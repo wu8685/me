@@ -1,0 +1,12 @@
+node_modules/
+package-lock.json
+
+# GSD (get-shit-done) tooling — local dev harness, not part of the me plugin
+.claude/
+.codex/
+.agents/*
+!.agents/plugins/
+!.agents/plugins/marketplace.json
+
+# Internal GSD planning artifacts — not published
+.planning/

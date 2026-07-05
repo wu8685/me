@@ -1,0 +1,2 @@
+# Obsidian local config — not tracked
+.obsidian/

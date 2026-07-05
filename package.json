@@ -1,0 +1,26 @@
+{
+  "name": "me",
+  "version": "1.4.0",
+  "description": "A Claude Code / Codex plugin that gives any workspace knowledge management capabilities",
+  "scripts": {
+    "test": "bash test/vault-test.sh"
+  },
+  "bin": {
+    "checklinks": "bun run bin/checklinks.ts",
+    "autolinks": "bun run bin/autolinks.ts",
+    "backlinks": "bun run bin/backlinks.ts",
+    "move": "bun run bin/move.ts",
+    "ingest": "bun run bin/ingest.ts"
+  },
+  "keywords": [
+    "knowledge-management",
+    "obsidian",
+    "vault",
+    "wikilinks"
+  ],
+  "author": "wuke <optimuswu8685@gmail.com>",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

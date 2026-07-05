@@ -1,0 +1,13 @@
+{
+  "name": "me",
+  "version": "1.4.0",
+  "description": "ME — a personal knowledge base plugin: a three-layer knowledge flywheel (raw → practices → cognition) with free wikilink cross-references.",
+  "author": {
+    "name": "wuke",
+    "email": "optimuswu8685@gmail.com"
+  },
+  "keywords": ["knowledge-base", "obsidian", "zettelkasten", "knowledge-management", "wikilinks"],
+  "homepage": "https://github.com/wu8685/me",
+  "repository": "https://github.com/wu8685/me",
+  "license": "MIT"
+}

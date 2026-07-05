@@ -1,0 +1,20 @@
+{
+  "name": "me-marketplace",
+  "description": "Development marketplace for ME personal knowledge base plugin",
+  "owner": {
+    "name": "wuke",
+    "email": "optimuswu8685@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "me",
+      "description": "ME — a personal knowledge base plugin: a three-layer knowledge flywheel (raw → practices → cognition) with free wikilink cross-references.",
+      "version": "1.4.0",
+      "source": "./",
+      "author": {
+        "name": "wuke",
+        "email": "optimuswu8685@gmail.com"
+      }
+    }
+  ]
+}
