@@ -696,6 +696,12 @@ writer 新增自己的 `bin/vault-write/graph.ts`。v1 不修改或依赖既有
 
 写前：
 
+> **2026-07-26 implementation-discovered correction:** index planning 不接受孤立的
+> basename `stem`。它消费 Task 6 `resolveWriteTarget` 产生的单一
+> `ResolvedWriteTarget`，其中同时包含 absolute note path、canonical POSIX
+> vault-relative path、stem 与 layer/index identity。否则 nested target 的完整
+> vault-relative link 无法从 basename 唯一恢复。
+
 1. 如果已有 resolved 入链指向 planned path，则 `indexAction: none`；
 2. 否则固定更新 `{configured-layer-root}/README.md`；
 3. managed entry 始终使用 **vault-relative** path-qualified link，不随 README

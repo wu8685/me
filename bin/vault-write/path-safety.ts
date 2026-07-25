@@ -16,6 +16,14 @@ export interface ResolvedVaultLayout {
   layers: Record<LogicalLayer, string>;
 }
 
+export interface ResolvedWriteTarget {
+  layerRoot: string;
+  notePath: string;
+  vaultRelativePath: string;
+  stem: string;
+  indexPath: string;
+}
+
 const LOGICAL_LAYERS: LogicalLayer[] = ['raw', 'practices', 'cognition'];
 const DEFAULT_LAYERS: Record<LogicalLayer, string> = {
   raw: 'raw',
@@ -297,7 +305,7 @@ export function resolveVaultLayout(vaultDir: string): ResolvedVaultLayout {
 export function resolveWriteTarget(
   layout: ResolvedVaultLayout,
   request: VaultWriteRequestV1,
-): { layerRoot: string; notePath: string; stem: string; indexPath: string } {
+): ResolvedWriteTarget {
   const layerRoot = layout.layers[request.layer];
   const notePath = path.join(layerRoot, ...request.relativePath.split('/'));
   const indexPath = path.join(layerRoot, 'README.md');
@@ -310,6 +318,7 @@ export function resolveWriteTarget(
   return {
     layerRoot,
     notePath,
+    vaultRelativePath: vaultRelative(layout, notePath),
     stem: path.basename(notePath, '.md'),
     indexPath,
   };

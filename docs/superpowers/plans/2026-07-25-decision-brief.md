@@ -847,17 +847,23 @@ export function snapshotVaultGraph(layout: ResolvedVaultLayout): VaultGraphSnaps
 export function planIndexUpdate(
   layout: ResolvedVaultLayout,
   layer: LogicalLayer,
-  stem: string,
+  target: ResolvedWriteTarget,
   title: string,
 ): { index: IndexPlan; suggestions: LinkSuggestions };
 export function validatePostWriteGraph(
   before: VaultGraphSnapshot,
   layout: ResolvedVaultLayout,
-  notePath: string,
-  stem: string,
+  target: ResolvedWriteTarget,
   index: IndexPlan,
 ): void;
 ```
+
+> **2026-07-26 implementation-discovered correction:** 原四参数接口只有 basename
+> `stem`，无法为 nested note 推导 §19.8 要求的完整 vault-relative link。Task 6
+> `resolveWriteTarget` 因此返回不可拆分的 `ResolvedWriteTarget`（absolute
+> `notePath`、canonical POSIX `vaultRelativePath`、`stem`、layer/index identity）；
+> planning 与 post-validation 都消费同一个 target object，避免调用方传入彼此矛盾的
+> path/stem。
 
 - [ ] **Step 1: 写 reachability/index RED tests**
 

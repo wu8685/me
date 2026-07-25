@@ -221,6 +221,7 @@ describe('writer path and target resolution', () => {
     expect(target).toEqual({
       layerRoot: path.join(vault, 'practices'),
       notePath: path.join(vault, 'practices/nested/deeper/2026-07-26-orchid.md'),
+      vaultRelativePath: 'practices/nested/deeper/2026-07-26-orchid.md',
       stem: '2026-07-26-orchid',
       indexPath: path.join(vault, 'practices/README.md'),
     });
