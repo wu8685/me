@@ -3188,6 +3188,63 @@ test_ingest_skill_llm_only_for_translate_summarize() {
   assert_file_not_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "mcp__web_reader__webReader" || return 1
 }
 
+# ── Decision Brief Skill Contract ──────────────────────────────────
+
+test_decision_brief_skill_structure() {
+  local f="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
+  local content
+
+  assert_file_exists "$f" || return 1
+  assert_file_contains "$f" '^name: decision-brief$' || return 1
+  assert_file_contains "$f" '^description:.*Use when' || return 1
+  assert_file_contains "$f" 'Decision Contract' || return 1
+
+  content=$(tr '\n' ' ' < "$f")
+  if ! printf '%s\n' "$content" | grep -qE 'cognition.*practices.*raw'; then
+    echo -e "    ${RED}FAIL${NC}: decision brief must search cognition, practices, then raw"
+    return 1
+  fi
+
+  assert_file_contains "$f" 'references/evidence-contract.md' || return 1
+  assert_file_contains "$f" 'references/output-contract.md' || return 1
+}
+
+test_decision_brief_public_privacy() {
+  local dir="$PLUGIN_ROOT/skills/decision-brief"
+  local forbidden='brain-spark|/Users/|持仓|optimuswu8685|小鹅通'
+
+  assert_dir_exists "$dir" || return 1
+  if grep -RInE -- "$forbidden" "$dir"; then
+    echo -e "    ${RED}FAIL${NC}: decision brief public files contain private data"
+    return 1
+  fi
+}
+
+test_decision_brief_profile_contract() {
+  local f="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
+  local content
+
+  assert_file_exists "$f" || return 1
+  assert_file_contains "$f" '\.me/profiles/decision-brief.md' || return 1
+
+  content=$(tr '\n' ' ' < "$f")
+  if ! printf '%s\n' "$content" | grep -qE \
+    '(inside|within)[^.]*(the )?vault|位于[^。]*vault|vault[^。]*(内|根)[^。]*Profile|Profile[^。]*vault[^。]*(内|根)'; then
+    echo -e "    ${RED}FAIL${NC}: decision Profile must be constrained to the current vault"
+    return 1
+  fi
+  if ! printf '%s\n' "$content" | grep -qE \
+    '默认不写(入)?([^。]*vault)?|does not write([^.]*)by default'; then
+    echo -e "    ${RED}FAIL${NC}: decision brief must not write to the vault by default"
+    return 1
+  fi
+  if ! printf '%s\n' "$content" | grep -qE \
+    '(不得|不能|不可)[^。]*(自动|直接)[^。]*cognition|must not[^.]*(automatically|directly)[^.]*cognition'; then
+    echo -e "    ${RED}FAIL${NC}: decision brief must not automatically write or promote cognition"
+    return 1
+  fi
+}
+
 # ── Quick Task 260406-e00: Convert Commands to Skills Tests ─────────────────
 
 test_skill_files_exist() {
@@ -4575,6 +4632,11 @@ main() {
     run_test test_ingest_skill_calls_script
     run_test test_ingest_skill_thin_orchestrator
     run_test test_ingest_skill_llm_only_for_translate_summarize
+
+    # Decision Brief Skill Contract
+    run_test test_decision_brief_skill_structure
+    run_test test_decision_brief_public_privacy
+    run_test test_decision_brief_profile_contract
 
     # E2E tests (require claude CLI)
     run_test test_e2e_me_setup
