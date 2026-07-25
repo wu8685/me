@@ -122,6 +122,7 @@ interface OwnedDirectory {
 interface OwnedLock {
   file: OwnedFile;
   descriptor: number;
+  closeDescriptor(descriptor: number): void;
 }
 
 interface LockOperations {
@@ -216,6 +217,23 @@ function bigStatFingerprint(stat: fs.BigIntStats): string {
   });
 }
 
+function ownedStatFingerprint(stat: fs.BigIntStats): Record<string, string> {
+  const type = stat.isFile()
+    ? 'file'
+    : stat.isDirectory()
+      ? 'directory'
+      : stat.isSymbolicLink()
+        ? 'symlink'
+        : 'other';
+  return {
+    type,
+    mode: stat.mode.toString(),
+    size: stat.size.toString(),
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+  };
+}
+
 function fileIdentity(file: string): string {
   const entry = fs.lstatSync(file, { bigint: true });
   const target = fs.statSync(file, { bigint: true });
@@ -226,10 +244,20 @@ function fileIdentity(file: string): string {
   });
 }
 
+function ownedFileIdentity(file: string): string {
+  const entry = fs.lstatSync(file, { bigint: true });
+  const target = fs.statSync(file, { bigint: true });
+  return JSON.stringify({
+    entry: ownedStatFingerprint(entry),
+    target: ownedStatFingerprint(target),
+    canonicalPath: fs.realpathSync(file),
+  });
+}
+
 function ownedFile(file: string): OwnedFile {
   return {
     path: file,
-    identity: fileIdentity(file),
+    identity: ownedFileIdentity(file),
     sha256: sha256(fs.readFileSync(file)),
   };
 }
@@ -257,7 +285,7 @@ function sameOwnedDirectory(expected: OwnedDirectory): boolean {
 
 function sameOwnedFile(expected: OwnedFile): boolean {
   try {
-    return fileIdentity(expected.path) === expected.identity
+    return ownedFileIdentity(expected.path) === expected.identity
       && sha256(fs.readFileSync(expected.path)) === expected.sha256;
   } catch {
     return false;
@@ -282,6 +310,15 @@ function sameOwnedLineage(expected: OwnedFile): boolean {
   }
 }
 
+function sameOwnedFileAtLinkCount(expected: OwnedFile, expectedLinkCount: bigint): boolean {
+  try {
+    return sameOwnedFile(expected)
+      && fs.statSync(expected.path, { bigint: true }).nlink === expectedLinkCount;
+  } catch {
+    return false;
+  }
+}
+
 function sameMovedFile(expected: OwnedFile, destination: string): boolean {
   try {
     const recorded = JSON.parse(expected.identity) as {
@@ -290,7 +327,6 @@ function sameMovedFile(expected: OwnedFile, destination: string): boolean {
         ino: string;
         mode: string;
         size: string;
-        mtimeNs: string;
         type: string;
       };
     };
@@ -301,7 +337,6 @@ function sameMovedFile(expected: OwnedFile, destination: string): boolean {
       && current.ino.toString() === recorded.target.ino
       && current.mode.toString() === recorded.target.mode
       && current.size.toString() === recorded.target.size
-      && current.mtimeNs.toString() === recorded.target.mtimeNs
       && sha256(fs.readFileSync(destination)) === expected.sha256;
   } catch {
     return false;
@@ -940,6 +975,17 @@ class Transaction {
       if (errno(error) === 'EEXIST') throw new VaultWriterError('TARGET_EXISTS');
       throw error;
     }
+    const nextLinkCount = expectedLinkCount + 1n;
+    if (
+      !sameOwnedFileAtLinkCount(expectedSource, nextLinkCount)
+      || !sameInode(source, destination)
+    ) {
+      throw new VaultWriterError('RECOVERY_REQUIRED');
+    }
+    const destinationOwned = ownedFile(destination);
+    if (!sameOwnedFileAtLinkCount(destinationOwned, nextLinkCount)) {
+      throw new VaultWriterError('RECOVERY_REQUIRED');
+    }
     this.afterMutation([source, destination]);
   }
 
@@ -1164,8 +1210,8 @@ function captureAcquiredLock(
   return {
     path: lockPath,
     identity: JSON.stringify({
-      entry: JSON.parse(bigStatFingerprint(entry)),
-      target: JSON.parse(bigStatFingerprint(target)),
+      entry: ownedStatFingerprint(entry),
+      target: ownedStatFingerprint(target),
       canonicalPath: lockOps.realpathSync(lockPath),
     }),
     sha256: sha256(expectedBytes),
@@ -1235,7 +1281,7 @@ function acquireLock(
     lockOps.fchmodSync(descriptor, 0o600);
     const file = captureAcquiredLock(lockPath, descriptor, bytes, operationId, lockOps);
     acquired = true;
-    return { lock: { file, descriptor } };
+    return { lock: { file, descriptor, closeDescriptor: lockOps.closeSync } };
   } catch (error) {
     failure = error;
     if (failedAcquisitionStillOwned(lockPath, descriptor, bytes, operationId)) {
@@ -1322,7 +1368,7 @@ function releaseOwnedLockEarly(
   operations: FileOperations,
 ): boolean {
   options.hooks?.beforeLockRelease?.(lock.file.path);
-  try { fs.closeSync(lock.descriptor); } catch { return false; }
+  try { lock.closeDescriptor(lock.descriptor); } catch { return false; }
   if (!sameOwnedFile(lock.file)) return false;
   options.hooks?.beforeFsMutation?.('unlink', [lock.file.path]);
   try {
@@ -1718,7 +1764,9 @@ export function executeVaultWrite(
       snapshotFingerprintPaths(initialPlan),
       new Set([initialPlan.target.vaultRelativePath]),
     );
-    if (!sameOwnedFile(notePublished)) throw new VaultWriterError('RECOVERY_REQUIRED');
+    if (!sameOwnedFileAtLinkCount(notePublished, 2n)) {
+      throw new VaultWriterError('RECOVERY_REQUIRED');
+    }
     verifyStaticInputs(initialPlan, options.pluginRoot);
     verifyExternalGraph(initialPlan);
 
@@ -1779,8 +1827,13 @@ export function executeVaultWrite(
     );
     verifyStaticInputs(initialPlan, options.pluginRoot);
     verifyExternalGraph(initialPlan);
-    if (!sameOwnedFile(notePublished)) throw new VaultWriterError('RECOVERY_REQUIRED');
-    if (initialPlan.index.action !== 'none' && !sameOwnedFile(indexPublished!)) {
+    if (!sameOwnedFileAtLinkCount(notePublished, 2n)) {
+      throw new VaultWriterError('RECOVERY_REQUIRED');
+    }
+    if (
+      initialPlan.index.action !== 'none'
+      && !sameOwnedFileAtLinkCount(indexPublished!, 2n)
+    ) {
       throw new VaultWriterError('RECOVERY_REQUIRED');
     }
     validatePostWriteGraph(initialPlan.graph, layout, initialPlan.target, initialPlan.index);
@@ -1795,7 +1848,7 @@ export function executeVaultWrite(
         !sameOwnedLineage(staged)
         || !sameOwnedFile(published)
         || !sameInode(staged.path, published.path)
-        || links < 2n
+        || links !== 2n
       ) {
         markPreserved(staged.path, `Inspect changed staging link ${vaultRelative(layout, staged.path)}.`);
         return;
@@ -1807,6 +1860,8 @@ export function executeVaultWrite(
         if (
           publishedBefore.dev !== publishedAfter.dev
           || publishedBefore.ino !== publishedAfter.ino
+          || publishedBefore.nlink !== 2n
+          || publishedAfter.nlink !== 1n
           || sha256(fs.readFileSync(published.path)) !== published.sha256
         ) {
           markPreserved(published.path, 'Verify published target after staging cleanup.');
@@ -1944,16 +1999,20 @@ export function executeVaultWrite(
         }
         tx.closeJournal();
       }
-      try { fs.closeSync(lockOwned.descriptor); } catch {
+      let lockDescriptorClosed = false;
+      try {
+        lockOwned.closeDescriptor(lockOwned.descriptor);
+        lockDescriptorClosed = true;
+      } catch {
         lockReleaseConflict = true;
         markPreserved(lockPath, 'Inspect the lock whose acquisition descriptor could not close.');
       }
-      if (sameOwnedFile(lockOwned.file)) {
+      if (lockDescriptorClosed && sameOwnedFile(lockOwned.file)) {
         try { tx.unlink(lockOwned.file); } catch {
           lockReleaseConflict = true;
           markPreserved(lockPath, 'Remove the lock only if it still belongs to this operation.');
         }
-      } else {
+      } else if (lockDescriptorClosed) {
         lockReleaseConflict = true;
         markPreserved(lockPath, 'Inspect the changed lock before removing it.');
       }

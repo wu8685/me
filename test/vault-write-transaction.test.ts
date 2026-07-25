@@ -534,6 +534,39 @@ describe('lock precedence and operation discovery', () => {
       .toBe('foreign lock bytes');
   });
 
+  test('a final lock descriptor close failure preserves the lock and skips unlink', () => {
+    const vault = makeVault();
+    const lockPath = path.join(vault, '.me/locks/vault-write.lock');
+    const unlinks: string[] = [];
+    let closes = 0;
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      hooks: {
+        beforeFsMutation(kind, paths) {
+          if (kind === 'unlink') unlinks.push(...paths);
+        },
+      },
+      lockOps: {
+        closeSync(descriptor: number) {
+          closes += 1;
+          fs.closeSync(descriptor);
+          const error = new Error('injected final close failure') as NodeJS.ErrnoException;
+          error.code = 'EIO';
+          throw error;
+        },
+      },
+    });
+
+    expect(closes).toBe(1);
+    expect(result.status).toBe('manual_recovery');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(fs.existsSync(lockPath)).toBeTrue();
+    expect(unlinks).not.toContain(lockPath);
+    expect(result.recoveries.flatMap(item => item.preservedPaths))
+      .toContain('.me/locks/vault-write.lock');
+  });
+
   test('a nested cooperative writer observes LOCK_HELD while the owner completes', () => {
     const vault = makeVault();
     let nested: ReturnType<typeof write> | undefined;
@@ -702,6 +735,36 @@ describe('fingerprint, no-clobber, and rollback windows', () => {
     expect(result.error?.code).toBe('TARGET_EXISTS');
     expect(fs.readFileSync(target, 'utf8')).toBe('foreign target');
     expect(fs.existsSync(path.join(vault, 'practices/README.md'))).toBeFalse();
+  });
+
+  test('accepts post-publish hard-link churn that returns to the expected lineage state', () => {
+    const vault = makeVault();
+    const outside = temporaryDirectory('me-lineage-churn-');
+    const result = write(vault, {
+      afterNotePublish(notePath) {
+        const transient = path.join(outside, 'transient-link.md');
+        fs.linkSync(notePath, transient);
+        fs.unlinkSync(transient);
+      },
+    });
+
+    expect(result.status).toBe('committed');
+    expect(result.error).toBeUndefined();
+  });
+
+  test('rejects a persistent post-publish extra hard link outside the vault', () => {
+    const vault = makeVault();
+    const outside = temporaryDirectory('me-lineage-extra-');
+    const extra = path.join(outside, 'extra-link.md');
+    const result = write(vault, {
+      afterNotePublish(notePath) {
+        fs.linkSync(notePath, extra);
+      },
+    });
+
+    expect(result.status).toBe('manual_recovery');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(fs.existsSync(extra)).toBeTrue();
   });
 
   test('detects target-parent metadata changes in the final pre-publish window', () => {
