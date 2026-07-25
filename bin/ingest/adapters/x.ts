@@ -342,9 +342,10 @@ export function createXAdapter(runner: CommandRunner): SourceAdapter {
       if (result.kind === 'video') {
         const mediaCapabilities = capabilities(result);
         const audioOnly = mediaCapabilities.length === 1 && mediaCapabilities[0] === 'audio';
+        const warnings = audioOnlyWarnings(result);
         return {
-          adapterId: 'x', readable: true, capabilities: mediaCapabilities, degradation: audioOnly ? 'partial' : 'none',
-          warnings: [...(audioOnly ? ['video-unavailable:audio-only'] : []), ...audioOnlyWarnings(result)],
+          adapterId: 'x', readable: true, capabilities: mediaCapabilities, degradation: warnings.length > 0 ? 'partial' : 'none',
+          warnings: [...(audioOnly ? ['video-unavailable:audio-only'] : []), ...warnings],
         };
       }
       try {

@@ -276,6 +276,7 @@ test('reports mixed X audio-only playlist entries as degraded media', async () =
     const [report, source] = await Promise.all([adapter.probe(context), adapter.extract(context)]);
 
     expect(report.capabilities).toEqual(['video', 'audio']);
+    expect(report.degradation).toBe('partial');
     expect(source.media.map((media) => media.kind)).toEqual(['video', 'audio']);
     expect(source.warnings).toContain('video-unavailable:audio-only:audio-002');
     expect(report.warnings).toContain('video-unavailable:audio-only:audio-002');
