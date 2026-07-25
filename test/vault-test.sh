@@ -3319,6 +3319,28 @@ EOF
   fi
 }
 
+test_decision_brief_profile_behavior_evidence() {
+  local f="$PLUGIN_ROOT/test/skills/decision-brief/profile-boundary-results.md"
+  local pair
+
+  assert_file_exists "$f" || return 1
+  grep -Fq 'Six samples ran through separate `codex exec --ephemeral` processes.' "$f" || return 1
+  grep -Fq 'actual shell inspection' "$f" || return 1
+
+  for pair in \
+    'PB1 | Existing contained Profile | ACCEPT | ACCEPT | PASS' \
+    'PB2 | Symlinked vault root, contained Profile | ACCEPT | ACCEPT | PASS' \
+    'PB3 | Existing prefix escapes and target returns inside | REJECT_UNSAFE | REJECT_UNSAFE | PASS' \
+    'PB4 | Missing target, all existing ancestors contained | GENERIC | GENERIC | PASS' \
+    'PB5 | Dangling Profile symlink | REJECT_UNSAFE | REJECT_UNSAFE | PASS' \
+    'PB6 | Existing ancestor and target escape | REJECT_UNSAFE | REJECT_UNSAFE | PASS'
+  do
+    grep -Fq "| $pair |" "$f" || return 1
+  done
+
+  [ "$(grep -Fc '**Verbatim decisive rationale:**' "$f")" -eq 6 ] || return 1
+}
+
 # ── Quick Task 260406-e00: Convert Commands to Skills Tests ─────────────────
 
 test_skill_files_exist() {
@@ -4711,6 +4733,7 @@ main() {
     run_test test_decision_brief_skill_structure
     run_test test_decision_brief_public_privacy
     run_test test_decision_brief_profile_contract
+    run_test test_decision_brief_profile_behavior_evidence
 
     # E2E tests (require claude CLI)
     run_test test_e2e_me_setup
