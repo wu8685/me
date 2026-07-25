@@ -2,13 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 为 ME 增加可跨机器安装的通用 `decision-brief` Skill，在不泄漏私人原则的前提下，把 vault 知识与最新事实组织成可执行、可证伪的决策简报。
+**Goal:** 为 ME 增加可跨机器安装的通用 `decision-brief` Skill，以及一个供其和其他
+Skill 复用的 deterministic transactional vault writer；在不泄漏私人原则的前提下，
+把 vault 知识与最新事实组织成可执行、可证伪且可安全保存的决策简报。
 
 **Spec:** `docs/superpowers/specs/2026-07-25-decision-brief-design.md`
 
-**Architecture:** `SKILL.md` 只承担触发、Decision Contract、检索顺序与执行纪律；证据分类和输出模板分别放入按需读取的 references。私人原则通过 vault 内可选 `.me/profiles/decision-brief.md` 注入，公共 Skill 不依赖 brain-spark，也不增加脚本，除非 baseline 证明存在必须确定化的重复工作。
+**Architecture:** `SKILL.md` 只承担触发、Decision Contract、检索顺序、保存授权与
+执行纪律；证据分类和输出模板分别放入按需读取的 references。私人原则通过 vault
+内可选 `.me/profiles/decision-brief.md` 注入。write-safety probes 已证明保存是必须
+确定化的重复工作，因此独立 `bin/vault-write/` 负责通用 schema/path/index/
+transaction contract；它不依赖 brain-spark，也不复用或重构 ingest finalizer。
 
-**Tech Stack:** Agent Skills (`SKILL.md`)、Markdown references、ME 的 `search`/`backlinks` 能力、Bash contract tests、fresh-context Skill pressure tests。
+**Tech Stack:** Agent Skills (`SKILL.md`)、Markdown references、TypeScript/Bun、
+Node filesystem primitives、ME native wikilink graph、Bash contract tests、
+fresh-context Skill pressure tests。
 
 ## Global Constraints
 
@@ -24,6 +32,11 @@
 - 公共 Skill、tests 和 fixtures 不包含 brain-spark 路径、私人原则、持仓、账号或小鹅通内容。
 - FinOps 与 graphyer 不在本计划范围。
 - Skill 开发严格执行 baseline RED → 最小 Skill GREEN → pressure test REFACTOR。
+- Writer 只创建新 note；不得提供 overwrite/force/delete existing note。
+- Writer 对外固定声明 `journaled-cooperative`，不得声称 Node 提供跨文件 atomic CAS。
+- 所有 draft/journal/recovery 只能位于 vault `.me/tmp`；preview 对 vault 零写入。
+- 不支持 hard-link no-clobber 时 fail closed，不得退化为 check-then-write。
+- 并发内容无法证明 ownership 时必须保留并返回结构化 manual recovery。
 
 ---
 
@@ -48,6 +61,21 @@ test/
         │   └── raw/source-note.md
         └── profile-vault/
             └── .me/profiles/decision-brief.md
+bin/
+├── vault-write.ts                       # preview/write CLI + JSON/exit mapping
+└── vault-write/
+    ├── contracts.ts                     # public request/result/status contract
+    ├── path-safety.ts                   # config, containment, symlink safety
+    ├── schema.ts                        # vault schema + installed template validation
+    ├── index.ts                         # reachability, graph regression, suggestions
+    └── transaction.ts                   # lock, journal, publish, rollback/recovery
+test/
+├── vault-write-contracts.test.ts
+├── vault-write-path-safety.test.ts
+├── vault-write-schema.test.ts
+├── vault-write-index.test.ts
+├── vault-write-transaction.test.ts
+└── vault-write-cli.test.ts
 ```
 
 ### Task 1: 建立 Skill RED Baseline
@@ -396,12 +424,634 @@ git add skills/decision-brief test/skills/decision-brief/variant-results.md
 git commit -m "test: harden decision brief behavior"
 ```
 
-### Task 6: 安装可见性、用户文档与版本
+### Task 6: 定义 Writer Contract 与安全路径（RED → GREEN）
+
+> **2026-07-26 ordering amendment:** 用户已批准通用 transactional vault writer。
+> 先执行 Tasks 6–11，再执行原发布任务（现 Task 12）。不得先发布一个只能
+> `not written` 的 Decision Brief。
+
+**Files:**
+- Create: `bin/vault-write/contracts.ts`
+- Create: `bin/vault-write/path-safety.ts`
+- Create: `test/vault-write-contracts.test.ts`
+- Create: `test/vault-write-path-safety.test.ts`
+
+**Interfaces:**
+- Produces:
+
+```ts
+export type LogicalLayer = 'raw' | 'practices' | 'cognition';
+export type VaultWriteStatus =
+  | 'preview' | 'committed' | 'validation_failed'
+  | 'conflict' | 'unsupported' | 'manual_recovery';
+
+export interface VaultWriteRequestV1 {
+  version: 1;
+  layer: LogicalLayer;
+  relativePath: string;
+  markdown: string;
+  index: { mode: 'auto' };
+  acknowledgeCognition?: boolean;
+}
+
+export interface VaultWriteResultV1 {
+  version: 1;
+  status: VaultWriteStatus;
+  operationId: string;
+  commitModel: 'preview-only' | 'journaled-cooperative';
+  requestDigest: string;
+  notePath?: string;
+  changedPaths: string[];
+  plannedPaths: string[];
+  indexAction: 'none' | 'create' | 'replace';
+  backlinks: Array<{ path: string; count: number }>;
+  unlinkedMentions: string[];
+  warnings: string[];
+  error?: { code: string; message: string };
+  recovery?: {
+    directory: string;
+    journal: string;
+    preservedPaths: string[];
+    remainingMutations: string[];
+    actions: Array<{
+      kind: 'inspect' | 'compare' | 'restore' | 'remove-owned';
+      path: string;
+      from?: string;
+      condition: string;
+    }>;
+  };
+}
+```
+
+- Produces:
+
+```ts
+export interface ResolvedVaultLayout {
+  lexicalVault: string;
+  canonicalVault: string;
+  meDir: string;
+  tmpDir: string;
+  lockDir: string;
+  schemaPath: string;
+  layers: Record<LogicalLayer, string>;
+}
+
+export function parseVaultWriteRequest(value: unknown): VaultWriteRequestV1;
+export function resolveVaultLayout(vaultDir: string): ResolvedVaultLayout;
+export function resolveWriteTarget(
+  layout: ResolvedVaultLayout,
+  request: VaultWriteRequestV1,
+): { layerRoot: string; notePath: string; stem: string; indexPath: string };
+export function assertSafeWriterPath(
+  layout: ResolvedVaultLayout,
+  candidate: string,
+  label: string,
+): void;
+export function vaultRelative(layout: ResolvedVaultLayout, absolute: string): string;
+```
+
+- Does not consume or modify `bin/ingest/finalize.ts`.
+
+- [ ] **Step 1: 写 request contract RED tests**
+
+在 `test/vault-write-contracts.test.ts` 中逐项断言：
+
+```ts
+expect(parseVaultWriteRequest({
+  version: 1,
+  layer: 'practices',
+  relativePath: 'decisions/2026-07-26-orchid-choice.md',
+  markdown: '---\n...\n---\n\nbody\n',
+  index: { mode: 'auto' },
+})).toMatchObject({ layer: 'practices' });
+```
+
+拒绝以下 case，且 error message 只能使用固定 code 对应的公共文案：
+
+- unknown top-level/index field；
+- `version !== 1`、unknown layer、`index.mode !== auto`；
+- non-string/empty/大于 4 MiB markdown；
+- cognition 缺少 `acknowledgeCognition: true`；
+- `../x.md`、`/x.md`、`a\\b.md`、empty component、control character；
+- 非 `.md`、非 `YYYY-MM-DD-kebab-slug.md`、double hyphen、uppercase stem；
+- `created` 的一致性在 Task 7 校验，不在 parser 用 regex 猜 frontmatter。
+
+- [ ] **Step 2: 写 config/path/symlink RED tests**
+
+`test/vault-write-path-safety.test.ts` 创建 default 与 custom layer fixtures，覆盖：
+
+- `layers.practices: knowledge/practices` 正确解析；
+- 缺失 config 使用 raw/practices/cognition defaults；
+- layer traversal、absolute layer、escaping symlink、dangling symlink；
+- `.me`、`.me/tmp`、`.me/locks`、`SCHEMA.md`、layer README symlink escape；
+- symlinked vault root 本身合法，lexical/canonical root 配对正确；
+- nonexistent safe target 的 deepest existing ancestor 被 canonicalize；
+- Windows drive/UNC 风格输入在非 Windows 上也不得被当普通相对 component；
+- `vaultRelative` 始终返回 `/` separator 且绝不返回 absolute path。
+
+- [ ] **Step 3: 运行 tests 确认 RED**
+
+Run:
+
+```bash
+bun test test/vault-write-contracts.test.ts test/vault-write-path-safety.test.ts
+```
+
+Expected: FAIL，modules 不存在。
+
+- [ ] **Step 4: 实现最小 contract 与 path safety**
+
+使用 `lstat` 区分 nonexistent 与 dangling symlink。containment 同时满足：
+
+```ts
+candidate === root || candidate.startsWith(root + path.sep)
+```
+
+以及每个 existing prefix 的 `realpath` 位于 canonical vault。不要用
+`existsSync` 把 dangling symlink 当“缺失”。解析 config 只接受
+`layers.{raw,practices,cognition}` 的 string scalar；duplicate/ambiguous key
+fail closed。
+
+- [ ] **Step 5: 运行 tests 与 typecheck**
+
+Run:
+
+```bash
+bun test test/vault-write-contracts.test.ts test/vault-write-path-safety.test.ts
+npx tsc --noEmit --target es2022 --module commonjs --moduleResolution node \
+  --esModuleInterop --skipLibCheck bin/vault-write/contracts.ts bin/vault-write/path-safety.ts
+```
+
+Expected: PASS。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add bin/vault-write/contracts.ts bin/vault-write/path-safety.ts \
+  test/vault-write-contracts.test.ts test/vault-write-path-safety.test.ts
+git commit -m "feat: define transactional vault write contract"
+```
+
+### Task 7: Schema 与 Template 驱动校验（RED → GREEN）
+
+**Files:**
+- Create: `bin/vault-write/schema.ts`
+- Create: `test/vault-write-schema.test.ts`
+
+**Interfaces:**
+- Consumes: `LogicalLayer`, `ResolvedVaultLayout` from Task 6.
+- Produces:
+
+```ts
+export interface FieldContract {
+  name: string;
+  type: 'string' | 'date' | 'list' | 'enum';
+  required: boolean;
+  values?: string[];
+}
+
+export interface LayerSchemaContract {
+  layer: LogicalLayer;
+  fields: Map<string, FieldContract>;
+  templateFields: string[];
+}
+
+export interface ValidatedNote {
+  stem: string;
+  title: string;
+  created: string;
+  tags: string[];
+  type: string;
+  source: string;
+  markdown: string;
+}
+
+export function loadLayerSchema(
+  layout: ResolvedVaultLayout,
+  pluginRoot: string,
+  layer: LogicalLayer,
+): LayerSchemaContract;
+export function validateNoteMarkdown(
+  markdown: string,
+  targetStem: string,
+  contract: LayerSchemaContract,
+): ValidatedNote;
+```
+
+- [ ] **Step 1: 写 schema parser RED tests**
+
+使用真实 `templates/SCHEMA.md` 和三个 template，再加入 fixture variants。精确覆盖：
+
+- core + per-layer fields 合并，practices `project` optional、cognition
+  `confidence` required enum；
+- 缺少 `LOCKED`、重复 table field、unknown type、同 layer 重复 heading、
+  malformed row 均 fail closed；
+- template field 不在 schema、schema required field 不在 template、
+  duplicate template key 均失败；
+- parser 不从 prose 中猜字段。
+
+- [ ] **Step 2: 写 Markdown/frontmatter RED tests**
+
+三层各至少一个合法 note；非法 cases：
+
+```text
+unknown/duplicate/missing key
+status/lifecycle/date_created
+YAML alias, tag, multiline object, mapping, boolean/number-as-string confusion
+invalid real date; created != filename date
+tags not list<string>; controlled type outside layer vocabulary
+raw source not HTTP(S)
+empty practices/cognition source
+cognition confidence outside low|medium|high
+empty title/body; frontmatter not at byte 0; second frontmatter
+absolute/traversing Markdown image target
+```
+
+明确接受 quoted string、规范 inline string list，以及 template 允许的 optional empty
+string；不依赖未安装的 YAML package。
+
+- [ ] **Step 3: 运行确认 RED**
+
+Run: `bun test test/vault-write-schema.test.ts`
+
+Expected: FAIL，`schema.ts` 不存在。
+
+- [ ] **Step 4: 实现严格 parser**
+
+只实现 schema/template 当前使用的 YAML subset。遇到不认识的 YAML construct 直接
+`validation_failed`，不做宽松 coercion。frontmatter field 顺序不影响验证；写入 bytes
+保持 request 原样，不由 writer 重新序列化。
+
+- [ ] **Step 5: 运行 tests 与提交**
+
+```bash
+bun test test/vault-write-schema.test.ts
+git add bin/vault-write/schema.ts test/vault-write-schema.test.ts
+git commit -m "feat: validate vault writes against schema"
+```
+
+### Task 8: 确定性索引、Link Regression 与 Backlinks（RED → GREEN）
+
+**Files:**
+- Create: `bin/vault-write/index.ts`
+- Create: `test/vault-write-index.test.ts`
+
+**Interfaces:**
+- Consumes: `ResolvedVaultLayout`, validated stem/title, layer root/index path.
+- Produces:
+
+```ts
+export interface VaultGraphSnapshot {
+  broken: Set<string>;
+  noteFiles: string[];
+}
+
+export interface IndexPlan {
+  action: 'none' | 'create' | 'replace';
+  path: string;
+  before?: Buffer;
+  after?: Buffer;
+  digest?: string;
+}
+
+export interface LinkSuggestions {
+  backlinks: Array<{ path: string; count: number }>;
+  unlinkedMentions: string[];
+}
+
+export function snapshotVaultGraph(layout: ResolvedVaultLayout): VaultGraphSnapshot;
+export function planIndexUpdate(
+  layout: ResolvedVaultLayout,
+  layer: LogicalLayer,
+  stem: string,
+  title: string,
+): { index: IndexPlan; suggestions: LinkSuggestions };
+export function validatePostWriteGraph(
+  before: VaultGraphSnapshot,
+  layout: ResolvedVaultLayout,
+  notePath: string,
+  stem: string,
+  index: IndexPlan,
+): void;
+```
+
+- [ ] **Step 1: 写 reachability/index RED tests**
+
+覆盖：
+
+- 已有真实 `[[stem]]` backlink → action none；
+- 只有 frontmatter、inline code、3/4 backtick、3/4 tilde fence 中的 link → 不算
+  backlink；
+- 无 backlink → 固定 layer root `README.md`，不受 filesystem enumeration order
+  影响；
+- README absent → create managed block；
+- README 无 marker → exact original bytes + deterministic separator + block；
+- 合法 marker → 合并、去重并按 Unicode code point 排序；
+- duplicate/nested/reversed/unclosed marker → validation failure；
+- target title plain-text mention 进入 sorted unlinked suggestions，但已有 backlink 不重复；
+- `.me/tmp/vault-write-*`、recovery、target note 本身不参与 pre-write suggestion。
+
+- [ ] **Step 2: 写 graph no-regression RED tests**
+
+用 native `wikilink-graph.js` fixture 断言：
+
+- 写后 note 有入链且不是 orphan；
+- operation 新增 broken wikilink 时失败；
+- vault 既有 broken link 不导致无关 write 失败；
+- index bytes 与 plan digest 不一致时失败；
+- suggestions 只返回 vault-relative POSIX paths。
+
+- [ ] **Step 3: 运行确认 RED**
+
+Run: `bun test test/vault-write-index.test.ts`
+
+Expected: FAIL。
+
+- [ ] **Step 4: 实现 code-aware scanner 与 managed block**
+
+fence closing marker 必须同字符且长度大于等于 opener；inline code delimiter 必须同
+run length。只扫描三层配置目录，所有 existing prefix 继续调用 Task 6 containment。
+
+- [ ] **Step 5: 运行 tests 与提交**
+
+```bash
+bun test test/vault-write-index.test.ts
+git add bin/vault-write/index.ts test/vault-write-index.test.ts
+git commit -m "feat: plan deterministic vault reachability"
+```
+
+### Task 9: Journaled Transaction Engine 与 Recovery（RED → GREEN）
+
+**Files:**
+- Create: `bin/vault-write/transaction.ts`
+- Create: `test/vault-write-transaction.test.ts`
+
+**Interfaces:**
+- Consumes: Tasks 6–8.
+- Produces:
+
+```ts
+export interface VaultWriteHooks {
+  afterLock?(): void;
+  afterStaging?(): void;
+  beforeNotePublish?(path: string): void;
+  afterNotePublish?(path: string): void;
+  beforeIndexPreserve?(path: string): void;
+  afterIndexPreserve?(original: string): void;
+  afterIndexPublish?(path: string): void;
+  beforePostValidation?(): void;
+}
+
+export interface VaultWriterOptions {
+  pluginRoot: string;
+  mode: 'preview' | 'write';
+  hooks?: VaultWriteHooks; // tests only; CLI never accepts hooks
+  fileOps?: {
+    linkSync: typeof import('fs').linkSync;
+    renameSync: typeof import('fs').renameSync;
+  };
+}
+
+export function executeVaultWrite(
+  vaultDir: string,
+  request: VaultWriteRequestV1,
+  options: VaultWriterOptions,
+): VaultWriteResultV1;
+```
+
+- [ ] **Step 1: 写 preview 与 successful create RED tests**
+
+断言：
+
+- preview 前后 recursive manifest 完全相同，不创建 `.me/tmp`/lock/parents；
+- 相同 snapshot/request 除 operationId 外 plan、digest、suggestions 相同；
+- absent note + absent README 通过 staged hard links no-clobber 发布；
+- existing README replace 后 status committed、new README valid、old inode 留在
+  `.me/tmp/vault-write-<id>/originals/`；
+- result 只含 relative paths，`commitModel` 分别为 preview-only /
+  journaled-cooperative；
+- journal state 到 `committed`，files `0600`、operation dir 尽力 `0700`。
+
+- [ ] **Step 2: 写 cooperative lock 与 primitive RED tests**
+
+覆盖：
+
+- nested writer/已存在 lock → `conflict/LOCK_HELD`，targets untouched；
+- `.me/locks` escaping/dangling symlink → validation failure；
+- injected `linkSync` `EXDEV`、`EPERM` → `unsupported`，不 fallback 到 copy/write/覆盖
+  rename；
+- note/index same-device preflight 失败 → unsupported；
+- target 在 `beforeNotePublish` 被外部创建 → foreign exact bytes preserved，index
+  untouched；
+- Windows 上 directory fsync unsupported 不得把已验证 commit 误报为 atomic durability；
+  非 Windows test 用 injected error 模拟并只产生 warning。
+
+- [ ] **Step 3: 写 index 并发窗口 RED tests**
+
+每个 hook 都保存 before/after hash：
+
+1. `beforeIndexPreserve` 普通 edit；
+2. `beforeIndexPreserve` 用 rename 做 atomic replacement；
+3. `afterIndexPreserve` 修改 moved original（模拟已打开 inode）；
+4. `afterIndexPreserve` 在 README path 外部 create；
+5. `afterIndexPublish` 修改 published README；
+6. `beforePostValidation` 同时改 note 与 README。
+
+期望：外部 bytes 保留在原 path 或 result.recovery.preservedPaths；writer 不覆盖或
+删除；不能完整恢复时 status 必须是 `manual_recovery`，且
+`remainingMutations/actions` 非空。禁止把这些 case 报成 committed/full rollback。
+
+- [ ] **Step 4: 写 rollback/crash RED tests**
+
+覆盖：
+
+- forced post-validation failure，所有 operation-owned bytes 未变 → 完整回滚，
+  status validation_failed，原 README exact bytes 可用；
+- published note 被外部 edit 后 validation failure → note preserved，
+  manual_recovery；
+- restore 时 README path 被外部 create → current + original 都 preserved，
+  manual_recovery；
+- operation-created parent 只有仍为空才删除；
+- staged/journal cleanup 只删除 fingerprint 仍归 operation 的文件；
+- 每个 state `locked/staged/note-published/index-preserved/index-published/validated`
+  的 fixture journal 在下次 write 被识别为
+  `manual_recovery/INCOMPLETE_OPERATION`，不得自动删除 lock 或猜恢复。
+
+- [ ] **Step 5: 运行确认 RED**
+
+Run: `bun test test/vault-write-transaction.test.ts`
+
+Expected: FAIL。
+
+- [ ] **Step 6: 实现 state machine**
+
+mutation 前后写 journal 并 `fsync` file；directory fsync 仅在平台支持时使用，不把
+它写成跨平台保证。README replace 禁止 `rename(staged, README)`；只能
+preserve-current → verify → hard-link staged no-clobber。成功时 retained original 不
+自动清理。
+
+- [ ] **Step 7: 运行 focused + full Bun tests**
+
+```bash
+bun test test/vault-write-transaction.test.ts
+bun test test/vault-write-*.test.ts
+bun test test/*.test.ts
+```
+
+Expected: PASS；不能新增 skip 来绕过 filesystem tests。
+
+- [ ] **Step 8: 提交**
+
+```bash
+git add bin/vault-write/transaction.ts test/vault-write-transaction.test.ts
+git commit -m "feat: write vault notes with recoverable transactions"
+```
+
+### Task 10: CLI、JSON/Redaction 与 Installable Binary（RED → GREEN）
+
+**Files:**
+- Create: `bin/vault-write.ts`
+- Create: `test/vault-write-cli.test.ts`
+- Modify: `package.json`
+- Modify: `test/vault-test.sh`
+
+**Interfaces:**
+- Consumes: `executeVaultWrite`.
+- Produces:
+
+```bash
+bun run bin/vault-write.ts preview --vault-dir VAULT [--request .me/tmp/request.json]
+bun run bin/vault-write.ts write   --vault-dir VAULT [--request .me/tmp/request.json]
+```
+
+- [ ] **Step 1: 写 CLI RED tests**
+
+从 subprocess 测试 stdin 与 `--request`：
+
+- preview/committed exit 0；
+- validation 2、conflict 3、manual recovery 4、unsupported 5、internal 1；
+- stdout 恰好一个可 parse JSON object，stderr 不含 request；
+- unknown flag、重复 flag、缺 mode/vault、非 JSON、多 object、invalid UTF-8；
+- request file 只允许 contained `.me/tmp/*.json`，拒绝 outside、escaping/dangling
+  symlink；
+- argv/process command 不包含 Markdown；
+- stdout/stderr/result 中不出现 fixture 的 Markdown sentinel、secret、absolute vault、
+  username、home、injected exception、command stderr；
+- output path 一律 `/` separator；
+- SIGINT/exception 后保留 journal并给下一次 invocation manual recovery，不伪报
+  rollback。
+
+- [ ] **Step 2: 添加 installability RED tests**
+
+`test/vault-test.sh` 增加并注册：
+
+```bash
+test_vault_writer_public_binary() {
+  assert_file_exists "$PLUGIN_ROOT/bin/vault-write.ts" || return 1
+  node -e '
+    const p=require(process.argv[1]);
+    if (p.bin["vault-write"] !== "bun run bin/vault-write.ts") process.exit(1)
+  ' "$PLUGIN_ROOT/package.json"
+}
+```
+
+并检查 public files 不含 absolute local path、private profile 或 brain-spark 内容。
+
+- [ ] **Step 3: 运行确认 RED**
+
+```bash
+bun test test/vault-write-cli.test.ts
+bash test/vault-test.sh test_vault_writer_public_binary
+```
+
+Expected: FAIL。
+
+- [ ] **Step 4: 实现 CLI 与固定 error catalog**
+
+stdout 由单一 `JSON.stringify(result)` 出口产生。捕获 exception 后只映射
+`code/public message/exit code`；详细 exception 仅在已经安全创建的 operation journal
+内记录，且不得把 secret value写入 journal。`--request` 文件读取后不删除用户输入。
+
+- [ ] **Step 5: 完整验证与提交**
+
+```bash
+bun test test/vault-write-cli.test.ts
+bun test test/vault-write-*.test.ts
+bash test/vault-test.sh test_vault_writer_public_binary
+npx tsc --noEmit --target es2022 --module commonjs --moduleResolution node \
+  --esModuleInterop --skipLibCheck bin/vault-write.ts bin/vault-write/*.ts
+git diff --check
+git add bin/vault-write.ts test/vault-write-cli.test.ts package.json test/vault-test.sh
+git commit -m "feat: expose transactional vault writer cli"
+```
+
+### Task 11: Decision Brief 调用 Writer 与 Save Pressure Tests
+
+**Files:**
+- Modify: `skills/decision-brief/SKILL.md`
+- Modify: `skills/decision-brief/references/output-contract.md`
+- Modify: `test/vault-test.sh`
+- Create: `test/skills/decision-brief/writer-results.md`
+
+**Interfaces:**
+- Consumes: `vault-write preview/write` JSON contract.
+- Produces: Decision Brief practices-only positive save path；仍不自动写 cognition。
+
+- [ ] **Step 1: 写静态 integration RED tests**
+
+检查 Skill：
+
+- 明确调用 `bin/vault-write.ts preview` 后才可 `write`；
+- 只有 `status: committed` 报 saved；
+- validation/conflict/unsupported → `not written`；
+- manual_recovery 必须逐项转述 preservedPaths/remainingMutations/actions；
+- Decision Brief 不设置 `acknowledgeCognition`；
+- 禁止 Skill 自行用 `apply_patch`/shell redirect/`mv` 写 vault target。
+
+- [ ] **Step 2: 定义并运行 fresh-context save probes**
+
+在独立虚构 vault 中固定五个场景，每个至少运行两次：
+
+```text
+DW1 明确保存阶段性决策，writer committed
+DW2 只说“建议不错”但未授权保存
+DW3 要求直接保存为高置信 cognition
+DW4 practices save 遇到 validation_failed
+DW5 practices save 遇到 manual_recovery
+```
+
+期望：
+
+- DW1 使用 practices request、先 preview、再 write、核对实际 JSON 后报告 saved；
+- DW2 不调用 write；
+- DW3 不设置 cognition acknowledgement，遵守 cognition gate；
+- DW4 报 `not written`；
+- DW5 不说 rolled back/saved，完整给 recovery 信息。
+
+记录 exact prompt、fresh-context metadata、writer fixture result、实际 vault
+before/after hash、Agent 关键原话；不得只靠关键词自动评分。
+
+- [ ] **Step 3: 修改 Skill 最小规则**
+
+把当前“qualifying writer”抽象说明收敛成可执行命令和 status table。Markdown request
+通过 stdin，不写 shell argv；临时 request 需要时只能放 `.me/tmp`。
+
+- [ ] **Step 4: 复测与提交**
+
+```bash
+bash test/vault-test.sh test_decision_brief_writer_contract
+bun test test/vault-write-*.test.ts
+git add skills/decision-brief test/skills/decision-brief/writer-results.md test/vault-test.sh
+git commit -m "feat: save decision briefs through vault writer"
+```
+
+### Task 12: 安装可见性、用户文档与版本
 
 **Files:**
 - Modify: `README.md`
 - Modify: `docs/features.md`
 - Modify: `docs/user-guide.md`
+- Modify: `docs/development.md`
 - Modify: `package.json`
 - Modify: `.codex-plugin/plugin.json`
 - Modify: `.claude-plugin/plugin.json`
@@ -432,7 +1082,11 @@ Expected: FAIL。
 
 - [ ] **Step 3: 更新用户文档**
 
-README 只讲适用价值与入口；features 说明输入/输出与默认不落盘；user guide 给出一个无 Profile 和一个本地 Profile 示例。不得写用户的私人原则示例。
+README 只讲适用价值与入口；features 说明输入/输出、默认不落盘，以及通用
+`vault-write` 的 preview/write 价值；user guide 给出一个无 Profile、一个本地
+Profile、一个明确 practices 保存的示例。development 记录 module boundary、
+`journaled-cooperative` 限定和 recovery contract。不得写用户的私人原则示例，也
+不得宣称 Node 提供跨文件 atomic CAS。
 
 - [ ] **Step 4: 升级 minor version**
 
@@ -445,6 +1099,9 @@ Run:
 ```bash
 bash test/vault-test.sh
 claude plugin validate .
+bun test test/vault-write-*.test.ts
+npx tsc --noEmit --target es2022 --module commonjs --moduleResolution node \
+  --esModuleInterop --skipLibCheck bin/vault-write.ts bin/vault-write/*.ts
 git diff --check
 rg -n 'brain-spark|/Users/|持仓|optimuswu8685|小鹅通' skills/decision-brief test/skills/decision-brief README.md docs/features.md docs/user-guide.md
 ```
