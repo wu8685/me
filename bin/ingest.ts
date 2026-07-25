@@ -14,6 +14,16 @@ import * as os from 'os';
 import * as https from 'https';
 import * as http from 'http';
 import { execSync } from 'child_process';
+import { defaultCommandRunner } from './ingest/command.ts';
+import { extractHtmlSource } from './ingest/adapters/html.ts';
+import {
+  extractBilibiliSource,
+  fetchBilibiliMeta as fetchBilibiliMetaFromAdapter,
+  fetchBilibiliSubtitleBody as fetchBilibiliSubtitleBodyFromAdapter,
+  fetchBilibiliSubtitleList as fetchBilibiliSubtitleListFromAdapter,
+  isBilibiliUrl as isBilibiliUrlFromAdapter,
+  parseBilibiliBvid as parseBilibiliBvidFromAdapter,
+} from './ingest/adapters/bilibili.ts';
 
 export type {
   Capability,
@@ -476,132 +486,28 @@ export function extractWikilinkCandidates(
   return Array.from(candidates.values()).sort((a, b) => b.count - a.count);
 }
 
-// ── Bilibili source adapter ───────────────────────────────────────────────────
+// ── HTML / Bilibili compatibility wrappers ──────────────────────────────────
 
-const BILI_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-
-/**
- * Returns true if the URL is a Bilibili video URL we can route to the dedicated
- * extractor. Currently supports `bilibili.com/video/BV...` and `b23.tv/...`.
- * Returns false for empty/malformed input — never throws.
- */
+/** Retained for callers while the CLI is migrated to adapter registry in Task 8. */
 export function isBilibiliUrl(url: string): boolean {
-  if (!url || typeof url !== 'string') return false;
-  if (/^(https?:\/\/)?(www\.)?bilibili\.com\/video\/BV[A-Za-z0-9]+/.test(url)) return true;
-  if (/^(https?:\/\/)?b23\.tv\/[A-Za-z0-9]+/.test(url)) return true;
-  return false;
+  return isBilibiliUrlFromAdapter(url);
 }
 
-/**
- * Extract the BV identifier from a Bilibili URL.
- * - bilibili.com/video/BVxxx → 'BVxxx' (strips query/trailing-slash/?p=N)
- * - b23.tv/xxx → follows redirect via curl and re-parses the resolved URL
- * - Anything else → null (no throw)
- */
+/** Retained for callers while redirect resolution now uses the safe command runner. */
 export function parseBilibiliBvid(url: string): string | null {
-  if (!url || typeof url !== 'string') return null;
-
-  // Fast path: direct /video/BVxxx match
-  const direct = url.match(/\/video\/(BV[A-Za-z0-9]+)/);
-  if (direct) return direct[1];
-
-  // b23.tv short link → follow redirect
-  if (/^(https?:\/\/)?b23\.tv\//.test(url)) {
-    try {
-      const resolved = execSync(
-        `curl -sIL -o /dev/null -w "%{url_effective}" --max-time 10 -A "${BILI_UA}" "${url}"`,
-        { encoding: 'utf8', timeout: 12000 },
-      ).trim();
-      const m = resolved.match(/\/video\/(BV[A-Za-z0-9]+)/);
-      return m ? m[1] : null;
-    } catch {
-      return null;
-    }
-  }
-
-  return null;
+  return parseBilibiliBvidFromAdapter(defaultCommandRunner, url);
 }
 
-/**
- * Fetch Bilibili video metadata via the public web-interface/view API.
- * Throws on non-zero API code so callers see the message.
- */
 export function fetchBilibiliMeta(bvid: string): BilibiliMeta {
-  const cmd = `curl -s --max-time 15 -A "${BILI_UA}" -H "Referer: https://www.bilibili.com/" "https://api.bilibili.com/x/web-interface/view?bvid=${bvid}"`;
-  const raw = execSync(cmd, { encoding: 'utf8', timeout: 18000 });
-  let json: any;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    throw new Error(`Bilibili API returned non-JSON for bvid=${bvid}`);
-  }
-  if (!json || json.code !== 0) {
-    throw new Error(`Bilibili API error: ${json?.message ?? json?.code ?? 'unknown'}`);
-  }
-  return json.data as BilibiliMeta;
+  return fetchBilibiliMetaFromAdapter(defaultCommandRunner, bvid);
 }
 
-/**
- * Fetch the per-page subtitle list via player/v2. Returns [] on any error
- * (subtitles are best-effort; missing/blocked → caller will trigger whisper).
- */
 export function fetchBilibiliSubtitleList(bvid: string, cid: number): BilibiliSubtitleEntry[] {
-  try {
-    const cmd = `curl -s --max-time 15 -A "${BILI_UA}" -H "Referer: https://www.bilibili.com/" "https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}"`;
-    const raw = execSync(cmd, { encoding: 'utf8', timeout: 18000 });
-    const json = JSON.parse(raw);
-    const list = json?.data?.subtitle?.subtitles;
-    return Array.isArray(list) ? (list as BilibiliSubtitleEntry[]) : [];
-  } catch {
-    return [];
-  }
+  return fetchBilibiliSubtitleListFromAdapter(defaultCommandRunner, bvid, cid);
 }
 
-/**
- * Fetch a subtitle body JSON from a (possibly protocol-relative) URL and
- * concatenate the per-line content. Returns '' on any failure.
- */
 export function fetchBilibiliSubtitleBody(subtitleUrl: string): string {
-  try {
-    if (!subtitleUrl) return '';
-    const abs = subtitleUrl.startsWith('//') ? `https:${subtitleUrl}` : subtitleUrl;
-    const cmd = `curl -s --max-time 15 -A "${BILI_UA}" -H "Referer: https://www.bilibili.com/" "${abs}"`;
-    const raw = execSync(cmd, { encoding: 'utf8', timeout: 18000 });
-    const json = JSON.parse(raw);
-    const body = json?.body;
-    if (!Array.isArray(body)) return '';
-    return body.map((b: any) => String(b?.content ?? '')).filter(Boolean).join('\n');
-  } catch {
-    return '';
-  }
-}
-
-/**
- * Pick the best subtitle from a candidate list.
- * Preference: non-AI (ai_type === 0) > AI; then zh-CN > others.
- * Returns null if list is empty.
- */
-function pickPreferredSubtitle(list: BilibiliSubtitleEntry[]): BilibiliSubtitleEntry | null {
-  if (!list || list.length === 0) return null;
-  const sorted = [...list].sort((a, b) => {
-    const aiDiff = (a.ai_type === 0 ? 0 : 1) - (b.ai_type === 0 ? 0 : 1);
-    if (aiDiff !== 0) return aiDiff;
-    const langDiff = (a.lan === 'zh-CN' ? 0 : 1) - (b.lan === 'zh-CN' ? 0 : 1);
-    return langDiff;
-  });
-  return sorted[0] ?? null;
-}
-
-/** Format duration in seconds as HH:MM:SS or MM:SS. */
-function formatDuration(seconds: number): string {
-  const s = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  const pad = (n: number) => String(n).padStart(2, '0');
-  if (h > 0) return `${h}:${pad(m)}:${pad(sec)}`;
-  return `${m}:${pad(sec)}`;
+  return fetchBilibiliSubtitleBodyFromAdapter(defaultCommandRunner, subtitleUrl);
 }
 
 /**
@@ -650,87 +556,21 @@ export function extractBilibili(
   url: string,
   opts?: { mode?: 'metadata' | 'transcribe' },
 ): ExtractedContent & { needsTranscription?: boolean; transcriptionAvailable?: boolean } {
-  const bvid = parseBilibiliBvid(url);
-  if (!bvid) throw new Error(`Not a Bilibili video URL: ${url}`);
-
-  const meta = fetchBilibiliMeta(bvid);
-
-  const pubdateIso = meta.pubdate
-    ? new Date(meta.pubdate * 1000).toISOString().split('T')[0]
-    : '';
-  const durationFmt = formatDuration(meta.duration ?? 0);
-
-  const lines: string[] = [];
-  lines.push(`# ${meta.title}`);
-  lines.push('');
-  lines.push(
-    `> 作者: ${meta.owner?.name ?? '未知'} · 时长: ${durationFmt} · 发布: ${pubdateIso}`,
-  );
-  const stat = meta.stat ?? ({} as BilibiliMeta['stat']);
-  lines.push(
-    `> 播放: ${stat.view ?? 0} · 弹幕: ${stat.danmaku ?? 0} · 点赞: ${stat.like ?? 0} · 投币: ${stat.coin ?? 0} · 收藏: ${stat.favorite ?? 0}`,
-  );
-  lines.push('');
-  lines.push('## 视频简介');
-  lines.push('');
-  lines.push(meta.desc || '*（无简介）*');
-  lines.push('');
-
-  const pages = Array.isArray(meta.pages) && meta.pages.length > 0
-    ? meta.pages
-    : [{ cid: 0, page: 1, part: meta.title, duration: meta.duration ?? 0 }];
-
-  let anyMissing = false;
   const mode = opts?.mode ?? 'metadata';
-
-  for (const page of pages) {
-    if (pages.length > 1) {
-      lines.push(`## P${page.page}: ${page.part}`);
-      lines.push('');
-    }
-
-    const subs = fetchBilibiliSubtitleList(bvid, page.cid);
-    const chosen = pickPreferredSubtitle(subs);
-    const body = chosen ? fetchBilibiliSubtitleBody(chosen.subtitle_url) : '';
-
-    if (body) {
-      lines.push(`### 字幕转录（${chosen?.lan ?? 'unknown'}）`);
-      lines.push('');
-      lines.push(body);
-      lines.push('');
-    } else if (mode === 'transcribe') {
-      // Whisper fallback — calls into transcribeBilibili (defined below).
+  const source = extractBilibiliSource(defaultCommandRunner, url, mode, {
+    transcribe: (sourceUrl, cid) => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bili-whisper-'));
       try {
-        const transcript = transcribeBilibili(url, page.cid, tmpDir);
-        lines.push('### 字幕转录（whisper-auto）');
-        lines.push('');
-        lines.push(transcript);
-        lines.push('');
+        return transcribeBilibili(sourceUrl, cid, tmpDir);
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
-    } else {
-      lines.push('<!-- 无 CC 字幕 -->');
-      lines.push('');
-      anyMissing = true;
-    }
-  }
-
-  const content = lines.join('\n');
-  const transcriptionAvailable = whichYtDlp() !== null && whichWhisperCli() !== null;
-
-  const result: ExtractedContent & {
-    needsTranscription?: boolean;
-    transcriptionAvailable?: boolean;
-  } = {
-    title: meta.title,
-    content,
-    images: [],
-  };
-  if (anyMissing && mode !== 'transcribe') {
+    },
+  });
+  const result = projectExtractedSource(source);
+  if (source.warnings.includes('needs-transcription') && mode !== 'transcribe') {
     result.needsTranscription = true;
-    result.transcriptionAvailable = transcriptionAvailable;
+    result.transcriptionAvailable = whichYtDlp() !== null && whichWhisperCli() !== null;
   }
   return result;
 }
@@ -749,24 +589,17 @@ export function extractContent(
   if (isBilibiliUrl(url)) {
     return extractBilibili(url, opts);
   }
+  return projectExtractedSource(extractHtmlSource(defaultCommandRunner, new URL(url), url));
+}
 
-  const output = execSync(`defuddle parse "${url}" --md`, {
-    encoding: 'utf8',
-    timeout: 30000,
-  });
-
-  // Extract title from first # heading or <title>
-  const titleMatch = output.match(/^#\s+(.+)/m) || output.match(/^title:\s*["']?(.+?)["']?\s*$/m);
-  const title = titleMatch ? titleMatch[1].trim() : 'Untitled';
-
-  // Extract image URLs
-  const imageMatches = output.matchAll(/!\[.*?\]\((https?:\/\/[^)]+)\)/g);
-  const images: string[] = [];
-  for (const match of imageMatches) {
-    images.push(match[1]);
-  }
-
-  return { title, content: output, images };
+function projectExtractedSource(
+  source: import('./ingest/contracts.ts').ExtractedSource,
+): ExtractedContent & { needsTranscription?: boolean; transcriptionAvailable?: boolean } {
+  return {
+    title: source.source.title,
+    content: source.blocks.map((block) => block.markdown).join('\n\n'),
+    images: source.media.flatMap((media) => media.kind === 'image' && media.url ? [media.url] : []),
+  };
 }
 
 /**
