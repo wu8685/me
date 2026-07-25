@@ -483,6 +483,18 @@ function maskCode(markdown: string): string {
     }
     let run = 1;
     while (fencedMasked[index + run] === '`') run += 1;
+    let precedingBackslashes = 0;
+    for (
+      let preceding = index - 1;
+      preceding >= 0 && fencedMasked[preceding] === '\\';
+      preceding -= 1
+    ) {
+      precedingBackslashes += 1;
+    }
+    if (precedingBackslashes % 2 === 1) {
+      index += run;
+      continue;
+    }
     let close = -1;
     for (let candidate = index + run; candidate < fencedMasked.length;) {
       if (fencedMasked[candidate] !== '`') {

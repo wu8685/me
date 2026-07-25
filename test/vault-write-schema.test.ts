@@ -392,6 +392,30 @@ describe('Markdown destination grammar', () => {
     expect(validate(vault, 'raw', note('raw', {}, body))).toBeTruthy();
   });
 
+  test.each([
+    ['one backslash', '\\`[x](file:///tmp/a)`'],
+    ['three backslashes', '\\\\\\`[x](file:///tmp/a)`'],
+    ['Unicode then one backslash', '😀\\`[x](file:///tmp/a)`'],
+  ])('keeps a file link active after an opening backtick escaped by %s', (_name, body) => {
+    const vault = makeVault();
+    expectCode(() => validate(vault, 'raw', note('raw', {}, `# Body\n\n${body}\n`)), 'INVALID_NOTE');
+  });
+
+  test.each([
+    ['two backslashes', '\\\\`[x](file:///tmp/a)`'],
+    ['four backslashes', '\\\\\\\\`[x](file:///tmp/a)`'],
+    ['Unicode then two backslashes', '😀\\\\`[x](file:///tmp/a)`'],
+  ])('masks a code sample after an opening backtick preceded by %s', (_name, body) => {
+    const vault = makeVault();
+    expect(validate(vault, 'raw', note('raw', {}, `# Body\n\n${body}\n`))).toBeTruthy();
+  });
+
+  test('does not apply opening-backtick escape parity to a real code closer', () => {
+    const vault = makeVault();
+    const body = '`[x](file:///tmp/a)\\\\\\`';
+    expect(validate(vault, 'raw', note('raw', {}, `# Body\n\n${body}\n`))).toBeTruthy();
+  });
+
   test('accepts nested and escaped inline link labels', () => {
     const vault = makeVault();
     fs.mkdirSync(path.join(vault, 'raw/sources'));
