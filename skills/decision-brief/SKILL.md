@@ -60,20 +60,41 @@ decision:
   profile: .me/profiles/decision-brief.md
 ```
 
-Resolve the configured path from the current vault root. Check both its lexical
-absolute path and, when it exists, its real path.
-
 Profile path must remain inside the current vault
 
-Equality with the vault root is inside; otherwise require the path to begin
-with the vault root plus the platform path separator. Reject and report an
-escape, including one through a symlink. User ownership of the machine does not
-override this boundary.
+Containment requires paired lexical and canonical vault roots
+
+Apply this path algorithm:
+
+1. Make the vault root absolute without resolving symlinks, resolve the Profile
+   against that lexical root, and require the normalized target to equal the
+   lexical root or begin with the root plus the platform path separator.
+2. Canonicalize the vault root with `realpath` or an equivalent operation. This
+   separate canonical root makes a symlinked vault root valid; never compare a
+   canonical target with the lexical root.
+3. For an existing target, canonicalize it and require containment under the
+   canonical root. Also inspect and canonicalize every existing path prefix
+   from the lexical root to the target; reject if any prefix escapes, even if a
+   later symlink would return inside.
+
+Canonicalize the deepest existing ancestor when the Profile target is missing
+
+Find it by walking upward from the target with a non-following metadata check,
+so a symlink is distinguishable from a nonexistent entry. Canonicalize every
+existing prefix through that ancestor and require canonical-root containment.
+Keep the nonexistent remainder beneath that contained canonical ancestor and
+verify the resulting prospective path remains contained.
+
+Reject dangling symlinks and realpath errors as unsafe
+
+Stop and report unsafe configuration; do not read the Profile, treat it as
+missing, or let user ownership of the machine override the boundary.
+
+Only a genuinely missing Profile whose ancestors are contained may use the generic flow
 
 The Profile may add retrieval entry points, framework triggers, and decision
 discipline. It cannot override ME schema, domain or project safety rules,
 authorization boundaries, evidence labels, or cognition promotion gates.
-Missing or invalid Profiles fall back to the general workflow.
 
 ## Analyze
 

@@ -3214,6 +3214,10 @@ decision_brief_has_profile_contract() {
   [ -f "$f" ] &&
     grep -Fq '.me/profiles/decision-brief.md' "$f" &&
     grep -Fxq 'Profile path must remain inside the current vault' "$f" &&
+    grep -Fxq 'Containment requires paired lexical and canonical vault roots' "$f" &&
+    grep -Fxq 'Canonicalize the deepest existing ancestor when the Profile target is missing' "$f" &&
+    grep -Fxq 'Reject dangling symlinks and realpath errors as unsafe' "$f" &&
+    grep -Fxq 'Only a genuinely missing Profile whose ancestors are contained may use the generic flow' "$f" &&
     grep -Fxq 'Default output: chat only; do not write the vault without explicit authorization' "$f" &&
     grep -Fxq 'Never promote a decision directly to cognition' "$f"
 }
@@ -3284,12 +3288,18 @@ test_decision_brief_profile_contract() {
   cat > "$valid" <<'EOF'
 Optional profile: .me/profiles/decision-brief.md
 Profile path must remain inside the current vault
+Containment requires paired lexical and canonical vault roots
+Canonicalize the deepest existing ancestor when the Profile target is missing
+Reject dangling symlinks and realpath errors as unsafe
+Only a genuinely missing Profile whose ancestors are contained may use the generic flow
 Default output: chat only; do not write the vault without explicit authorization
 Never promote a decision directly to cognition
 EOF
   cat > "$counterexample" <<'EOF'
 Optional profile: .me/profiles/decision-brief.md
 The Profile may remain outside the current vault.
+Only check the lexical path and ignore symlinks.
+Treat realpath errors as a missing optional Profile.
 Default output may write the vault without explicit authorization.
 Promote every decision directly to cognition.
 EOF
