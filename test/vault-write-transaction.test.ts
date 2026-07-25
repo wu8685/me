@@ -235,6 +235,189 @@ describe('lock precedence and operation discovery', () => {
       .toBe('incomplete-operation');
   });
 
+  test('scans startup recoveries before attempting exclusive lock acquisition', () => {
+    const vault = makeVault();
+    operation(vault, 'crashed-before-lock', 'staged');
+    let opens = 0;
+    let releases = 0;
+
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      hooks: {
+        beforeLockRelease() {
+          releases += 1;
+        },
+      },
+      lockOps: {
+        openSync(...args: unknown[]) {
+          opens += 1;
+          return (fs.openSync as (...values: unknown[]) => number)(...args);
+        },
+      },
+    });
+
+    expect(result.status).toBe('manual_recovery');
+    expect(result.error?.code).toBe('INCOMPLETE_OPERATION');
+    expect(result.recoveries.map(item => item.operationId)).toEqual(['crashed-before-lock']);
+    expect(opens).toBe(0);
+    expect(releases).toBe(0);
+    expect(fs.existsSync(path.join(vault, '.me/locks/vault-write.lock'))).toBeFalse();
+  });
+
+  test.each([
+    'write',
+    'fsync',
+    'fchmod',
+    'lstat',
+    'ownership',
+  ] as const)('closes the acquisition descriptor and safely handles an injected %s failure', stage => {
+    const vault = makeVault();
+    const lockPath = path.join(vault, '.me/locks/vault-write.lock');
+    let closes = 0;
+    const injected = () => {
+      const error = new Error(`injected ${stage}`) as NodeJS.ErrnoException;
+      error.code = 'EIO';
+      throw error;
+    };
+
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      lockOps: {
+        ...(stage === 'write' ? { writeFileSync: injected } : {}),
+        ...(stage === 'fsync' ? { fsyncSync: injected } : {}),
+        ...(stage === 'fchmod' ? { fchmodSync: injected } : {}),
+        ...(stage === 'lstat' ? { lstatSync: injected } : {}),
+        ...(stage === 'ownership' ? { readFileSync: injected } : {}),
+        closeSync(descriptor: number) {
+          closes += 1;
+          fs.closeSync(descriptor);
+        },
+      },
+    });
+
+    expect(closes).toBe(1);
+    if (stage === 'write') {
+      expect(result.status).toBe('manual_recovery');
+      expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+      expect(result.recoveries.map(item => item.state)).toEqual(['ownership-conflict']);
+      expect(fs.existsSync(lockPath)).toBeTrue();
+    } else {
+      expect(result.status).toBe('validation_failed');
+      expect(result.error?.code).toBe('INTERNAL_ERROR');
+      expect(result.recoveries).toEqual([]);
+      expect(fs.existsSync(lockPath)).toBeFalse();
+    }
+  });
+
+  test('preserves a lock replacement introduced between acquisition identity checks', () => {
+    const vault = makeVault();
+    const lockPath = path.join(vault, '.me/locks/vault-write.lock');
+    let inspected = false;
+    let closes = 0;
+
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      lockOps: {
+        lstatSync(candidate: fs.PathLike, options?: fs.StatOptions) {
+          const stat = fs.lstatSync(candidate, options as never);
+          if (candidate === lockPath && !inspected) {
+            inspected = true;
+            fs.unlinkSync(lockPath);
+            fs.writeFileSync(lockPath, 'foreign replacement');
+          }
+          return stat as never;
+        },
+        closeSync(descriptor: number) {
+          closes += 1;
+          fs.closeSync(descriptor);
+        },
+      },
+    });
+
+    expect(closes).toBe(1);
+    expect(result.status).toBe('manual_recovery');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(result.recoveries.map(item => item.state)).toEqual(['ownership-conflict']);
+    expect(fs.readFileSync(lockPath, 'utf8')).toBe('foreign replacement');
+  });
+
+  test('aggregates a racing startup operation with acquisition cleanup recovery', () => {
+    const vault = makeVault();
+    const lockPath = path.join(vault, '.me/locks/vault-write.lock');
+
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      lockOps: {
+        writeFileSync() {
+          operation(vault, 'raced-startup', 'staged');
+          const error = new Error('injected acquisition write failure') as NodeJS.ErrnoException;
+          error.code = 'EIO';
+          throw error;
+        },
+      },
+    });
+
+    expect(result.status).toBe('manual_recovery');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(result.recoveries.map(item => item.operationId).sort()).toEqual([
+      'raced-startup',
+      result.operationId,
+    ].sort());
+    expect(result.recoveries.map(item => item.state).sort()).toEqual([
+      'incomplete-operation',
+      'ownership-conflict',
+    ]);
+    expect(fs.existsSync(lockPath)).toBeTrue();
+  });
+
+  test('aggregates a racing startup operation with lock release recovery', () => {
+    const vault = makeVault();
+    fs.writeFileSync(path.join(vault, 'SCHEMA.md'), 'unsupported schema');
+
+    const result = write(vault, {
+      beforeLockRelease(lockPath) {
+        operation(vault, 'raced-release', 'staged');
+        fs.writeFileSync(lockPath, 'foreign release replacement');
+      },
+    });
+
+    expect(result.status).toBe('manual_recovery');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(result.recoveries.map(item => item.operationId).sort()).toEqual([
+      'raced-release',
+      result.operationId,
+    ].sort());
+    expect(result.recoveries.map(item => item.state).sort()).toEqual([
+      'incomplete-operation',
+      'ownership-conflict',
+    ]);
+  });
+
+  test('aggregates a racing startup operation with final lock release recovery', () => {
+    const vault = makeVault();
+    const result = write(vault, {
+      beforeLockRelease(lockPath) {
+        operation(vault, 'raced-final-release', 'staged');
+        fs.writeFileSync(lockPath, 'foreign final release replacement');
+      },
+    });
+
+    expect(result.status).toBe('manual_recovery');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(result.recoveries.map(item => item.operationId).sort()).toEqual([
+      'raced-final-release',
+      result.operationId,
+    ].sort());
+    expect(result.recoveries.map(item => item.state).sort()).toEqual([
+      'incomplete-operation',
+      'ownership-conflict',
+    ]);
+  });
+
   test('a minimal committed marker without exact committed content is unrecognized', () => {
     const vault = makeVault();
     fs.mkdirSync(path.join(vault, '.me/tmp/vault-write-done'), { recursive: true });
