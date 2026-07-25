@@ -43,23 +43,37 @@ export function createAdapterRegistry(adapters: SourceAdapter[], options: Adapte
     }
   }
 
+  function sessionFor(url: URL, adapter: SourceAdapter) {
+    return {
+      adapter,
+      async probe(context: ExtractContext): Promise<CapabilityReport> {
+        try {
+          return await adapter.probe({ ...context, url });
+        } catch (cause) {
+          throw new AdapterExtractionError(adapter.id, 'probe', cause);
+        }
+      },
+      async extract(context: ExtractContext): Promise<ExtractedSource> {
+        try {
+          return await adapter.extract({ ...context, url });
+        } catch (cause) {
+          throw new AdapterExtractionError(adapter.id, 'extract', cause);
+        }
+      },
+    };
+  }
+
+  async function resolveSession(url: URL) {
+    return sessionFor(url, await resolve(url));
+  }
+
   async function probe(url: URL, context: ExtractContext): Promise<CapabilityReport> {
-    const adapter = await resolve(url);
-    try {
-      return await adapter.probe({ ...context, url });
-    } catch (cause) {
-      throw new AdapterExtractionError(adapter.id, 'probe', cause);
-    }
+    return (await resolveSession(url)).probe(context);
   }
 
   async function extract(url: URL, context: ExtractContext): Promise<ExtractedSource> {
-    const adapter = await resolve(url);
-    try {
-      return await adapter.extract({ ...context, url });
-    } catch (cause) {
-      throw new AdapterExtractionError(adapter.id, 'extract', cause);
-    }
+    return (await resolveSession(url)).extract(context);
   }
 
-  return { match, resolve, probe, extract };
+  return { match, resolve, resolveSession, probe, extract };
 }

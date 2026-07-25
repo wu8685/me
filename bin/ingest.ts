@@ -850,6 +850,33 @@ export interface IngestCliOptions {
   write: boolean;
 }
 
+export class SourceBlockedError extends Error {
+  readonly code = 'source-blocked' as const;
+
+  constructor(
+    readonly adapterId: string,
+    readonly warnings: string[],
+  ) {
+    super(`Source is blocked for adapter ${adapterId}`);
+    this.name = 'SourceBlockedError';
+  }
+}
+
+export type IngestErrorPayload =
+  | { code: 'source-blocked'; adapterId: string; warnings: string[] }
+  | { error: string };
+
+export function ingestErrorPayload(error: unknown): IngestErrorPayload {
+  if (error instanceof SourceBlockedError) {
+    return {
+      code: error.code,
+      adapterId: error.adapterId,
+      warnings: [...error.warnings],
+    };
+  }
+  return { error: error instanceof Error ? error.message : String(error) };
+}
+
 const INGEST_MODES = new Set<ExtractMode>(['raw', 'translate-cn', 'summarize', 'transcribe', 'handout']);
 const TOPIC_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)*$/;
 
@@ -1067,6 +1094,33 @@ function sourceCapabilities(source: ExtractedSource, probed: CapabilityReport['c
   return [...capabilities];
 }
 
+function transcriptBody(source: ExtractedSource): string | undefined {
+  const transcript = source.transcript ?? [];
+  if (transcript.length === 0) return undefined;
+  const timestamp = (seconds: number): string => {
+    const value = Math.max(0, Math.floor(seconds));
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.floor((value % 3600) / 60);
+    const remainder = value % 60;
+    const pad = (part: number) => String(part).padStart(2, '0');
+    return hours > 0
+      ? `${hours}:${pad(minutes)}:${pad(remainder)}`
+      : `${pad(minutes)}:${pad(remainder)}`;
+  };
+  return [
+    `# ${source.source.title}（转写）`,
+    '',
+    '## 完整转写',
+    '',
+    ...transcript.flatMap(segment => [
+      `**${timestamp(segment.start)}–${timestamp(segment.end)}**${segment.speaker ? ` · ${segment.speaker}` : ''}`,
+      '',
+      segment.text.trim(),
+      '',
+    ]),
+  ].join('\n').trimEnd() + '\n';
+}
+
 export async function runRichIngest(
   options: IngestCliOptions,
   runner: CommandRunner = defaultCommandRunner,
@@ -1101,24 +1155,20 @@ export async function runRichIngest(
     } else {
       const url = options.url as URL;
       const { registry } = createRichIngestRegistry(runner);
-      capabilityReport = await registry.probe(url, { vaultDir: options.vaultDir, tempDir: workspace });
+      const session = await registry.resolveSession(url);
+      capabilityReport = await session.probe({ vaultDir: options.vaultDir, tempDir: workspace });
       if (capabilityReport.degradation === 'blocked') {
-        throw new Error(JSON.stringify({
-          code: 'source-blocked',
-          adapterId: capabilityReport.adapterId,
-          warnings: capabilityReport.warnings,
-        }));
+        throw new SourceBlockedError(session.adapter.id, capabilityReport.warnings);
       }
-      const directAdapter = registry.match(url);
       const guessedMode = options.mode
-        ?? (directAdapter.id === 'bilibili' || directAdapter.id === 'x' ? config.defaultVideoMode : undefined);
+        ?? (session.adapter.id === 'bilibili' || session.adapter.id === 'x' ? config.defaultVideoMode : undefined);
       const extractionMode = guessedMode === 'handout' ? 'transcribe' : guessedMode;
-      source = await registry.extract(url, {
+      source = await session.extract({
         vaultDir: options.vaultDir,
         tempDir: workspace,
         ...(extractionMode ? { mode: extractionMode } : {}),
       });
-      adapterId = capabilityReport.adapterId;
+      adapterId = session.adapter.id;
       source = prepareUrlMedia(source, workspace, runner, options.write);
       trustedResourceRoots = [workspace];
     }
@@ -1132,7 +1182,9 @@ export async function runRichIngest(
     const handout = mode === 'handout'
       ? formatHandout(source, { topicHeadings: [] })
       : undefined;
-    const previewBody = processedMarkdown ?? handout?.markdown ?? body;
+    const generatedTranscript = mode === 'transcribe' ? transcriptBody(source) : undefined;
+    const finalizedMarkdown = processedMarkdown ?? generatedTranscript;
+    const previewBody = finalizedMarkdown ?? handout?.markdown ?? body;
     const slug = deriveSlug(source.source.title) || 'ingest';
     const today = new Date().toISOString().slice(0, 10);
     const stem = `${today}-${slug}`;
@@ -1141,7 +1193,13 @@ export async function runRichIngest(
     const autoLinkResult = autoLink(`${frontmatter}\n\n${previewBody}`, vaultIndex);
     const relatedNotes = scoreRelatedNotes([], source.source.title, vaultIndex, options.vaultDir).slice(0, 5);
     const capabilities = sourceCapabilities(source, capabilityReport.capabilities);
-    const warnings = [...new Set([...capabilityReport.warnings, ...source.warnings, ...(handout?.warnings ?? [])])];
+    const probeWarnings = source.transcript?.length
+      ? capabilityReport.warnings.filter(warning =>
+        warning !== 'needs-transcription'
+        && warning !== 'transcription-unavailable'
+        && warning !== 'transcription-empty')
+      : capabilityReport.warnings;
+    const warnings = [...new Set([...probeWarnings, ...source.warnings, ...(handout?.warnings ?? [])])];
 
     let writeResult: FinalizeResult | undefined;
     if (options.write) {
@@ -1149,7 +1207,7 @@ export async function runRichIngest(
         vaultDir: options.vaultDir,
         source,
         ...(handout ? { handout } : {}),
-        ...(processedMarkdown ? { processedMarkdown } : {}),
+        ...(finalizedMarkdown ? { processedMarkdown: finalizedMarkdown } : {}),
         ...(options.topic ? { topic: options.topic } : {}),
         stem,
         created: today,
@@ -1239,8 +1297,7 @@ Output: JSON preview with legacy fields plus { sourceKind, adapterId, capabiliti
     const options = parseIngestCliOptions(args);
     console.log(JSON.stringify(await runRichIngest(options), null, 2));
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(JSON.stringify({ error: message }));
+    console.error(JSON.stringify(ingestErrorPayload(error)));
     process.exit(1);
   }
 }
