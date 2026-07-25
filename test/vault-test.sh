@@ -3375,15 +3375,21 @@ test_decision_brief_write_transaction_contract() {
   local block
 
   assert_file_exists "$skill" || return 1
-  grep -Fq 'Before the first target write, preflight every target against its snapshot:' "$skill" || return 1
-  grep -Fq 'before each individual mutation, compare that target again and couple the' "$skill" || return 1
-  grep -Fq 'planned creation, both checks must confirm that the path still does not' "$skill" || return 1
-  grep -Fq 'A mismatch before any write aborts the whole operation without mutating a' "$skill" || return 1
-  grep -Fq 'If a later target changes' "$skill" || return 1
-  grep -Fq 'after writing has begun, use the ownership-aware rollback below' "$skill" || return 1
+  grep -Fq 'Do not implement the transaction yourself. Ordinary shell checks,' "$skill" || return 1
+  grep -Fq '`apply_patch`, and `mv` do not atomically couple comparison with mutation' "$skill" || return 1
+  grep -Fq 'Only call a deterministic transactional writer already provided by the' "$skill" || return 1
+  grep -Fq 'contract guarantees atomic' "$skill" || return 1
+  grep -Fq 'no-clobber creates, conditional replacements, post-write validation,' "$skill" || return 1
+  grep -Fq 'output a schema-targeted practices draft and the exact validation checklist' "$skill" || return 1
+  grep -Fq 'explicitly say `not written`' "$skill" || return 1
 
   assert_file_exists "$evidence" || return 1
   grep -Fq 'These checks validate evidence structure, not agent behavior.' "$evidence" || return 1
+  grep -Fq '| WT1 | FAIL |' "$evidence" || return 1
+  grep -Fq '| WT2 | FAIL |' "$evidence" || return 1
+  grep -Fq '| WT3 | PASS |' "$evidence" || return 1
+  grep -Fq '| WT4 | FAIL |' "$evidence" || return 1
+  grep -Fq 'ctime and historical metadata are not restorable' "$evidence" || return 1
 
   for id in WT1 WT2 WT3 WT4; do
     [ "$(grep -Fc "### $id" "$evidence")" -eq 1 ] || return 1
@@ -3397,6 +3403,22 @@ test_decision_brief_write_transaction_contract() {
     echo "$block" | grep -Fq '**Fresh context:**' || return 1
     echo "$block" | grep -Fq '**Fixture:**' || return 1
     echo "$block" | grep -Fq '**Operation:**' || return 1
+    echo "$block" | grep -Fq '**Before hashes:**' || return 1
+    echo "$block" | grep -Fq '**After hashes:**' || return 1
+    echo "$block" | grep -Fq '**Exact excerpt:**' || return 1
+    echo "$block" | grep -Fq '**Filesystem verdict:**' || return 1
+  done
+
+  for id in NW1 NW2 NW3 NW4 NW5; do
+    [ "$(grep -Fc "### $id" "$evidence")" -eq 1 ] || return 1
+    block="$(
+      awk -v heading="### $id" '
+        $0 == heading { in_probe = 1; next }
+        in_probe && /^### NW[1-5]$/ { exit }
+        in_probe { print }
+      ' "$evidence"
+    )"
+    echo "$block" | grep -Fq '**Fresh context:**' || return 1
     echo "$block" | grep -Fq '**Before hashes:**' || return 1
     echo "$block" | grep -Fq '**After hashes:**' || return 1
     echo "$block" | grep -Fq '**Exact excerpt:**' || return 1

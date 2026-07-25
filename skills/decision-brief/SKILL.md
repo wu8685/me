@@ -148,27 +148,25 @@ then:
 3. Use only the type, fields, and source shape explicitly allowed for that
    practices layer by its current schema and template. Reject an unknown type or
    field; stay chat-only rather than inventing one.
-4. Before writing, enumerate every file the operation will create or modify.
-   Record each path's existence, exact bytes, and metadata needed for faithful
-   restoration.
-5. Before the first target write, preflight every target against its snapshot:
-   existence, exact bytes, and relevant metadata must still match. Immediately
-   before each individual mutation, compare that target again and couple the
-   check to an atomic no-clobber create or conditional replacement. For a
-   planned creation, both checks must confirm that the path still does not
-   exist. If the environment cannot enforce this compare-and-swap discipline,
-   stay chat-only.
-6. A mismatch before any write aborts the whole operation without mutating a
-   target and is reported as a concurrent change. If a later target changes
-   after writing has begun, use the ownership-aware rollback below; never
-   overwrite the concurrent bytes.
-7. After writing, run the vault's required schema, link, index reachability, and
-   backlinks checks. Report “saved” only after every check passes.
-8. On failure, delete a newly created file or restore an earlier file only while
-   its current bytes still equal this operation's written bytes. A mismatch is
-   a concurrent change: stop without overwriting it. Claim “not saved” or
-   “rolled back” only after full restoration; otherwise list every remaining
-   partial mutation and the manual recovery needed.
+4. Do not implement the transaction yourself. Ordinary shell checks,
+   `apply_patch`, and `mv` do not atomically couple comparison with mutation and
+   therefore are not sufficient for an automatic vault write.
+5. Only call a deterministic transactional writer already provided by the
+   current vault or environment when its documented contract guarantees atomic
+   no-clobber creates, conditional replacements, post-write validation,
+   ownership-aware rollback, and concurrent-change preservation for the whole
+   mutation set.
+6. The writer contract must also enforce the current schema and template,
+   configured practices layer, link health, index reachability, and backlinks
+   workflow. Do not infer these guarantees from generic filesystem tools.
+7. If no qualifying writer exists, do not mutate any vault target. Instead,
+   output a schema-targeted practices draft and the exact validation checklist
+   that a future writer must run; explicitly say `not written`. Explicit save
+   authorization does not relax this boundary.
+8. Report “saved” only when the qualifying writer reports an atomic commit and
+   all required checks passed. If it reports a conflict or incomplete recovery,
+   preserve its exact status and list remaining mutations and manual recovery;
+   never upgrade that result to “saved” or “rolled back”.
 
 Raw sources belong in raw. Even when the user says “这是我的原则”, first apply the
 current vault's cognition validation and confirmation requirements; never claim
