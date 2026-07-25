@@ -48,7 +48,26 @@ const SENSITIVE_KEYS = new Set([
   'xamzsecuritytoken',
   'xamzsignature',
 ]);
-const HIGH_CONFIDENCE_CREDENTIAL = /(?:^|[\s"'=:,(])(?:Bearer|Basic)\s+\S+|(?:^|[\s"'=:,(])(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{16,}|(?:^|[\s"'=:,(])(?:AKIA|ASIA)[A-Z0-9]{16}(?:$|[\s"',;)])|(?:^|[\s"'=:,(])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:$|[\s"',;)])|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/i;
+const SENSITIVE_KEY_TERMINALS = new Set([
+  'auth',
+  'authorization',
+  'cookie',
+  'credential',
+  'password',
+  'passwd',
+  'secret',
+  'signature',
+  'token',
+]);
+const SENSITIVE_KEY_PREFIXES = new Set([
+  'access',
+  'api',
+  'decrypt',
+  'decryption',
+  'private',
+  'secret',
+]);
+const HIGH_CONFIDENCE_CREDENTIAL = /(?:^|[^A-Za-z0-9_-])(?:(?:Bearer|Basic)\s+\S+|(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{16,}|(?:AKIA|ASIA)[A-Z0-9]{16}|[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})(?=$|[^A-Za-z0-9_-])|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/i;
 const KEYED_VALUE = /\b([A-Za-z][A-Za-z0-9_-]{1,63})\s*[:=]\s*(\S+)/g;
 const ABSOLUTE_LOCAL_PATH = /(?:^|[\s"'=(])(?:\/(?!\/)[^\s"']+|[A-Za-z]:\\[^\s"']+)/;
 const SOURCE_KINDS = new Set(['article', 'paper', 'video', 'course']);
@@ -107,8 +126,36 @@ function normalizeSensitiveKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+function sensitiveKeyParts(key: string): string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
 function isSensitiveKey(key: string): boolean {
-  return SENSITIVE_KEYS.has(normalizeSensitiveKey(key));
+  const normalized = normalizeSensitiveKey(key);
+  if (SENSITIVE_KEYS.has(normalized)) return true;
+  if (/^(?:(?:x|o)?auth|api|access|refresh|session|security|xamzsecurity)token$/.test(normalized)) {
+    return true;
+  }
+  if (normalized === 'sessionid') return true;
+
+  const parts = sensitiveKeyParts(key);
+  const terminal = parts.at(-1);
+  if (terminal && SENSITIVE_KEY_TERMINALS.has(terminal)) {
+    return true;
+  }
+  if (terminal === 'id' && parts.at(-2) === 'session') return true;
+
+  const keyIndex = terminal === 'key'
+    ? parts.length - 1
+    : terminal === 'id' && parts.at(-2) === 'key'
+      ? parts.length - 2
+      : -1;
+  return keyIndex > 0 && parts.slice(0, keyIndex).some(part => SENSITIVE_KEY_PREFIXES.has(part));
 }
 
 function isSourceBody(pathParts: Array<string | number>): boolean {

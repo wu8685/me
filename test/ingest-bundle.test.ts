@@ -134,6 +134,84 @@ test('rejects audited sensitive query keys and high-confidence tokens across non
   }
 });
 
+test.each([
+  'auth_token',
+  'authToken',
+  'api_token',
+  'x_auth_token',
+  'session_id',
+  'oauth_credential',
+  'request_signature',
+  'client_secret',
+  'account_password',
+  'decrypt_key',
+  'aws_access_key_id',
+])('rejects semantic sensitive query key %s without echoing its value', (queryKey) => {
+  const queryValue = 'private-query-value-42';
+  let message = '';
+
+  try {
+    validateSourceBundle(bundle({
+      source: {
+        url: `https://example.com/source?${encodeURIComponent(queryKey)}=${queryValue}`,
+        kind: 'article',
+        title: 'Source',
+      },
+    }), fixture('bundle-valid'));
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+
+  expect(message).toMatch(/sensitive|credential/i);
+  expect(message).not.toContain(queryValue);
+});
+
+test.each([
+  'author',
+  'token_count',
+  'credential_format',
+  'signature_algorithm',
+  'secret_recipe',
+  'password_policy',
+  'session_timeout',
+  'decryption_status',
+  'access_level',
+])('does not reject unrelated query key %s', (queryKey) => {
+  expect(() => validateSourceBundle(bundle({
+    source: {
+      url: `https://example.com/source?${encodeURIComponent(queryKey)}=public-metadata`,
+      kind: 'article',
+      title: 'Source',
+    },
+  }), fixture('bundle-valid'))).not.toThrow();
+});
+
+test.each([
+  (secret: string) => `asset.${secret}`,
+  (secret: string) => `relative/path/${secret}/preview.png`,
+  (secret: string) => `relative/path/${secret}.jpg`,
+  (secret: string) => `https://example.com/assets/${secret}/preview.png`,
+])('rejects a high-confidence token after any non-token boundary without echoing it', (valueFor) => {
+  const secret = ['sk', '-', 'D'.repeat(32)].join('');
+  const value = valueFor(secret);
+  let message = '';
+
+  try {
+    validateSourceBundle(bundle({
+      source: {
+        url: value.startsWith('https://') ? value : 'https://example.com/source',
+        kind: 'article',
+        title: value,
+      },
+    }), fixture('bundle-valid'));
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+
+  expect(message).toMatch(/sensitive|credential/i);
+  expect(message).not.toContain(secret);
+});
+
 test('does not treat quoted source body prose as executable metadata', () => {
   const headerName = ['Authoriza', 'tion'].join('');
   const localPath = ['/', 'Users', '/', 'example', '/', 'quoted.txt'].join('');
@@ -142,7 +220,7 @@ test('does not treat quoted source body prose as executable metadata', () => {
     blocks: [{
       id: 'b1',
       kind: 'quote',
-      markdown: `The article discusses auth, X-Amz-Credential, "${headerName}: Bearer illustrative-value", ${exampleToken}, and ${localPath}.`,
+      markdown: `The article discusses auth, X-Amz-Credential, "${headerName}: Bearer illustrative-value", asset.${exampleToken}, relative/${exampleToken}/preview.png, and ${localPath}.`,
     }],
     transcript: [{
       start: 0,

@@ -251,7 +251,7 @@ function resolveResourcePath(sourcePath: string | undefined, roots: TrustedRoot[
 function validateMediaExtension(asset: MediaAsset, sourcePath: string): void {
   const extension = path.extname(asset.path ?? sourcePath).toLowerCase();
   if (VISUAL_KINDS.has(asset.kind) && !VISUAL_EXTENSIONS.has(extension)) {
-    throw new Error(`media kind ${asset.kind} is incompatible with extension ${extension || '(none)'}`);
+    throw new Error('media extension is incompatible with media kind');
   }
 }
 

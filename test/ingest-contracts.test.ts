@@ -453,6 +453,88 @@ describe('rich ingest CLI orchestration', () => {
     }
   });
 
+  test('rejects a full --write Bundle auth_token query without echoing its value or publishing an artifact', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-auth-token-bundle-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    const queryKey = ['auth', '_', 'token'].join('');
+    const queryValue = 'private-query-value-84';
+    fs.mkdirSync(vault);
+    fs.mkdirSync(bundle);
+    fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+      version: 1,
+      source: {
+        url: `https://example.com/source?${queryKey}=${queryValue}`,
+        kind: 'article',
+        title: 'Source',
+      },
+      blocks: [{ id: 'b1', kind: 'paragraph', markdown: 'Substantive source body.' }],
+      media: [],
+      provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: [] },
+      warnings: [],
+    }));
+
+    try {
+      let payload = '';
+      try {
+        await runRichIngest(parseIngestCliOptions([
+          '--bundle', bundle, '--vault-dir', vault, '--mode', 'raw', '--write',
+        ]));
+      } catch (error) {
+        payload = JSON.stringify(ingestErrorPayload(error));
+      }
+      expect(payload).toMatch(/sensitive|credential/i);
+      expect(payload).not.toContain(queryValue);
+      expect(fs.readdirSync(vault)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('does not echo an untrusted incompatible extension in a full-write error payload', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-hostile-extension-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    const secretExtension = 'private-extension-value-63';
+    const assetName = `asset.${secretExtension}`;
+    fs.mkdirSync(vault);
+    fs.mkdirSync(bundle);
+    fs.writeFileSync(path.join(bundle, assetName), 'image');
+    fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+      version: 1,
+      source: { url: 'https://example.com/source', kind: 'article', title: 'Source' },
+      blocks: [{
+        id: 'b1',
+        kind: 'image',
+        markdown: `![Local](${assetName})`,
+        mediaId: 'image-001',
+      }],
+      media: [{
+        id: 'image-001',
+        kind: 'image',
+        path: assetName,
+      }],
+      provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: [] },
+      warnings: [],
+    }));
+
+    try {
+      let payload = '';
+      try {
+        await runRichIngest(parseIngestCliOptions([
+          '--bundle', bundle, '--vault-dir', vault, '--mode', 'raw', '--write',
+        ]));
+      } catch (error) {
+        payload = JSON.stringify(ingestErrorPayload(error));
+      }
+      expect(payload).toMatch(/extension|media kind/i);
+      expect(payload).not.toContain(secretExtension);
+      expect(fs.readdirSync(vault)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('does not echo an untrusted media ID from a full Bundle write failure payload', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-hostile-media-id-'));
     const vault = path.join(root, 'vault');
