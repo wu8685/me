@@ -492,10 +492,29 @@ Skill 的语义门槛。
 layer 配置缺失时沿用 ME 默认值，但 resolved layout 必须满足：
 
 - raw/practices/cognition 三个 root 都已存在且 canonical target 是 directory；
-- 三个 lexical/canonical root pairwise distinct，且不存在相同、ancestor/descendant、
-  nested 或其他 overlap；
-- 任一 layer 不能等于 vault root、`.me`、`.me/tmp`、`.me/locks`、
-  `.me/tmp/vault-write-*` recovery、`SCHEMA.md` 或上述路径的 ancestor/descendant；
+- layer-layer matrix：任意两个 lexical roots 或 canonical roots 都不能 equal，也不能
+  互为 strict ancestor/descendant；三层只能是 disjoint sibling subtrees；
+- layer-vault matrix：layer 必须是 vault root 的 strict descendant；等于 vault root
+  或位于 vault 外都拒绝；
+- layer-reserved matrix：layer 与 `.me` 不能 equal，layer 不能是 `.me` 的 ancestor，
+  `.me` 也不能是 layer 的 ancestor；这同时排除 config、tmp、locks 和所有
+  operation/recovery。对 root `SCHEMA.md` file，layer 不能 equal，也不能是该 file 的
+  lexical ancestor；`SCHEMA.md/...` 这种 file-descendant path亦拒绝；
+- **内部 nesting 是有意允许的**，不应用 layer overlap rule：
+
+```text
+vault/.me/
+├── config.yaml
+├── locks/
+│   └── vault-write.lock
+└── tmp/
+    └── vault-write-<operationId>/
+        ├── journal.json
+        └── originals/
+```
+
+  `.me` ancestor of tmp/locks、tmp ancestor of operation、operation ancestor of
+  originals 都合法；tmp 与 locks 必须彼此 disjoint；
 - `.me` 必须是 vault 内已存在的 real directory，不接受 symlink；`tmp`/`locks`
   缺失时可在 write 的 pre-lock bootstrap 以 tracked mkdir 创建（preview 不创建），
   存在时必须是 contained real directory；
@@ -573,15 +592,23 @@ interface VaultWriteResultV1 {
   plannedPaths: string[];
   indexAction: 'none' | 'create' | 'replace';
   backlinks: Array<{ path: string; count: number }>;
-  unlinkedMentions: string[];
+  unlinkedMentions: Array<{
+    path: string;
+    count: number;
+    offsets: number[];        // zero-based UTF-8 byte offsets in original file
+  }>;
   warnings: string[];
   error?: { code: string; message: string };
   recoveryState: 'none' | 'retained-originals' | 'incomplete';
   recoveries: Array<{
     operationId: string;
-    state: 'retained-original' | 'incomplete-operation' | 'ownership-conflict';
+    state:
+      | 'retained-original'
+      | 'incomplete-operation'
+      | 'unrecognized-operation'
+      | 'ownership-conflict';
     directory: string;        // always under .me/tmp, vault-relative
-    journal: string;
+    journal?: string;
     preservedPaths: string[];
     remainingMutations: string[];
     actions: Array<{
@@ -654,23 +681,29 @@ writer 新增自己的 `bin/vault-write/graph.ts`。v1 不修改或依赖既有
   basename-only target 只有在全 vault 唯一时可 resolve，否则是 ambiguous/broken；
 - writer 自己生成的 source/index link 永远使用不带 alias/fragment/`.md` 的
   path-qualified form；
-- backlink count 是同一 source document 的实际出现次数；mentions 忽略已在同一
-  document 成为 wikilink 的 title/stem，按 `(path, offset)` 计数；
-- output 先按 vault-relative POSIX path code-point sort，再按 count/offset 固定排序，
-  不依赖 filesystem enumeration order。
+- backlink count 是同一 source document 的 resolved wikilink 实际出现次数；
+- unlinked mention 在 code/frontmatter mask 后扫描：title 使用 exact Unicode
+  code-point sequence，ASCII stem 使用 ASCII case-insensitive match；已处于 wikilink
+  span 的 occurrence 排除，同一 byte span 同时匹配 title/stem 时只计一次；
+- `offsets` 是 original UTF-8 file bytes 的 zero-based start offsets，升序且去重；
+  `count === offsets.length`；
+- backlinks 与 unlinkedMentions 都先按 vault-relative POSIX path code-point sort；
+  offsets 升序。不依赖 filesystem enumeration order。
 
 写前：
 
 1. 如果已有 resolved 入链指向 planned path，则 `indexAction: none`；
 2. 否则固定更新 `{configured-layer-root}/README.md`；
-3. managed entry 使用 target 的 layer-relative path-qualified link，例如 target 为
-   `knowledge/practices/decisions/2026-07-26-orchid-choice.md`，practices README 写
-   `[[decisions/2026-07-26-orchid-choice]]`；
+3. managed entry 始终使用 **vault-relative** path-qualified link，不随 README
+   所在目录改变解析基准。例如 target 为
+   `knowledge/practices/decisions/2026-07-26-orchid-choice.md`，README 写
+   `[[knowledge/practices/decisions/2026-07-26-orchid-choice]]`；custom layer
+   `实验记录` 则写 `[[实验记录/decisions/2026-07-26-orchid-choice]]`；
 4. managed block 按 normalized target code point 排序：
 
 ```markdown
 <!-- me:index:start -->
-- [[decisions/2026-07-26-example]]
+- [[knowledge/practices/decisions/2026-07-26-example]]
 <!-- me:index:end -->
 ```
 
@@ -684,7 +717,8 @@ writer 新增自己的 `bin/vault-write/graph.ts`。v1 不修改或依赖既有
 - operation 不新增 broken wikilink；
 - README 只发生计划内变化。
 
-backlinks 和 unlinked mentions 只作为结果建议返回，不修改其他笔记。
+backlinks 和 structured unlinked mentions
+`{path,count,offsets}[]` 只作为结果建议返回，不修改其他笔记。
 
 ### 19.8.1 Markdown destination grammar
 
@@ -721,6 +755,11 @@ containment并 exact resolve 到普通 file。Markdown link grammar 与 frontmat
 `source` grammar 是两个独立 contract；source 仍只能使用 §19.4 的 path-qualified
 wikilink。
 
+local Markdown destination 的相对基准固定为 **planned note parent directory**，不是
+process cwd、vault root、layer root 或 README parent。schema validator 因而必须同时
+接收 `ResolvedVaultLayout` 与 absolute planned note path；先相对 planned parent
+resolve，再做 vault containment与 file existence/type validation。
+
 ### 19.9 Transaction model
 
 #### Cooperative lock
@@ -734,9 +773,9 @@ wikilink。
 - lock path 与 `.me` 先做 symlink containment；
 - **只要 lock 存在，永远先返回 `conflict/LOCK_HELD`**；即使同时发现 incomplete
   journal 也不把可能仍 active 的 operation 宣布为 recovery；
-- 仅在 lock 不存在时扫描所有 `.me/tmp/vault-write-*/journal.json`：发现一个或多个
-  non-committed journal 返回 `manual_recovery/INCOMPLETE_OPERATION`，全部聚合到
-  `recoveries[]`；
+- 仅在 lock 不存在时扫描 `.me/tmp` 中名字以 `vault-write-` 开头的**每一个**
+  directory entry。valid non-committed journal 以及任何 unrecognized entry 都阻止
+  新 write，并全部聚合到 `recoveries[]`；
 - v1 不用 PID、mtime 或“过期”猜测自动删除 lock/journal；
 - release 时 close 自己的 fd 后，只有 lock 的 lstat identity、bytes 和 operationId
   仍等于 acquisition fingerprint 才能 unlink。changed/replaced lock 视为外部内容，
@@ -809,9 +848,26 @@ planned -> locked -> staged -> note-published -> index-preserved
 -> index-published -> validated -> committed
 ```
 
-启动 `write` 时发现非 `committed` journal 或 lock，writer 不自动猜测恢复，返回
-`manual_recovery/INCOMPLETE_OPERATION`。`committed` 只表示本次运行完成全部计划写入、
-ownership 校验与 post-validation；result 固定写
+startup 的**唯一 precedence** 是：existing lock → `LOCK_HELD`；no lock + operation
+scan issue → aggregate `INCOMPLETE_OPERATION` manual recovery；两者都没有才允许 acquire
+lock。
+
+operation scan 对以下每个 `vault-write-*` entry 都创建
+`state: unrecognized-operation` recovery，保留原 entry、不 follow symlink、不自动
+rename/delete：
+
+- entry 是 symlink、非 directory 或 unreadable；
+- `journal.json` missing、symlink、非普通文件、unreadable、malformed JSON；
+- journal version/operationId/state unknown，directory name 与 operationId 不匹配；
+- state 不在 `planned|locked|staged|note-published|index-preserved|index-published|
+  validated|committed`；
+- duplicate operationId 或相互矛盾的 path/state。
+
+valid non-committed journal 使用 `state: incomplete-operation`；recognized committed
+directory 不阻止 write。missing/malformed journal 时 recovery 的 `journal` 省略。
+所有 problematic entries 按 vault-relative POSIX path排序后完整返回，不能只取第一
+个。`committed` 只表示本次运行完成全部计划写入、ownership 校验与
+post-validation；result 固定写
 `commitModel: journaled-cooperative`，绝不使用 `atomic: true`。
 
 #### Plan fingerprint 与 mutation-boundary revalidation
@@ -837,6 +893,11 @@ input 仍必须匹配；若变化，按 ownership rollback/manual recovery 处�
 
 每次 `link`、`rename`、`unlink`、`mkdir`、`rmdir` 前立即重跑该 source/destination 及
 existing parent chain 的 lexical/canonical containment。不能只依赖 plan-time check。
+test-only `beforeFsMutation(kind, paths)` 在每次真实 mutation 的最终 check 前、紧邻 fs
+call 触发；kind 为 `link|rename|unlink|mkdir|rmdir`，link/rename paths 固定为
+`[source,destination]`，其余为 `[target]`。测试通过该 hook 在五类 mutation window
+替换 parent/symlink/destination，证明没有未覆盖的 fs call。production CLI 不接受
+hook。
 
 #### Commit cleanup 与 retained recovery
 
@@ -901,9 +962,30 @@ Decision Brief 明确保存阶段性判断时：
    `not written`，不得用空字符串、当前 note 自链、虚构 link 或 remote URL 绕过
    practices profile；
 3. target 固定为 configured practices layer 下
-   `decisions/YYYY-MM-DD-<slug>.md`。slug 从 Decision title 生成 lowercase ASCII
-   kebab-case；无法生成时使用 `decision-<requestDigest前12位>`。existing path 或
-   case-fold stem collision 返回 conflict，不自动加 `-2` 或改写别的文件；
+   `decisions/YYYY-MM-DD-<slug>.md`。slug 的唯一 input 是 Decision Contract
+   `Decision` field 的原始 string，不含 owner、日期、brief body 或 writer request。
+   精确算法：
+
+```ts
+const normalizedTitle = decision
+  .normalize('NFKC')
+  .trim()
+  .replace(/\p{White_Space}+/gu, ' ')
+  .toLowerCase();
+const ascii = normalizedTitle
+  .replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-+|-+$/g, '')
+  .slice(0, 60)
+  .replace(/-+$/g, '');
+const slug = ascii || `decision-${
+  sha256(Buffer.from(normalizedTitle, 'utf8')).slice(0, 12)
+}`;
+```
+
+   `.toLowerCase()` 使用 ECMAScript locale-independent mapping，不用
+   `toLocaleLowerCase`。empty/全中文/全符号 title 都按 normalized UTF-8 title hash，
+   不使用 requestDigest。existing path 或 case-fold stem collision 返回 conflict，
+   不自动加 `-2`、重新 hash 或改写别的文件；
 4. frontmatter `project` 仅在 Decision Contract 有明确项目时填写 path-qualified
    wikilink/plain string，否则使用 template 允许的 empty string；
 5. 先调用 `preview`，向用户/Agent 暴露 target、index action 和 validation；
@@ -937,3 +1019,10 @@ Decision Brief 明确保存阶段性判断时：
     post-validation 重验，四个 hook boundary 的变更均被检测。
 13. Decision Brief practices note 固定为 reflection、path-qualified existing source
     和 deterministic `decisions/` target；无 provenance 或 collision 时 not written。
+14. managed index 对 default/custom layer 都生成 full vault-relative link；local
+    Markdown destination 相对 planned note parent resolve。
+15. 每种 fs mutation 都经过 `beforeFsMutation` test window 与即时 containment。
+16. 任意 malformed/missing/unreadable/symlink/unknown `vault-write-*` entry 在 no-lock
+    startup 全量进入 `recoveries[]` 并阻止 write。
+17. unlinked mentions 返回 deterministic `{path,count,offsets}[]`，count 与 UTF-8 byte
+    offsets一致。

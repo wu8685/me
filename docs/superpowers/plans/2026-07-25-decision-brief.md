@@ -475,15 +475,19 @@ export interface VaultWriteResultV1 {
   plannedPaths: string[];
   indexAction: 'none' | 'create' | 'replace';
   backlinks: Array<{ path: string; count: number }>;
-  unlinkedMentions: string[];
+  unlinkedMentions: Array<{ path: string; count: number; offsets: number[] }>;
   warnings: string[];
   error?: { code: string; message: string };
   recoveryState: 'none' | 'retained-originals' | 'incomplete';
   recoveries: Array<{
     operationId: string;
-    state: 'retained-original' | 'incomplete-operation' | 'ownership-conflict';
+    state:
+      | 'retained-original'
+      | 'incomplete-operation'
+      | 'unrecognized-operation'
+      | 'ownership-conflict';
     directory: string;
-    journal: string;
+    journal?: string;
     preservedPaths: string[];
     remainingMutations: string[];
     actions: Array<{
@@ -603,9 +607,13 @@ expect(parseVaultWriteRequest({
 - `layers.practices: knowledge/practices` 正确解析；
 - 缺失 config 使用 raw/practices/cognition defaults；
 - layer traversal、absolute layer、escaping symlink、dangling symlink；
-- pairwise same/duplicate/ancestor/descendant/nested layer roots；
-- layer 等于 vault root、`.me`、tmp、locks、schema、operation recovery，或与它们
-  ancestor/descendant overlap；
+- layer-layer lexical 与 canonical matrices：equal 或互为 ancestor/descendant 全拒绝；
+- layer-vault：必须是 strict descendant，等于 root/在外部拒绝；
+- layer-reserved：与 `.me` equal/任一方向 ancestor 拒绝；layer equal/ancestor of
+  root `SCHEMA.md` 或 `SCHEMA.md/...` file-descendant 拒绝；
+- 明确接受 internal matrix：`.me > tmp > vault-write-<id> > originals` 和
+  `.me > locks > vault-write.lock`；tmp/locks disjoint。不能把 layer 的 pairwise
+  overlap rule误用于这些预期 nesting；
 - configured layer exists 但不是 directory；`.me` 是 symlink；
 - `.me`、`.me/tmp`、`.me/locks`、`SCHEMA.md`、layer README symlink escape；
 - symlinked vault root 本身合法，lexical/canonical root 配对正确；
@@ -634,9 +642,10 @@ candidate === root || candidate.startsWith(root + path.sep)
 以及每个 existing prefix 的 `realpath` 位于 canonical vault。不要用
 `existsSync` 把 dangling symlink 当“缺失”。解析 config 只接受
 `layers.{raw,practices,cognition}` 的 string scalar；duplicate/ambiguous key
-fail closed。`resolveVaultLayout` 对所有 layer/internal roots 构造 lexical +
-canonical interval，做 pairwise overlap matrix；preview 不创建缺失 internal dir，
-write 只在 pre-lock bootstrap 中以 tracked mkdir 创建 safe tmp/locks child。
+fail closed。`resolveVaultLayout` 分开执行 layer-layer、layer-vault、layer-reserved
+matrices；internal paths 按显式 allow-tree 验证，不能使用一个“所有 path 不得 nested”
+的通用循环。preview 不创建缺失 internal dir，write 只在 pre-lock bootstrap 中以
+tracked mkdir 创建 safe tmp/locks child。
 
 - [ ] **Step 5: 运行 tests 与 typecheck**
 
@@ -705,8 +714,9 @@ export function loadLayerSchema(
   layer: LogicalLayer,
 ): LayerSchemaContract;
 export function validateNoteMarkdown(
+  layout: ResolvedVaultLayout,
+  plannedNotePath: string,
   markdown: string,
-  targetStem: string,
   contract: LayerSchemaContract,
 ): ValidatedNote;
 ```
@@ -768,6 +778,9 @@ string；不依赖未安装的 YAML package。Markdown tests 必须逐项覆盖�
 - reject raw/once/twice/4-level percent-encoded dot/slash/backslash traversal，invalid
   percent 和 decode depth >4；
 - code fence/inline code 中看似非法 destination 不参与 validation。
+- local destination 的 relative base 必须是 `path.dirname(plannedNotePath)`，不是
+  process cwd、vault root 或 layer root；default/custom nested target 各测试
+  `../sources/note.md` 的 contained resolution，以及 escape rejection。
 
 - [ ] **Step 3: 运行确认 RED**
 
@@ -780,7 +793,8 @@ Expected: FAIL，`schema.ts` 不存在。
 只实现 profile/template 当前使用的 YAML subset。遇到不认识的 YAML construct 直接
 `validation_failed`，不做宽松 coercion。frontmatter field 顺序不影响验证；写入 bytes
 保持 request 原样，不由 writer 重新序列化。`SCHEMA.md` 只算 exact bytes SHA-256，
-代码中禁止 Markdown heading/table regex。
+代码中禁止 Markdown heading/table regex。`validateNoteMarkdown` 必须用传入 layout
+和 planned note parent解析 local destinations，并在 resolution 时再次做 containment。
 
 - [ ] **Step 5: 运行 tests 与提交**
 
@@ -823,7 +837,7 @@ export interface IndexPlan {
 
 export interface LinkSuggestions {
   backlinks: Array<{ path: string; count: number }>;
-  unlinkedMentions: string[];
+  unlinkedMentions: Array<{ path: string; count: number; offsets: number[] }>;
 }
 
 export function snapshotVaultGraph(layout: ResolvedVaultLayout): VaultGraphSnapshot;
@@ -863,6 +877,9 @@ export function validatePostWriteGraph(
 - 三层 duplicate stem（包括 case-only）fail closed；
 - escaping/dangling symlink 与 directory enumeration order reversal；
 - backlink count、mention count/offset、path sort 在重复运行中 exact deterministic。
+- mention offsets 是 original file 的 zero-based UTF-8 byte offsets；title exact
+  Unicode、stem ASCII case-insensitive；排除 wikilink spans，相同 span dedupe，
+  `count === offsets.length`。
 
 - [ ] **Step 2: 写 graph no-regression RED tests**
 
@@ -873,8 +890,11 @@ export function validatePostWriteGraph(
 - vault 既有 broken link 不导致无关 write 失败；
 - index bytes 与 plan digest 不一致时失败；
 - suggestions 只返回 vault-relative POSIX paths。
-- managed block 生成 layer-relative path-qualified link，例如
-  `[[decisions/2026-07-26-orchid-choice]]`，不再生成 basename-only link。
+- managed block 生成 full vault-relative path-qualified link，例如 default target
+  `knowledge/practices/decisions/2026-07-26-orchid-choice.md` 生成
+  `[[knowledge/practices/decisions/2026-07-26-orchid-choice]]`；custom practices
+  `实验记录` 生成 `[[实验记录/decisions/2026-07-26-orchid-choice]]`。不得生成
+  layer-relative 或 basename-only link。
 
 - [ ] **Step 3: 运行确认 RED**
 
@@ -910,6 +930,10 @@ git commit -m "feat: plan deterministic vault reachability"
 
 ```ts
 export interface VaultWriteHooks {
+  beforeFsMutation?(
+    kind: 'link' | 'rename' | 'unlink' | 'mkdir' | 'rmdir',
+    paths: string[],
+  ): void;
   afterLock?(): void;
   afterStaging?(): void;
   beforeNotePublish?(path: string): void;
@@ -939,10 +963,17 @@ export interface VaultWriterOptions {
   pluginRoot: string;
   mode: 'preview' | 'write';
   hooks?: VaultWriteHooks; // tests only; CLI never accepts hooks
-  fileOps?: {
+  fileOps?: Partial<{
+    readdirSync: typeof import('fs').readdirSync;
+    lstatSync: typeof import('fs').lstatSync;
+    realpathSync: typeof import('fs').realpathSync;
+    readFileSync: typeof import('fs').readFileSync;
     linkSync: typeof import('fs').linkSync;
     renameSync: typeof import('fs').renameSync;
-  };
+    unlinkSync: typeof import('fs').unlinkSync;
+    mkdirSync: typeof import('fs').mkdirSync;
+    rmdirSync: typeof import('fs').rmdirSync;
+  }>;
 }
 
 export function executeVaultWrite(
@@ -980,6 +1011,15 @@ export function executeVaultWrite(
 - lock 不存在且有 2 个以上 incomplete journal → 一次
   `manual_recovery/INCOMPLETE_OPERATION`，`recoveries[]` 全部列出且 aggregate
   `recoveryState: incomplete`；
+- lock 不存在时混合以下 `vault-write-*` entries：valid incomplete、symlink、
+  non-directory、unreadable directory、missing/symlink/non-file/unreadable/malformed
+  journal、unknown version/state、directory-operationId mismatch、duplicate
+  operationId。每项均保留并结构化返回；unrecognized 使用
+  `state: unrecognized-operation`，missing journal 不伪造 journal path；
+- 同一 fixture 加上 existing lock 后只能返回 `LOCK_HELD`，不得返回 recoveries；
+- recognized committed operation directory 不阻止下一次 write；
+- unreadable cases 使用 injected `readdirSync/lstatSync/readFileSync` errors，不能依赖
+  chmod 在 root/Windows 上恰好失败；
 - release lock 前 hook replace/edit lock：identity/bytes 不再 owned，不删除，返回
   manual recovery；
 - `.me/locks` escaping/dangling symlink → validation failure；
@@ -1015,6 +1055,16 @@ beforePostValidation
   都会立即 containment failure，不依赖旧 plan；
 - PlanFingerprint inputs 按 relative path deterministic sort，包含 bytes hash +
   dev/ino/type/mode/size/mtimeNs/ctimeNs。
+
+`beforeFsMutation` 必须在每一次实际 fs mutation 的最终 containment/ownership check
+之前且紧邻调用触发；`paths` 顺序固定：
+
+- link/rename：`[source, destination]`；
+- unlink/mkdir/rmdir：`[target]`。
+
+tests 对五种 kind 各至少一次在 hook 中把 parent 替换为 escaping symlink 或创建
+destination，断言真实 fs call未执行、外部 bytes 保留、result conflict/manual
+recovery正确。specialized hooks 只表达业务阶段，不能替代这个全 mutation hook。
 
 - [ ] **Step 4: 写 index 并发窗口 RED tests**
 
@@ -1053,8 +1103,9 @@ committed/full rollback。
 - retained original 的 plural recovery actions 包含 inspect/compare/conditional
   remove-owned guidance，不含无条件 recursive delete；
 - 每个 state `locked/staged/note-published/index-preserved/index-published/validated`
-  的 fixture journal 在下次 write 被识别为
-  `manual_recovery/INCOMPLETE_OPERATION`，不得自动删除 lock 或猜恢复。
+  的 fixture journal 在**lock absent**时被识别为
+  `manual_recovery/INCOMPLETE_OPERATION`；若 lock present 则只有 `LOCK_HELD`。不得
+  自动删除 lock/operation entry 或猜恢复。
 
 - [ ] **Step 6: 运行确认 RED**
 
@@ -1113,6 +1164,8 @@ bun run bin/vault-write.ts write   --vault-dir VAULT [--request .me/tmp/request.
 - every code/status/exit/public message comes from Task 6 `WRITER_ERROR_CATALOG`；
 - 2+ incomplete operations serialize as plural `recoveries[]` with no absolute path and
   none omitted；
+- mixed incomplete + unrecognized operation entries serialize every recovery, including
+  an item without `journal` for missing/malformed journal；
 - stdout 恰好一个可 parse JSON object，stderr 不含 request；
 - unknown flag、重复 flag、缺 mode/vault、非 JSON、多 object、invalid UTF-8；
 - request file 只允许 contained `.me/tmp/*.json`，拒绝 outside、escaping/dangling
@@ -1228,8 +1281,21 @@ before/after hash、Agent 关键原话；不得只靠关键词自动评分。
 - [ ] **Step 3: 修改 Skill 最小规则**
 
 把当前“qualifying writer/atomic commit”抽象说明收敛成可执行命令、
-`journaled-cooperative` commit model 和 status table。Decision title 生成 lowercase
-ASCII kebab slug；无法生成时使用 `decision-<requestDigest前12位>`。Markdown request
+`journaled-cooperative` commit model 和 status table。slug 唯一 input 为 Decision
+Contract 的 raw `Decision` string：
+
+```ts
+const normalizedTitle = decision.normalize('NFKC').trim()
+  .replace(/\p{White_Space}+/gu, ' ').toLowerCase();
+const ascii = normalizedTitle.replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, '');
+const slug = ascii || `decision-${sha256(
+  Buffer.from(normalizedTitle, 'utf8')
+).slice(0, 12)}`;
+```
+
+测试 ASCII、full-width、Unicode whitespace、mixed case、全中文、全符号、empty、
+>60 chars；locale 切换不改变结果。fallback 不得使用 requestDigest。Markdown request
 通过 stdin，不写 shell argv；临时 request 需要时只能放 `.me/tmp`。
 
 - [ ] **Step 4: 复测与提交**
