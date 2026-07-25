@@ -235,6 +235,7 @@ describe('finalizeIngest', () => {
       kind: 'topic',
       markdown: '# Complete Course（讲义）\n\n完整内容\n',
       usedMediaIds: [],
+      includedTranscriptSegments: [],
       omittedTranscriptSegments: [0],
       warnings: ['incomplete-transcript-mapping'],
     };
@@ -385,6 +386,28 @@ describe('finalizeIngest', () => {
     expect(stagingEntries(vault)).toEqual([]);
   });
 
+  test('preserves a published artifact when concurrent user content makes rollback unsafe', () => {
+    const vault = makeVault();
+    const artifact = path.dirname(expectedNote(vault));
+    const userFile = path.join(artifact, 'user-created-after-publish.txt');
+    const parent = path.dirname(artifact);
+    const readmePath = path.join(parent, 'README.md');
+    fs.mkdirSync(parent, { recursive: true });
+    fs.writeFileSync(readmePath, '# Existing index\n');
+
+    expect(() => finalizeIngest(validArticleInput(vault), {
+      beforeReadmeCompare() {
+        fs.writeFileSync(userFile, 'concurrent user data');
+        fs.writeFileSync(readmePath, '# Concurrent user edit\n');
+      },
+      renameSync: fs.renameSync,
+    })).toThrow(/manual recovery/i);
+
+    expect(fs.readFileSync(userFile, 'utf8')).toBe('concurrent user data');
+    expect(fs.readFileSync(readmePath, 'utf8')).toBe('# Concurrent user edit\n');
+    expect(fs.existsSync(expectedNote(vault))).toBeTrue();
+  });
+
   test('rejects unsupported media syntax instead of omitting it from validation', () => {
     const fixtures = [
       '段落一\n\n![图一](images/image-001.jpg)\n\n![[../../private.png]]',
@@ -399,6 +422,37 @@ describe('finalizeIngest', () => {
       expect(() => finalizeIngest(input)).toThrow(/unsupported media syntax/);
       expect(fs.existsSync(expectedNote(vault))).toBeFalse();
     }
+  });
+
+  test('ignores media-looking examples in inline and correctly nested fenced code', () => {
+    const vault = makeVault();
+    const input = validArticleInput(vault);
+    input.processedMarkdown = [
+      '段落一',
+      '',
+      '![图一](images/image-001.jpg)',
+      '',
+      '`<img src="/etc/passwd">` and `![[private.png]]` and `![code](../../private.png)`',
+      '',
+      '````md',
+      '```',
+      '<img src="/etc/passwd">',
+      '![[private.png]]',
+      '![code](../../private.png)',
+      '```',
+      '````',
+      '',
+      '~~~~md',
+      '~~~',
+      '![code](../../private.png)',
+      '~~~',
+      '~~~~',
+    ].join('\n');
+
+    const result = finalizeIngest(input);
+
+    expect(fs.existsSync(result.notePath)).toBeTrue();
+    expect(fs.readFileSync(result.notePath, 'utf8')).toContain('![图一](images/image-001.jpg)');
   });
 
   test('rejects an empty or metadata-only video handout', () => {
@@ -425,6 +479,7 @@ describe('finalizeIngest', () => {
         kind: 'topic',
         markdown: '# Empty Course（讲义）\n\n> 作者：未知｜总时长：01:00\n',
         usedMediaIds: [],
+        includedTranscriptSegments: [],
         omittedTranscriptSegments: [],
         warnings,
       };
@@ -465,6 +520,7 @@ describe('finalizeIngest', () => {
         kind: 'topic',
         markdown: '# Metadata Only（讲义）\n\n必须保留的完整论证\n',
         usedMediaIds: [],
+        includedTranscriptSegments: [],
         omittedTranscriptSegments: [],
         warnings: [],
       },
@@ -473,7 +529,49 @@ describe('finalizeIngest', () => {
       stem: '2026-07-25-metadata-only',
       created: '2026-07-25',
       trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
-    })).toThrow(/substantive/i);
+    })).toThrow(/processed handout|coverage|transcript/i);
+  });
+
+  test('rejects a handout whose included mapping does not cover every transcript segment', () => {
+    const vault = makeVault();
+    const source: ExtractedSource = {
+      source: {
+        url: 'https://example.com/incomplete-course',
+        kind: 'course',
+        title: 'Incomplete Course',
+        durationSec: 60,
+      },
+      blocks: [],
+      transcript: [
+        { start: 0, end: 30, text: '第一段完整论证' },
+        { start: 30, end: 60, text: '第二段完整论证' },
+      ],
+      media: [],
+      provenance: {
+        extractor: 'fixture',
+        extractedAt: '2026-07-25T00:00:00Z',
+        methods: ['fixture'],
+      },
+      warnings: [],
+    };
+    const handout = {
+      kind: 'topic',
+      markdown: '# Incomplete Course（讲义）\n\n第一段完整论证\n',
+      usedMediaIds: [],
+      includedTranscriptSegments: [0],
+      omittedTranscriptSegments: [],
+      warnings: [],
+    } satisfies HandoutResult;
+
+    expect(() => finalizeIngest({
+      vaultDir: vault,
+      source,
+      handout,
+      topic: 'courses',
+      stem: '2026-07-25-incomplete-course',
+      created: '2026-07-25',
+      trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+    })).toThrow(/coverage|transcript/i);
   });
 
   test('rejects unsafe or noncanonical stems before creating an artifact', () => {
@@ -521,6 +619,33 @@ describe('finalizeIngest', () => {
     expect(result.backlinks).toEqual([]);
   });
 
+  test('requires a matching fence marker and sufficient closing length for backlink scanning', () => {
+    const vault = makeVault();
+    const raw = path.join(vault, 'knowledge/raw');
+    const stem = '2026-07-25-atomic-ingest-guide';
+    fs.writeFileSync(path.join(raw, 'four-backticks.md'), [
+      '````md',
+      '```',
+      `[[${stem}]]`,
+      '```',
+      '````',
+      '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(raw, 'four-tildes.md'), [
+      '~~~~md',
+      '~~~',
+      `[[${stem}]]`,
+      '~~~',
+      '~~~~',
+      '',
+    ].join('\n'));
+
+    const result = finalizeIngest(validArticleInput(vault));
+
+    expect(result.backlinks).toEqual([]);
+    expect(result.readmePath).toBe(path.join(raw, 'atomic-ingest', 'README.md'));
+  });
+
   test('rejects a duplicate stem anywhere in configured vault layers', () => {
     const vault = makeVault();
     const duplicate = path.join(
@@ -566,6 +691,34 @@ describe('finalizeIngest', () => {
     ].join('\n');
     expect(() => finalizeIngest(malformed)).toThrow(/tag/i);
 
+    for (const tags of ['[true]', '[123]', '[{secret: value}]']) {
+      const invalidVault = makeVault();
+      const invalid = validArticleInput(invalidVault);
+      invalid.frontmatter = [
+        '---',
+        'title: "Atomic Ingest Guide"',
+        'created: 2026-07-25',
+        `tags: ${tags}`,
+        'type: article',
+        'source: "https://example.com/article"',
+        '---',
+      ].join('\n');
+      expect(() => finalizeIngest(invalid)).toThrow(/tag/i);
+    }
+
+    const quotedVault = makeVault();
+    const quoted = validArticleInput(quotedVault);
+    quoted.frontmatter = [
+      '---',
+      'title: "Atomic Ingest Guide"',
+      'created: 2026-07-25',
+      'tags: ["ingest", \'atomic-write\']',
+      'type: article',
+      'source: "https://example.com/article"',
+      '---',
+    ].join('\n');
+    expect(() => finalizeIngest(quoted)).not.toThrow();
+
     const vault = makeVault();
     const result = finalizeIngest(validArticleInput(vault));
     expect(fs.readFileSync(result.notePath, 'utf8')).toContain('tags: ["ingest", "atomic"]');
@@ -592,6 +745,19 @@ describe('finalizeIngest', () => {
     const input = validArticleInput(vault);
     input.source.media[0].path = writeAsset(vault, 'not-an-image.txt', 'text');
     expect(() => finalizeIngest(input)).toThrow(/extension|media kind/i);
+  });
+
+  test('rejects a .me symlink that escapes the vault before creating reservation locks', () => {
+    const vault = makeVault();
+    const externalMe = temporaryDirectory('me-finalize-external-me-');
+    fs.cpSync(path.join(vault, '.me'), externalMe, { recursive: true });
+    fs.rmSync(path.join(vault, '.me'), { recursive: true });
+    fs.symlinkSync(externalMe, path.join(vault, '.me'));
+    const input = validArticleInput(vault);
+    input.trustedResourceRoots = [path.join(externalMe, 'tmp')];
+
+    expect(() => finalizeIngest(input)).toThrow(/\\.me|outside vault/i);
+    expect(fs.existsSync(path.join(externalMe, 'ingest-reservations'))).toBeFalse();
   });
 
   test('returns related notes, backlinks, and unlinked mentions without editing notes', () => {
@@ -665,6 +831,7 @@ describe('finalizeIngest', () => {
       kind: 'slide',
       markdown: '# Complete Course（讲义）\n\n![第一页](<slides/slide one.jpg>)\n\n完整课程内容\n',
       usedMediaIds: ['slide-001'],
+      includedTranscriptSegments: [0],
       omittedTranscriptSegments: [],
       warnings: [],
     };

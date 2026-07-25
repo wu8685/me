@@ -339,6 +339,7 @@ describe('formatHandout', () => {
     expect(result.markdown).toContain('第三段结论保留原意。');
     expect(result.markdown).not.toContain('Key Points');
     expect(result.usedMediaIds).toEqual(['slide-001', 'slide-002', 'slide-003']);
+    expect(result.includedTranscriptSegments).toEqual([0, 1, 2]);
     expect(result.omittedTranscriptSegments).toEqual([]);
   });
 
@@ -404,6 +405,7 @@ describe('formatHandout', () => {
     expect(result.markdown).toContain('继续展开。');
     expect(result.markdown).toContain('编辑说明：已按术语表校订专名，未删减论证。');
     expect(result.usedMediaIds).toEqual(['frame-001']);
+    expect(result.includedTranscriptSegments).toEqual([0, 1]);
     expect(result.omittedTranscriptSegments).toEqual([]);
   });
 
@@ -440,6 +442,7 @@ describe('formatHandout', () => {
     expect(first.markdown).toContain('## §2 · 07:50–13:20 · 主题 2');
     expect(first.markdown).toContain('完整片段 1');
     expect(first.markdown).toContain('完整片段 78');
+    expect(first.includedTranscriptSegments).toEqual(Array.from({ length: 78 }, (_, index) => index));
     expect(first.omittedTranscriptSegments).toEqual([]);
   });
 
@@ -478,6 +481,7 @@ describe('formatHandout', () => {
 
     expect(result.markdown).not.toContain('结束时间越界。');
     expect(result.markdown).not.toContain('起点位于 duration。');
+    expect(result.includedTranscriptSegments).toEqual([]);
     expect(result.omittedTranscriptSegments).toEqual([0, 1]);
     expect(result.usedMediaIds).toEqual([]);
   });
@@ -494,6 +498,7 @@ describe('formatHandout', () => {
 
     expect(result.markdown).toContain('有效片段');
     expect(result.markdown).not.toContain('越界片段');
+    expect(result.includedTranscriptSegments).toEqual([0]);
     expect(result.omittedTranscriptSegments).toEqual([1]);
     expect(result.warnings).toContain('incomplete-transcript-mapping');
   });

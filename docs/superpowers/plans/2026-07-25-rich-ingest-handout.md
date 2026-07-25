@@ -573,12 +573,18 @@ interface HandoutResult {
   kind: 'slide' | 'topic';
   markdown: string;
   usedMediaIds: string[];
+  includedTranscriptSegments: number[];
   omittedTranscriptSegments: number[];
   warnings: string[];
 }
 ```
 
-只要 `omittedTranscriptSegments` 非空，finalizer 必须拒绝“完整讲义”状态。
+formatter 必须让每个 transcript index 恰好出现在
+`includedTranscriptSegments` 或 `omittedTranscriptSegments` 之一，且不得重复。
+finalizer 只接受 transcript 非空、`includedTranscriptSegments` 完整覆盖
+`0..transcript.length-1`、`omittedTranscriptSegments` 为空、warnings 不含
+`transcript-empty` 的正式讲义。`processedMarkdown` 中看似有正文的行不能替代这份
+coverage mapping。
 
 - [ ] **Step 8: 运行测试**
 
@@ -638,18 +644,24 @@ Expected: FAIL，缺少 `finalize.ts`。
 
 - [ ] **Step 3: 实现 staging 与验证**
 
-顺序必须是：topic exclusive lock + vault-wide stem reservation → vault-wide stem
-唯一性与 destination check → 在目标 topic 内 `mkdtemp` → 复制/生成全部资源 → 验证 frontmatter、tags、
-相对引用、图片数量/顺序、media syntax 与 transcript 完整性 → destination 二次检查 →
-将整个 `<stem>/` staging 目录一次同文件系统 `renameSync` 发布 → 校验 README
-snapshot 内容/metadata 未变 → 通过同目录临时文件原子替换最近一级 README。
-README CAS/替换失败时删除本次 artifact 并保留或恢复原 README；任何错误都清理
-staging/lock。已有目标不得覆盖，同 topic 第二篇图文使用独立 artifact `images/`。
+顺序必须是：验证 `.me` lexical path/realpath 不逃出 vault → topic exclusive lock +
+vault-wide stem reservation → vault-wide stem 唯一性与 destination check → 在目标
+topic 内 `mkdtemp` → 复制/生成全部资源 → 验证 frontmatter、tags、相对引用、图片
+数量/顺序、media syntax 与 transcript coverage → 记录 staging artifact manifest →
+destination 二次检查 → 将整个 `<stem>/` staging 目录一次同文件系统 `renameSync`
+发布 → 校验 README snapshot 内容/metadata 未变 → 通过同目录临时文件原子替换最近
+一级 README。
+
+README CAS/替换失败时，只能在 final artifact 与发布 manifest 完全一致时删除 artifact。
+若发现新增、删除或变化的 entry，必须保留 final artifact 与当前 README，并抛出明确的
+manual-recovery error，不能递归删除并发用户内容。任何错误都清理 staging/lock。
+已有目标不得覆盖，同 topic 第二篇图文使用独立 artifact `images/`。
 
 adversarial tests 必须覆盖：check→rename 并发目标、README snapshot→replace 并发编辑、
-协作 finalizer 串行、unsupported Obsidian/HTML/reference-style media、空/metadata-only
-handout、非法 stem/tag、stale staging/code-block false backlink、跨 topic duplicate stem、
-过宽 trusted root 与 media kind/extension 不匹配。
+artifact publish→README CAS 间的并发用户写入、协作 finalizer 串行、`.me` symlink
+escape、unsupported Obsidian/HTML/reference-style media、code span/fence 排除、空或
+coverage 不完整的 handout、非法 stem/tag、stale staging/code-block false backlink、
+跨 topic duplicate stem、过宽 trusted root 与 media kind/extension 不匹配。
 
 - [ ] **Step 4: 实现 backlinks 建议**
 

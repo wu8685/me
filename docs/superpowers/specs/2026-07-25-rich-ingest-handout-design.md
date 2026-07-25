@@ -336,20 +336,26 @@ Finalizer 必须：
 1. 由 orchestration 显式传入至少一个窄范围 `trustedResourceRoots`；不得信任 `/`、
    home、vault root 或能包含 home/vault 的祖先目录，也不把该能力暴露成用户可传的
    CLI 参数；
-2. 在 topic 目录取得 exclusive lock，并在 vault 内取得 stem reservation；二者覆盖
+2. 在创建 lock/reservation 前验证 `.me` 的 lexical path 与 realpath 均位于 vault；
+   `.me` symlink 指向外部时 fail closed，不得在外部创建 lock；
+3. 在 topic 目录取得 exclusive lock，并在 vault 内取得 stem reservation；二者覆盖
    uniqueness/destination check、artifact publish 与 README compare-and-swap。同 topic
    协作 finalizer 必须串行，不同 topic 的同 stem 也不能并发发布；
-3. 在目标 vault/topic 内创建 staging 目录，生成 Markdown 与全部资源；
-4. 验证 frontmatter、English kebab-case tags、资源类型/扩展、相对引用、图片数量与
+4. 在目标 vault/topic 内创建 staging 目录，生成 Markdown 与全部资源；
+5. 验证 frontmatter、English kebab-case tags、资源类型/扩展、相对引用、图片数量与
    顺序、transcript 完整性；不支持的 Obsidian/HTML/reference-style media syntax
-   必须显式拒绝；
-5. 将整个 `<stem>/` staging 目录以一次同文件系统 `rename` 发布；已有同名目标
+   必须显式拒绝；media/backlink scanner 必须忽略 inline code，并按 opening marker
+   字符与长度正确处理 fenced code；
+6. 记录 staging artifact manifest，再将整个 `<stem>/` staging 目录以一次同文件系统
+   `rename` 发布；已有同名目标
    或 vault 其他位置的同 stem 均 fail closed；
-6. 检查索引可达性；扫描排除 staging，并忽略 frontmatter/fenced code 中的 wikilink；
-7. 若没有有效入链，则以 snapshot 内容和 metadata 做 README compare-and-swap，
+7. 检查索引可达性；扫描排除 staging，并忽略 frontmatter/fenced/inline code 中的
+   wikilink；
+8. 若没有有效入链，则以 snapshot 内容和 metadata 做 README compare-and-swap，
    再通过同目录 temp rename 替换；
-8. README 变化或替换失败时撤销本次 artifact；并发用户内容不得被恢复逻辑覆盖；
-9. 返回 related notes/backlinks/unlinked mentions 建议，不修改其他笔记正文。
+9. README 变化或替换失败时，只有 artifact 与发布 manifest 完全一致才可删除；发现
+   新增或变化的用户内容时保留 artifact 与当前 README，并报 manual recovery；
+10. 返回 related notes/backlinks/unlinked mentions 建议，不修改其他笔记正文。
 
 topic exclusive lock、vault-wide stem reservation 与二次 destination check 保证所有
 遵守 contract 的 finalizer 不会互相覆盖。外部 hostile writer 若绕过 lock，portable Node/Bun 文件 API 无
@@ -365,9 +371,11 @@ topic exclusive lock、vault-wide stem reservation 与二次 destination check �
 - PDF 只得到摘要页却被当作全文；
 - bundle path 越界或包含禁止字段；
 - transcript 时间范围无效；
-- 视频/课程 transcript 为空、含 `transcript-empty`、或正式讲义只有 metadata/header；
+- 视频/课程 transcript 为空、含 `transcript-empty`、included mapping 未覆盖全部
+  transcript index、或 omitted mapping 非空；metadata-only `processedMarkdown`
+  不能替代 coverage mapping；
 - 图片数量不一致且未报告；
-- 正式讲义缺少主体正文。
+- Task 6 formatter 未让每个合法 transcript segment 恰好进入 included/omitted 之一。
 
 允许的部分成功：
 
@@ -386,6 +394,10 @@ topic exclusive lock、vault-wide stem reservation 与二次 destination check �
 - resource root 只由 adapter/bundle orchestration 建立，且必须窄于 vault/home/root；
 - source media 的 lexical path 与 realpath 都必须落在同一个 trusted root 内；
 - 不支持的 media embed syntax 必须拒绝，不能因 parser 未识别而漏过 traversal/absolute 引用；
+- media 与 backlink scanner 必须忽略 inline/fenced code；fence closing marker 必须与
+  opening marker 同字符且长度不短于 opening；
+- custom frontmatter 的 tags 只接受显式 quoted YAML strings；boolean、number、mapping
+  即使字面符合 kebab regex 也必须拒绝；
 - 浏览器登录态只存在于 Agent 会话，不写入 ME 产物；
 - 公开 fixture 不包含真实付费内容。
 

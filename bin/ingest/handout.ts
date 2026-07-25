@@ -20,6 +20,7 @@ export interface HandoutResult {
   kind: 'slide' | 'topic';
   markdown: string;
   usedMediaIds: string[];
+  includedTranscriptSegments: number[];
   omittedTranscriptSegments: number[];
   warnings: string[];
 }
@@ -163,7 +164,8 @@ function assignContent(
   transcript: TranscriptSegment[],
   media: MediaAsset[],
   duration: number,
-): { omitted: number[]; usedMediaIds: string[] } {
+): { included: number[]; omitted: number[]; usedMediaIds: string[] } {
+  const included: number[] = [];
   const omitted: number[] = [];
   transcript.forEach((segment, index) => {
     if (!segmentIsValid(segment, duration)) {
@@ -178,6 +180,7 @@ function assignContent(
       return;
     }
     section.transcript.push({ index, segment });
+    included.push(index);
   });
 
   const usedMediaIds: string[] = [];
@@ -190,7 +193,7 @@ function assignContent(
     section.media.push(asset);
     usedMediaIds.push(asset.id);
   }
-  return { omitted, usedMediaIds };
+  return { included, omitted, usedMediaIds };
 }
 
 function transcriptMarkdown(segment: TranscriptSegment): string {
@@ -279,7 +282,7 @@ export function formatHandout(source: ExtractedSource, options: HandoutOptions):
     pageCount = 0;
   }
 
-  const { omitted, usedMediaIds } = assignContent(sections, transcript, media, duration);
+  const { included, omitted, usedMediaIds } = assignContent(sections, transcript, media, duration);
   if (transcript.length === 0) warnings.push('transcript-empty');
   if (omitted.length > 0) warnings.push('incomplete-transcript-mapping');
   const markdown = [
@@ -291,6 +294,7 @@ export function formatHandout(source: ExtractedSource, options: HandoutOptions):
     kind,
     markdown,
     usedMediaIds,
+    includedTranscriptSegments: included,
     omittedTranscriptSegments: omitted,
     warnings: [...new Set(warnings)],
   };

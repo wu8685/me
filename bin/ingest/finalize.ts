@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import {
   buildVaultIndex,
   deriveSlug,
@@ -68,6 +68,11 @@ interface ReadmeState {
 interface TrustedRoot {
   lexical: string;
   real: string;
+}
+
+interface PublishedArtifact {
+  path: string;
+  manifest: Map<string, string>;
 }
 
 const FRONTMATTER_FIELDS = new Set(['title', 'created', 'tags', 'type', 'source']);
@@ -270,29 +275,64 @@ function parseTagList(value: string): string[] {
   if (!clean.startsWith('[') || !clean.endsWith(']')) {
     throw new Error('frontmatter schema: tags must be an inline list');
   }
-  const inner = clean.slice(1, -1).trim();
-  if (!inner) return [];
-  return inner.split(',').map(item => {
-    const token = item.trim();
-    if (!token) throw new Error('frontmatter schema: malformed tags list');
-    if (token.startsWith('"')) {
-      if (!token.endsWith('"')) throw new Error('frontmatter schema: malformed tags list');
-      let parsed: unknown;
+  const tags: string[] = [];
+  let index = 1;
+  const skipWhitespace = (): void => {
+    while (index < clean.length && /\s/.test(clean[index])) index += 1;
+  };
+  skipWhitespace();
+  if (clean[index] === ']') return tags;
+
+  while (index < clean.length - 1) {
+    const quote = clean[index];
+    if (quote !== '"' && quote !== "'") {
+      throw new Error('frontmatter schema: tags must contain explicitly quoted strings');
+    }
+    const start = index;
+    index += 1;
+    let singleQuoted = '';
+    let closed = false;
+    while (index < clean.length - 1) {
+      const character = clean[index];
+      if (quote === '"' && character === '\\') {
+        index += 2;
+        continue;
+      }
+      if (character === quote) {
+        if (quote === "'" && clean[index + 1] === "'") {
+          singleQuoted += "'";
+          index += 2;
+          continue;
+        }
+        closed = true;
+        index += 1;
+        break;
+      }
+      if (quote === "'") singleQuoted += character;
+      index += 1;
+    }
+    if (!closed) throw new Error('frontmatter schema: malformed tags list');
+
+    let parsed: unknown;
+    if (quote === '"') {
       try {
-        parsed = JSON.parse(token);
+        parsed = JSON.parse(clean.slice(start, index));
       } catch {
         throw new Error('frontmatter schema: malformed tags list');
       }
-      return validateTag(parsed);
+    } else {
+      parsed = singleQuoted;
     }
-    if (token.startsWith("'")) {
-      if (!token.endsWith("'") || token.slice(1, -1).includes("'")) {
-        throw new Error('frontmatter schema: malformed tags list');
-      }
-      return validateTag(token.slice(1, -1));
-    }
-    return validateTag(token);
-  });
+    tags.push(validateTag(parsed));
+
+    skipWhitespace();
+    if (clean[index] === ']') return tags;
+    if (clean[index] !== ',') throw new Error('frontmatter schema: malformed tags list');
+    index += 1;
+    skipWhitespace();
+    if (clean[index] === ']') throw new Error('frontmatter schema: malformed tags list');
+  }
+  throw new Error('frontmatter schema: malformed tags list');
 }
 
 function validateFrontmatter(frontmatter: string, source: ExtractedSource): void {
@@ -375,13 +415,24 @@ function validateSource(source: ExtractedSource, handout?: HandoutResult): void 
       throw new Error('transcript completeness validation failed');
     }
   }
-  if (handout?.omittedTranscriptSegments.length) {
-    throw new Error('handout has omitted transcript segments');
-  }
   if (handout && (source.source.kind === 'video' || source.source.kind === 'course')) {
     const warnings = [...source.warnings, ...handout.warnings];
     if (transcript.length === 0 || warnings.includes('transcript-empty')) {
       throw new Error('video/course handout requires a non-empty transcript');
+    }
+    const included = handout.includedTranscriptSegments;
+    const omitted = handout.omittedTranscriptSegments;
+    if (Array.isArray(omitted) && omitted.length > 0) {
+      throw new Error('handout has omitted transcript segments');
+    }
+    if (
+      !Array.isArray(included)
+      || !Array.isArray(omitted)
+      || included.length !== transcript.length
+      || new Set(included).size !== transcript.length
+      || included.some(index => !Number.isInteger(index) || index < 0 || index >= transcript.length)
+    ) {
+      throw new Error('video/course handout transcript coverage is incomplete');
     }
   }
 }
@@ -401,7 +452,7 @@ function articleBodyAndAssets(
   input: FinalizeInput,
   staging: string,
   artifactPath: string,
-  resourceRoots: string[],
+  resourceRoots: TrustedRoot[],
 ): { body: string; assets: PlannedAsset[] } {
   const mediaById = new Map(input.source.media.map(asset => [asset.id, asset]));
   const referenced = new Set<string>();
@@ -457,7 +508,7 @@ function handoutBodyAndAssets(
   input: FinalizeInput,
   staging: string,
   artifactPath: string,
-  resourceRoots: string[],
+  resourceRoots: TrustedRoot[],
 ): { body: string; assets: PlannedAsset[] } {
   const handout = input.handout as HandoutResult;
   const mediaById = new Map(input.source.media.map(asset => [asset.id, asset]));
@@ -487,10 +538,78 @@ function handoutBodyAndAssets(
   return { body: `${body}\n`, assets };
 }
 
+function stripInlineCode(line: string): string {
+  let result = '';
+  let index = 0;
+  while (index < line.length) {
+    if (line[index] !== '`' || (index > 0 && line[index - 1] === '\\')) {
+      result += line[index];
+      index += 1;
+      continue;
+    }
+    let openerEnd = index;
+    while (line[openerEnd] === '`') openerEnd += 1;
+    const openerLength = openerEnd - index;
+    let cursor = openerEnd;
+    let closerEnd = -1;
+    while (cursor < line.length) {
+      if (line[cursor] !== '`') {
+        cursor += 1;
+        continue;
+      }
+      let runEnd = cursor;
+      while (line[runEnd] === '`') runEnd += 1;
+      if (runEnd - cursor === openerLength) {
+        closerEnd = runEnd;
+        break;
+      }
+      cursor = runEnd;
+    }
+    if (closerEnd < 0) {
+      result += line.slice(index, openerEnd);
+      index = openerEnd;
+      continue;
+    }
+    result += ' '.repeat(closerEnd - index);
+    index = closerEnd;
+  }
+  return result;
+}
+
+function markdownOutsideCode(markdown: string): string {
+  const visible: string[] = [];
+  let fence: { marker: '`' | '~'; length: number } | undefined;
+  for (const line of markdown.split(/\r?\n/)) {
+    if (fence) {
+      const closing = line.match(/^ {0,3}(`+|~+)[ \t]*$/);
+      if (
+        closing
+        && closing[1][0] === fence.marker
+        && closing[1].length >= fence.length
+      ) {
+        fence = undefined;
+      }
+      visible.push('');
+      continue;
+    }
+    const opening = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (opening) {
+      fence = {
+        marker: opening[1][0] as '`' | '~',
+        length: opening[1].length,
+      };
+      visible.push('');
+      continue;
+    }
+    visible.push(stripInlineCode(line));
+  }
+  return visible.join('\n');
+}
+
 function imageReferences(markdown: string): string[] {
   const references: string[] = [];
   const pattern = /!\[[^\]\r\n]*\]\((<[^>\r\n]*>|[^)\r\n]*)\)/g;
-  for (const match of markdown.matchAll(pattern)) {
+  for (const match of markdownOutsideCode(markdown).matchAll(pattern)) {
     const raw = match[1].trim();
     const unwrapped = raw.startsWith('<') && raw.endsWith('>') ? raw.slice(1, -1) : raw;
     let decoded: string;
@@ -514,26 +633,15 @@ function imageReferences(markdown: string): string[] {
 }
 
 function rejectUnsupportedMediaSyntax(markdown: string): void {
+  const visible = markdownOutsideCode(markdown);
   if (
-    /!\[\[/m.test(markdown)
-    || /<img\b[^>]*>/im.test(markdown)
-    || /!\[[^\]\r\n]*\]\s*\[[^\]\r\n]*\]/m.test(markdown)
-    || /!\[[^\]\r\n]+\](?!\s*\()/m.test(markdown)
+    /!\[\[/m.test(visible)
+    || /<img\b[^>]*>/im.test(visible)
+    || /!\[[^\]\r\n]*\]\s*\[[^\]\r\n]*\]/m.test(visible)
+    || /!\[[^\]\r\n]+\](?!\s*\()/m.test(visible)
   ) {
     throw new Error('unsupported media syntax; use inline Markdown images with local relative paths');
   }
-}
-
-function hasSubstantiveHandoutBody(markdown: string): boolean {
-  return markdown.split(/\r?\n/).some(line => {
-    const clean = line.trim();
-    return Boolean(clean)
-      && !clean.startsWith('#')
-      && !clean.startsWith('>')
-      && !clean.startsWith('---')
-      && !clean.startsWith('![')
-      && !clean.startsWith('<!--');
-  });
 }
 
 function validateStagedArtifact(markdown: string, assets: PlannedAsset[], frontmatter: string, source: ExtractedSource): void {
@@ -576,20 +684,7 @@ function noteFiles(vaultDir: string, layerDirectories: string[]): string[] {
 
 function searchableMarkdown(content: string): string {
   const withoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
-  const lines = withoutFrontmatter.split(/\r?\n/);
-  const visible: string[] = [];
-  let fence: '`' | '~' | undefined;
-  for (const line of lines) {
-    const marker = line.match(/^\s*(`{3,}|~{3,})/);
-    if (marker) {
-      const kind = marker[1][0] as '`' | '~';
-      if (!fence) fence = kind;
-      else if (fence === kind) fence = undefined;
-      continue;
-    }
-    if (!fence) visible.push(line);
-  }
-  return visible.join('\n');
+  return markdownOutsideCode(withoutFrontmatter);
 }
 
 function discoverSuggestions(
@@ -663,14 +758,65 @@ function restoreReadme(readmePath: string, state: ReadmeState): void {
   }
 }
 
-function rollbackPublished(paths: string[]): void {
-  for (const published of [...paths].reverse()) {
+function artifactManifest(root: string): Map<string, string> {
+  const entries = new Map<string, string>();
+  const walk = (directory: string, relativeDirectory: string): void => {
+    const names = fs.readdirSync(directory).sort();
+    for (const name of names) {
+      const absolute = path.join(directory, name);
+      const relative = path.posix.join(relativeDirectory, name);
+      const stat = fs.lstatSync(absolute, { bigint: true });
+      if (stat.isDirectory()) {
+        entries.set(relative, [
+          'directory', stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs,
+        ].join(':'));
+        walk(absolute, relative);
+      } else if (stat.isFile()) {
+        const digest = createHash('sha256').update(fs.readFileSync(absolute)).digest('hex');
+        entries.set(relative, [
+          'file', stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs, digest,
+        ].join(':'));
+      } else {
+        entries.set(relative, [
+          'other', stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs,
+        ].join(':'));
+      }
+    }
+  };
+  walk(root, '');
+  return entries;
+}
+
+function sameArtifactManifest(left: Map<string, string>, right: Map<string, string>): boolean {
+  if (left.size !== right.size) return false;
+  for (const [relative, fingerprint] of left) {
+    if (right.get(relative) !== fingerprint) return false;
+  }
+  return true;
+}
+
+function rollbackPublished(artifacts: PublishedArtifact[]): string[] {
+  const preserved: string[] = [];
+  for (const published of [...artifacts].reverse()) {
+    if (!fs.existsSync(published.path)) continue;
+    let unchanged = false;
     try {
-      fs.rmSync(published, { recursive: true, force: true });
+      unchanged = fs.lstatSync(published.path).isDirectory()
+        && sameArtifactManifest(published.manifest, artifactManifest(published.path));
     } catch {
-      // Continue removing only paths recorded as belonging to this transaction.
+      unchanged = false;
+    }
+    if (!unchanged) {
+      preserved.push(published.path);
+      continue;
+    }
+    try {
+      fs.rmSync(published.path, { recursive: true, force: true });
+    } catch {
+      preserved.push(published.path);
     }
   }
+  return preserved;
 }
 
 export function finalizeIngest(
@@ -681,6 +827,7 @@ export function finalizeIngest(
   if (!fs.existsSync(vaultDir) || !fs.statSync(vaultDir).isDirectory()) {
     throw new Error('vault directory does not exist');
   }
+  assertSafeVaultPath(vaultDir, path.join(vaultDir, '.me'), '.me path');
   validateSource(input.source, input.handout);
 
   const config = resolveConfig(vaultDir);
@@ -732,7 +879,7 @@ export function finalizeIngest(
 
   let staging: string | undefined;
   let readmeTemp: string | undefined;
-  const published: string[] = [];
+  const published: PublishedArtifact[] = [];
   let readmePath: string | undefined;
   let readmeState: ReadmeState | undefined;
   let readmeAttempted = false;
@@ -756,13 +903,6 @@ export function finalizeIngest(
     }
     const frontmatter = input.frontmatter ?? processed.frontmatter ?? generatedFrontmatter(input, created);
     const body = processed.body.trim();
-    if (
-      input.handout
-      && (input.source.source.kind === 'video' || input.source.source.kind === 'course')
-      && !hasSubstantiveHandoutBody(body)
-    ) {
-      throw new Error('video/course handout has no substantive transcript body');
-    }
     const markdown = `${frontmatter}\n\n${body}\n`;
     const stagedNote = path.join(staging, `${stem}.md`);
 
@@ -772,6 +912,7 @@ export function finalizeIngest(
     }
     fs.writeFileSync(stagedNote, markdown, { flag: 'wx' });
     validateStagedArtifact(markdown, preparedParts.assets, frontmatter, input.source);
+    const manifest = artifactManifest(staging);
 
     if (fs.existsSync(artifactPath)) throw new Error(`destination already exists: ${artifactPath}`);
 
@@ -788,7 +929,7 @@ export function finalizeIngest(
     if (fs.existsSync(artifactPath)) throw new Error(`destination already exists before publish: ${artifactPath}`);
     fileOperations.renameSync(staging, artifactPath);
     staging = undefined;
-    published.push(artifactPath);
+    published.push({ path: artifactPath, manifest });
 
     if (readmeTemp && readmePath) {
       try {
@@ -822,7 +963,14 @@ export function finalizeIngest(
         // Preserve the original transaction failure; artifact rollback still proceeds.
       }
     }
-    rollbackPublished(published);
+    const preserved = rollbackPublished(published);
+    if (preserved.length > 0) {
+      const original = cause instanceof Error ? cause.message : 'unknown transaction failure';
+      throw new Error(
+        `manual recovery required: published artifact changed after publication and was preserved at `
+        + `${preserved.join(', ')}; original failure: ${original}`,
+      );
+    }
     throw cause;
   } finally {
     if (readmeTemp) fs.rmSync(readmeTemp, { force: true });
