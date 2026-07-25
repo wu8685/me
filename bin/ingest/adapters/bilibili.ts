@@ -28,7 +28,7 @@ export interface BilibiliSubtitleEntry {
 interface BilibiliSubtitleLine { from: number; to: number; content: string }
 
 export interface BilibiliAdapterOptions {
-  transcribe?: (url: string, cid: number) => string;
+  transcribe?: (url: string, cid: number) => string | TranscriptSegment[];
   transcriptionAvailable?: () => boolean;
 }
 
@@ -148,10 +148,23 @@ export function extractBilibiliSource(
         .filter((line) => Number.isFinite(line.from) && Number.isFinite(line.to) && line.from < line.to)
         .map((line) => ({ start: pageOffset + line.from, end: pageOffset + line.to, text: line.content })));
     } else if (mode === 'transcribe' && transcriptionAvailable && options.transcribe) {
-      const text = options.transcribe(url, page.cid);
-      if (text.trim() && (page.duration ?? meta.duration) > 0) {
+      const generated = options.transcribe(url, page.cid);
+      const localSegments = Array.isArray(generated)
+        ? generated.filter((segment) => segment.text.trim() && segment.start >= 0 && segment.start < segment.end)
+        : [];
+      const text = typeof generated === 'string'
+        ? generated
+        : localSegments.map((segment) => segment.text).join('\n');
+      if (typeof generated === 'string' && text.trim() && (page.duration ?? meta.duration) > 0) {
         lines.push('### 字幕转录（whisper-auto）', '', text, '');
         transcript.push({ start: pageOffset, end: pageOffset + (page.duration ?? meta.duration), text });
+      } else if (localSegments.length > 0) {
+        lines.push('### 字幕转录（whisper-auto）', '', text, '');
+        transcript.push(...localSegments.map((segment) => ({
+          ...segment,
+          start: pageOffset + segment.start,
+          end: pageOffset + segment.end,
+        })));
       } else {
         lines.push('<!-- 无转写结果 -->', '');
         missingTranscript = true;

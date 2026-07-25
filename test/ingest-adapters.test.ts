@@ -83,6 +83,15 @@ test('projects inline Markdown images through the extractContent compatibility w
   expect(result.content).toContain('Before ![inline chart](https://cdn.example.com/inline.png) after');
 });
 
+test('associates a standalone duplicate image with its own Markdown occurrence', async () => {
+  const source = await createHtmlAdapter(recordingRunner({
+    stdout: 'Before ![same](https://cdn.example.com/same.png) after\n\n![same](https://cdn.example.com/same.png)\n',
+  })).extract({ url: new URL('https://example.com/article'), vaultDir: '/tmp/v' });
+
+  expect(source.media.map((asset) => asset.id)).toEqual(['image-001', 'image-002']);
+  expect(source.blocks.at(-1)).toMatchObject({ kind: 'image', mediaId: 'image-002' });
+});
+
 test('keeps Bilibili CC as the preferred transcript', async () => {
   const source = await createBilibiliAdapter(bilibiliFixtureRunner()).extract({
     url: new URL(BILI_URL),
@@ -128,6 +137,20 @@ test('offsets Bilibili multi-page captions into a single ordered timeline', asyn
   expect(source.transcript).toEqual([
     { start: 0, end: 3, text: 'P1 字幕' },
     { start: 10, end: 12, text: 'P2 字幕' },
+  ]);
+});
+
+test('offsets multi-page Whisper segments into a single ordered timeline', async () => {
+  const source = await createBilibiliAdapter(twoPageWithoutCcRunner(), {
+    transcribe: (_url, cid) => cid === 101
+      ? [{ start: 0, end: 3, text: 'P1 Whisper' }]
+      : [{ start: 0, end: 2, text: 'P2 Whisper' }],
+    transcriptionAvailable: () => true,
+  }).extract({ url: new URL(BILI_URL), vaultDir: '/tmp/v', mode: 'transcribe' });
+
+  expect(source.transcript).toEqual([
+    { start: 0, end: 3, text: 'P1 Whisper' },
+    { start: 10, end: 12, text: 'P2 Whisper' },
   ]);
 });
 
@@ -203,6 +226,22 @@ function twoPageBilibiliRunner(): CommandRunner {
       }
       if (url === 'https://cdn.example.com/p1.json') return { stdout: JSON.stringify({ body: [{ from: 0, to: 3, content: 'P1 字幕' }] }), stderr: '', status: 0 };
       if (url === 'https://cdn.example.com/p2.json') return { stdout: JSON.stringify({ body: [{ from: 0, to: 2, content: 'P2 字幕' }] }), stderr: '', status: 0 };
+      throw new Error(`Unexpected command arguments: ${args.join(' ')}`);
+    },
+  };
+}
+
+function twoPageWithoutCcRunner(): CommandRunner {
+  const meta = JSON.parse(fixtureText('bilibili-meta.json'));
+  meta.data.pages = [
+    { cid: 101, page: 1, part: 'P1', duration: 10 },
+    { cid: 202, page: 2, part: 'P2', duration: 20 },
+  ];
+  return {
+    run(_command, args) {
+      const url = args.at(-1) ?? '';
+      if (url.includes('/x/web-interface/view')) return { stdout: JSON.stringify(meta), stderr: '', status: 0 };
+      if (url.includes('/x/player/v2')) return { stdout: JSON.stringify({ code: 0, data: { subtitle: { subtitles: [] } } }), stderr: '', status: 0 };
       throw new Error(`Unexpected command arguments: ${args.join(' ')}`);
     },
   };

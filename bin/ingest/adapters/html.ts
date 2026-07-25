@@ -19,16 +19,21 @@ function blockId(index: number): string {
 /** Convert the Markdown emitted by defuddle into ordered source blocks and media. */
 export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]; media: MediaAsset[] } {
   const blocks: SourceBlock[] = [];
+  const normalizedMarkdown = markdown.replace(/\r\n/g, '\n');
   const imagePattern = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+)(?:\s+"[^"]*")?\)/g;
-  const media = Array.from(markdown.matchAll(imagePattern), (match, index) => ({
-    id: `image-${String(index + 1).padStart(3, '0')}`,
-    kind: 'image' as const,
-    url: match[2],
-    alt: match[1] || undefined,
+  const imageOccurrences = Array.from(normalizedMarkdown.matchAll(imagePattern), (match, index) => ({
+    offset: match.index!,
+    media: {
+      id: `image-${String(index + 1).padStart(3, '0')}`,
+      kind: 'image' as const,
+      url: match[2],
+      alt: match[1] || undefined,
+    },
   }));
-  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const media = imageOccurrences.map((occurrence) => occurrence.media);
+  const lines = normalizedMarkdown.split('\n');
   let paragraph: string[] = [];
-  let nextWholeLineImage = 0;
+  let lineOffset = 0;
 
   const addBlock = (kind: SourceBlock['kind'], value: string, mediaId?: string) => {
     blocks.push({ id: blockId(blocks.length + 1), kind, markdown: value, ...(mediaId ? { mediaId } : {}) });
@@ -45,20 +50,23 @@ export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]
     if (heading) {
       flushParagraph();
       addBlock('heading', line);
+      lineOffset += line.length + 1;
       continue;
     }
     if (image) {
       flushParagraph();
-      const imageMedia = media.slice(nextWholeLineImage).find((asset) => asset.url === image[2] && asset.alt === (image[1] || undefined));
-      if (imageMedia) nextWholeLineImage = media.indexOf(imageMedia) + 1;
-      addBlock('image', line, imageMedia?.id);
+      const occurrence = imageOccurrences.find((candidate) => candidate.offset === lineOffset);
+      addBlock('image', line, occurrence?.media.id);
+      lineOffset += line.length + 1;
       continue;
     }
     if (line.trim() === '') {
       flushParagraph();
+      lineOffset += line.length + 1;
       continue;
     }
     paragraph.push(line);
+    lineOffset += line.length + 1;
   }
   flushParagraph();
 
