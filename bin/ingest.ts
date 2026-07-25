@@ -15,6 +15,19 @@ import * as https from 'https';
 import * as http from 'http';
 import { execSync } from 'child_process';
 
+export type {
+  Capability,
+  CapabilityReport,
+  ExtractContext,
+  ExtractMode,
+  ExtractedSource,
+  MediaAsset,
+  SourceAdapter,
+  SourceBlock,
+  SourceKind,
+  TranscriptSegment,
+} from './ingest/contracts.ts';
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface LayerConfig {
