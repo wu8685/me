@@ -3,6 +3,7 @@
 > 三层知识飞轮（Raw → Practices → Cognition）+ 自由 WikiLink 交叉引用的个人知识管理插件
 
 **ME** 把任何工作空间变成知识飞轮 —— 零基础设施，只需 Git + Markdown + Claude Code 或 Codex。
+同一个 `/me:ingest` 可以把 HTML 文章、PDF、X 与 Bilibili 公共内容整理成带来源、正文和本地素材的笔记；视频默认优先生成保留完整时间线的讲义，便于之后检索、复习和引用。
 
 ## 快速开始
 
@@ -35,7 +36,7 @@ Codex 安装后会把技能加载为 `me:*`。在 Codex 里运行 `/skills` 选�
 | 功能 | Claude Code | Codex skill |
 | --- | --- | --- |
 | 初始化三层知识目录结构 | `/me:setup` | `me:setup` |
-| 摘入 URL 为结构化笔记 | `/me:ingest <url>` | `me:ingest` |
+| 摘入文章、PDF、公开视频或 Source Bundle | `/me:ingest <source>` | `me:ingest` |
 | 多维搜索笔记（全文 / 标签 / 层级 / 日期） | `/me:search <query>` | `me:search` |
 | 检查链接健康（断链、孤儿、死结） | `/me:checklinks` | `me:checklinks` |
 | 自动添加 WikiLink（支持单笔记模式） | `/me:autolinks [note]` | `me:autolinks` |
@@ -62,7 +63,7 @@ Raw (调研) → Practices (实践) → Cognition (认知)
 
 ## 版本
 
-**v1.4.0**
+**v1.5.0**
 
 ## 文档
 

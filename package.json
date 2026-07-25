@@ -1,6 +1,6 @@
 {
   "name": "me",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "A Claude Code / Codex plugin that gives any workspace knowledge management capabilities",
   "scripts": {
     "test": "bash test/vault-test.sh",

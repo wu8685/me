@@ -55,26 +55,70 @@ Next steps:
   Run `/me:ingest <url>` to add your first research note.
 ```
 
-## 摄入第一篇文章
+## 摄入文章、PDF 与公开视频
 
 ```bash
+# HTML 文章
 /me:ingest https://example.com/article-about-ai
+
+# PDF（也支持由响应类型识别的无后缀 PDF）
+/me:ingest https://example.com/research/report.pdf
+
+# 公开 X 文章或视频
+/me:ingest https://x.com/example/status/1234567890
+
+# Bilibili 公共视频
+/me:ingest https://www.bilibili.com/video/BV1Example
 ```
 
 Codex 等价调用：`$me:ingest https://example.com/article-about-ai`。
 
-**输出：**
-```
-Detected: English article.
-Mode: translate-cn
-Override? (press Enter to accept, or type: summarize | raw)
+`/me:ingest` 会先预览来源类型、处理模式和可用能力，再确认 topic 并写入。英文文章默认 `translate-cn`，中文文章默认 `summarize`；视频或课程默认生成 `handout` 讲义。也可以显式指定：
 
-[Processing...]
-
-Created: raw/2026-04-06-ai-agents.md
-Auto-linked: 3 wikilinks
-Related notes: 2 suggestions
+```bash
+/me:ingest https://www.bilibili.com/video/BV1Example --mode handout
+/me:ingest https://x.com/example/status/1234567890 --mode transcribe
 ```
+
+讲义不是十条摘要。ME 会保留完整的时间戳 transcript：有稳定、带时间戳的页面时生成 Slide-driven 讲义；访谈、talking head 或没有稳定页面的视频生成 Topic-driven 讲义。
+
+### 导入 Source Bundle
+
+Source Bundle v1 是静态交换目录，适合导入用户已有合法访问权、但公开 URL 无法直接读取的材料：
+
+```text
+my-bundle/
+├── source-bundle.json
+└── assets/
+    └── slide-001.jpg
+```
+
+```bash
+/me:ingest --bundle ./my-bundle
+```
+
+Bundle 中的路径必须留在目录内部，不能包含登录状态、凭据、本机绝对路径或可执行指令。ME 会在写入前校验完整 Bundle；非法 Bundle 不会留下部分文件。
+
+### 依赖探测与 degraded 结果
+
+基础 HTML 摄入只需插件运行环境。富媒体来源会在预览阶段探测所需能力：
+
+- PDF：需要 `curl`、`pdftotext`、`pdftohtml`。
+- X 视频：需要 `yt-dlp`。
+- 缺少现成字幕而需要本地转写时：使用配置中可用的 `mlx-whisper` 或 `whisper.cpp` provider。
+
+预览 JSON 中的 `capabilities` 表示实际可用内容，`warnings` 表示缺失或失败的资源。`warnings` 非空时应把结果视为 degraded/partial，并明确说明缺了什么；登录阻断、加密/DRM 或不可读来源会直接失败。只有输出包含 `writeResult` 才表示 artifact 已写入，失败时不会留下半篇笔记。
+
+成功写入后，一篇材料位于独立目录中：
+
+```text
+raw/<topic>/YYYY-MM-DD-slug/
+├── YYYY-MM-DD-slug.md
+├── images/
+└── slides/
+```
+
+只有实际存在的素材目录才会创建。输出还会给出 warnings 与 link suggestions，便于后续补充连接。
 
 ## 搜索笔记
 

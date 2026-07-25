@@ -39,7 +39,7 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 | 功能 | Claude Code | Codex skill | 输入 | 输出 |
 |------|-------------|-------------|------|------|
 | 初始化工作空间 | `/me:setup` | `me:setup` | - | 三层目录 + 配置文件 |
-| 摄入 URL | `/me:ingest <url>` | `me:ingest` | URL | 结构化 Markdown 笔记 |
+| 摄入外部材料 | `/me:ingest <source>` | `me:ingest` | URL 或 Source Bundle | 结构化 Markdown 笔记与本地素材 |
 | 多维搜索笔记 | `/me:search` | `me:search` | 查询条件 | 匹配笔记列表 |
 | 链接健康检查 | `/me:checklinks` | `me:checklinks` | - | 断链/孤儿/死结报告 |
 | 自动添加 WikiLink | `/me:autolinks` | `me:autolinks` | - | 批量更新笔记链接 |
@@ -79,16 +79,41 @@ Detected existing directories:
 Map these directories? (Press Enter for defaults)
 ```
 
-## /me:ingest - 摘入 URL
+## /me:ingest - 摄入文章、PDF 与公开视频
 
-**功能：** 将 URL 转换为结构化的 Markdown 笔记。
+**功能：** 用一个入口把 HTML、PDF、X 文章或视频、Bilibili 视频，以及 Source Bundle 转换成可检索的 Markdown 笔记。正文图片、PDF 图表和视频讲义素材会随笔记本地化；写入时以整篇材料为单位完成，避免留下半篇笔记或散落素材。
 
-**模式：**
+| Source Adapter | 适用材料 | 主要产物 |
+| --- | --- | --- |
+| HTML | 普通网页文章 | 正文、来源信息、正文图片 |
+| PDF | 公开论文与报告（包括无 `.pdf` 后缀但响应类型为 PDF 的链接） | 分页正文、图表与图注 |
+| X | 公开 X 文章、单条或多段视频 | 文章正文或带时间线的视频内容 |
+| Bilibili | 公开视频 | 字幕/转写与视频讲义 |
+| Source Bundle v1 | 已由授权工具导出的静态材料目录 | 经完整校验后的正文、transcript 与素材 |
+
+**处理模式：**
+
 - `translate-cn` - 英文文章翻译为中文（默认）
 - `summarize` - 中文文章摘要
 - `raw` - 保留原文内容
+- `transcribe` - 按时间顺序保存完整转写
+- `handout` - 生成讲义；有稳定时间戳页面时采用 Slide-driven，否则采用 Topic-driven，并保留完整 transcript
 
-**输出文件名：** `YYYY-MM-DD-slug.md`
+**能力与 degraded 语义：**
+
+- 预览结果会报告 `adapterId`、`capabilities`、`warnings`，视频讲义另有 `handoutKind`。
+- `warnings` 非空表示结果处于 degraded/partial 状态。调用者必须说明缺少的字幕、图片或媒体，不得把部分结果描述为完整。
+- `blocked` 来源（例如登录页、加密 PDF 或不可读取的错误页）不会写入笔记。
+- 只有返回 `writeResult` 才表示写入成功；校验或最终写入失败时不会保留部分 artifact。
+
+**输出布局：**
+
+```text
+raw/<topic>/YYYY-MM-DD-slug/
+├── YYYY-MM-DD-slug.md
+├── images/                 # 有正文图片或 PDF 图表时
+└── slides/                 # 有讲义页面时
+```
 
 **Frontmatter schema：**
 ```yaml
@@ -103,6 +128,11 @@ source: "https://example.com/article"
 
 **自动处理：**
 - 语言检测（中文/英文）
+- HTML / PDF / X / Bilibili 来源识别
+- PDF 与视频依赖探测
+- 视频 Slide-driven / Topic-driven 讲义选择
+- Source Bundle v1 完整校验
+- 图片、图表与讲义页面本地化
 - Kebab-case 英文 slug
 - 自动添加 WikiLink（基于 vault index）
 - 相关笔记推荐（基于 tag + 关键词）

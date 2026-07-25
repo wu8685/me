@@ -174,6 +174,81 @@ test_codex_public_docs() {
   assert_file_contains "$PLUGIN_ROOT/docs/features.md" 'Codex skill' || return 1
 }
 
+test_ingest_docs_rich_media() {
+  local readme="$PLUGIN_ROOT/README.md"
+  local features="$PLUGIN_ROOT/docs/features.md"
+  local guide="$PLUGIN_ROOT/docs/user-guide.md"
+
+  for term in HTML PDF X Bilibili "Source Bundle" handout degraded; do
+    assert_file_contains "$features" "$term" || return 1
+  done
+
+  for term in "https://example.com/article" ".pdf" "x.com/" "bilibili.com/" handout degraded "依赖"; do
+    assert_file_contains "$guide" "$term" || return 1
+  done
+  grep -q -- "--bundle" "$guide" || {
+    echo -e "    ${RED}FAIL${NC}: '$guide' does not document --bundle"
+    return 1
+  }
+
+  assert_file_contains "$readme" "PDF" || return 1
+  assert_file_contains "$readme" "公开视频" || return 1
+  assert_file_contains "$readme" "讲义" || return 1
+  assert_file_not_contains "$readme" "rich-ingest" || return 1
+  assert_file_not_contains "$features" "rich-ingest" || return 1
+  assert_file_not_contains "$guide" "rich-ingest" || return 1
+
+  local versions
+  versions=$(bun -e "
+    const fs = require('fs');
+    const files = [
+      'package.json',
+      '.codex-plugin/plugin.json',
+      '.claude-plugin/plugin.json',
+      '.claude-plugin/marketplace.json',
+    ];
+    console.log(files.map(file => {
+      const data = JSON.parse(fs.readFileSync('$PLUGIN_ROOT/' + file, 'utf8'));
+      return data.version ?? data.plugins?.[0]?.version;
+    }).join('\\n'));
+  ")
+  [ "$(echo "$versions" | sort -u | wc -l | tr -d ' ')" -eq 1 ] || {
+    echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
+    return 1
+  }
+  [ "$(echo "$versions" | head -n 1)" = "1.5.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.5.0"
+    return 1
+  }
+
+  local private_product private_product_zh private_vault
+  private_product="xiao""etong"
+  private_product_zh="小鹅""通"
+  private_vault="brain""-spark"
+  local public_paths=(
+    "$PLUGIN_ROOT/bin"
+    "$PLUGIN_ROOT/skills"
+    "$PLUGIN_ROOT/test/fixtures/ingest"
+    "$readme"
+    "$features"
+    "$guide"
+    "$PLUGIN_ROOT/package.json"
+    "$PLUGIN_ROOT/.codex-plugin"
+    "$PLUGIN_ROOT/.claude-plugin"
+  )
+
+  if rg -n -i "$private_product|$private_product_zh|$private_vault|/Users/wu8685/" "${public_paths[@]}"; then
+    echo -e "    ${RED}FAIL${NC}: public ingest artifacts contain private product or machine-specific data"
+    return 1
+  fi
+
+  if rg -n -P -i '(?:cookie|authorization|token)\s*[:=]\s*["'"'"']?(?!\[redacted\])[A-Za-z0-9_./+=-]{20,}' \
+    "$PLUGIN_ROOT/bin" "$PLUGIN_ROOT/skills" "$readme" "$features" "$guide"; then
+    echo -e "    ${RED}FAIL${NC}: public ingest artifacts contain a credential-shaped value"
+    return 1
+  fi
+}
+
 test_schema_fields() {
   local schema="$PLUGIN_ROOT/templates/SCHEMA.md"
   # Core fields present
@@ -4338,6 +4413,7 @@ main() {
     run_test test_plugin_structure
     run_test test_plugin_manifest
     run_test test_codex_public_docs
+    run_test test_ingest_docs_rich_media
     run_test test_schema_fields
     run_test test_templates_match_schema
     run_test test_no_forbidden_fields_in_templates

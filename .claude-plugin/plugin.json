@@ -1,6 +1,6 @@
 {
   "name": "me",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "ME — a personal knowledge base plugin: a three-layer knowledge flywheel (raw → practices → cognition) with free wikilink cross-references.",
   "author": {
     "name": "wuke",
