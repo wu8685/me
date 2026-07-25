@@ -145,12 +145,19 @@ then:
 2. Read the current vault's schema, matching template, and project instructions,
    including post-create rules. If a required contract is unavailable, stay
    chat-only and report that nothing was saved.
-3. Use only an existing allowed type and fields, with the schema's source shape.
-   Do not invent `decision`, `confidence`, `status`, or another ad hoc field.
-4. Run the vault's required schema, link, index reachability, and backlinks
-   checks. Report “saved” only after every check passes. On failure, revert this
-   write or state that it was not saved and requires repair; never claim
-   completion.
+3. Use only the type, fields, and source shape explicitly allowed for that
+   practices layer by its current schema and template. Reject an unknown type or
+   field; stay chat-only rather than inventing one.
+4. Before writing, enumerate every file the operation will create or modify.
+   Record each path's existence, exact bytes, and metadata needed for faithful
+   restoration.
+5. After writing, run the vault's required schema, link, index reachability, and
+   backlinks checks. Report “saved” only after every check passes.
+6. If a check fails, delete a newly created file or restore an earlier file only
+   while its current bytes still equal this operation's written bytes. A
+   mismatch is a concurrent change: stop without overwriting it. Claim “not
+   saved” or “rolled back” only after full restoration; otherwise list every
+   remaining partial mutation and the manual recovery needed.
 
 Raw sources belong in raw. Even when the user says “这是我的原则”, first apply the
 current vault's cognition validation and confirmation requirements; never claim
