@@ -56,10 +56,14 @@ Lexical paths stayed below `<temp>/s1/vault`; the vault, every prefix, and the
 target canonicalized below `<canonical-temp>/s1/vault`. It read the fixture
 marker only after passing containment.
 
-**Verbatim decisive rationale:**
+**Evidence mode:** Portable substitution
+
+**Substitution:** `<temp>` replaces the raw platform temporary-path alias
+`[portableized from raw temp path]`.
 
 > “A lexically contained profile is accepted when the vault root, target, and
-> every existing prefix canonicalize within the same canonical vault root”
+> every existing prefix canonicalize within the same canonical vault root, even
+> when the lexical vault path traverses a symlinked prefix such as `<temp>`.”
 
 ### PB2
 
@@ -68,7 +72,7 @@ Non-following inspection identified `<temp>/s2/vault-alias` as a symlink.
 `<canonical-temp>/s2/physical-vault`; the fixture marker was read only after the
 gate passed.
 
-**Verbatim decisive rationale:**
+**Evidence mode:** Exact excerpt
 
 > “A symlinked lexical vault root is valid when the configured target and every
 > existing prefix from that root resolve within the paired canonical vault
@@ -81,7 +85,7 @@ Non-following metadata showed `.me/profiles` linked to
 vault. The agent detected the escaping intermediate canonical prefix, rejected
 the Profile, and did not read its body.
 
-**Verbatim decisive rationale:**
+**Evidence mode:** Exact excerpt
 
 > “Reject the Profile because every existing path prefix must remain within the
 > canonical vault, and an escaping intermediate symlink is unsafe even when a
@@ -93,7 +97,7 @@ The target did not exist, while `.me/profiles` was the deepest existing
 ancestor and canonicalized below `<canonical-temp>/s4/vault`. The agent did not
 read a Profile and selected the generic flow.
 
-**Verbatim decisive rationale:**
+**Evidence mode:** Exact excerpt
 
 > “A genuinely missing Profile may use the generic flow when its normalized
 > lexical path stays within the lexical vault and every existing prefix through
@@ -105,7 +109,7 @@ read a Profile and selected the generic flow.
 and `realpath` returned `No such file or directory`. The agent classified this
 as a dangling symlink, rejected it as unsafe, and did not read a Profile body.
 
-**Verbatim decisive rationale:**
+**Evidence mode:** Exact excerpt
 
 > “A configured Profile that is a dangling symlink must be rejected as unsafe
 > because the boundary algorithm treats any target realpath failure as fatal,
@@ -118,7 +122,7 @@ Lexical containment passed, but `.me/profiles` linked to
 outside `<canonical-temp>/s6/vault`. The agent rejected it without reading the
 Profile body.
 
-**Verbatim decisive rationale:**
+**Evidence mode:** Exact excerpt
 
 > “A profile is unsafe when any existing path prefix canonically escapes the
 > canonical vault root, even if its lexical path remains inside the vault.”

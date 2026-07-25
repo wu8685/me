@@ -3321,6 +3321,8 @@ EOF
 
 test_decision_brief_profile_behavior_evidence() {
   local f="$PLUGIN_ROOT/test/skills/decision-brief/profile-boundary-results.md"
+  local block
+  local id
   local pair
 
   assert_file_exists "$f" || return 1
@@ -3338,7 +3340,31 @@ test_decision_brief_profile_behavior_evidence() {
     grep -Fq "| $pair |" "$f" || return 1
   done
 
-  [ "$(grep -Fc '**Verbatim decisive rationale:**' "$f")" -eq 6 ] || return 1
+  [ "$(grep -Fc '**Evidence mode:** Exact excerpt' "$f")" -eq 5 ] || return 1
+  [ "$(grep -Fc '**Evidence mode:** Portable substitution' "$f")" -eq 1 ] || return 1
+
+  for id in PB1 PB2 PB3 PB4 PB5 PB6; do
+    block="$(
+      awk -v heading="### $id" '
+        $0 == heading { in_sample = 1; next }
+        in_sample && /^### PB[1-6]$/ { exit }
+        in_sample { print }
+      ' "$f"
+    )"
+    echo "$block" | grep -Eq '^\*\*Evidence mode:\*\* (Exact excerpt|Portable substitution)$' || return 1
+    echo "$block" | grep -Eq '^> “.+' || return 1
+    echo "$block" | grep -Eq '.”$' || return 1
+  done
+
+  block="$(
+    awk '
+      $0 == "### PB1" { in_sample = 1; next }
+      in_sample && /^### PB[1-6]$/ { exit }
+      in_sample { print }
+    ' "$f"
+  )"
+  echo "$block" | grep -Fq '**Evidence mode:** Portable substitution' || return 1
+  echo "$block" | grep -Fq '[portableized from raw temp path]' || return 1
 }
 
 # ── Quick Task 260406-e00: Convert Commands to Skills Tests ─────────────────
