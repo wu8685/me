@@ -6,11 +6,14 @@ import type { CommandResult, CommandRunner } from '../bin/ingest/command.ts';
 import { createHtmlAdapter } from '../bin/ingest/adapters/html.ts';
 import { createBilibiliAdapter } from '../bin/ingest/adapters/bilibili.ts';
 import { createPdfAdapter, parsePdftohtmlXml, probePdfContentType } from '../bin/ingest/adapters/pdf.ts';
+import { createXAdapter } from '../bin/ingest/adapters/x.ts';
 import { extractContent, transcribeBilibili } from '../bin/ingest.ts';
 
 const FIXTURES = path.join(import.meta.dir, 'fixtures', 'ingest');
 const BILI_URL = 'https://www.bilibili.com/video/BV1fixture';
 const PDF_URL = 'https://example.com/paper.pdf';
+const X_ARTICLE_URL = 'https://x.com/example/articles/123';
+const X_VIDEO_URL = 'https://x.com/example/status/456';
 
 function fixtureText(name: string): string {
   return fs.readFileSync(path.join(FIXTURES, name), 'utf8');
@@ -200,6 +203,60 @@ test('associates a standalone duplicate image with its own Markdown occurrence',
   expect(source.blocks.at(-1)).toMatchObject({ kind: 'image', mediaId: 'image-002' });
 });
 
+test('extracts an X Article body and ordered images', async () => {
+  const source = await createXAdapter(xArticleRunner()).extract({
+    url: new URL(X_ARTICLE_URL), vaultDir: '/tmp/v',
+  });
+
+  expect(source.source.kind).toBe('article');
+  expect(source.source.title).toBe('A public X Article');
+  expect(source.media.map((media) => media.url)).toEqual([
+    'https://pbs.twimg.com/a.jpg',
+    'https://pbs.twimg.com/b.jpg',
+  ]);
+});
+
+test('classifies public X media as video and persists its media path', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-video-vault-'));
+  try {
+    const source = await createXAdapter(xVideoRunner()).extract({
+      url: new URL(X_VIDEO_URL), vaultDir, mode: 'handout',
+    });
+
+    const video = source.media.find((media) => media.kind === 'video');
+    expect(source.source.kind).toBe('video');
+    expect(video?.path).toBeDefined();
+    expect(video?.path?.startsWith(vaultDir)).toBe(true);
+    expect(fs.existsSync(video!.path!)).toBe(true);
+  } finally {
+    fs.rmSync(vaultDir, { recursive: true, force: true });
+  }
+});
+
+test('returns auth-required instead of ingesting an X login page', async () => {
+  await expect(createXAdapter(loginPageRunner()).extract({
+    url: new URL(X_ARTICLE_URL), vaultDir: '/tmp/v',
+  })).rejects.toThrow(/auth-required/);
+});
+
+test('returns auth-required when an X Article body is shorter than 200 visible characters', async () => {
+  await expect(createXAdapter(shortXArticleRunner()).extract({
+    url: new URL(X_ARTICLE_URL), vaultDir: '/tmp/v',
+  })).rejects.toThrow(/auth-required/);
+});
+
+test('returns auth-required when the X video probe reports a login wall', async () => {
+  await expect(createXAdapter(xAuthProbeRunner()).extract({
+    url: new URL(X_VIDEO_URL), vaultDir: '/tmp/v',
+  })).rejects.toThrow(/auth-required/);
+});
+
+test('does not hide an X video-probe network failure by falling back to Article', async () => {
+  await expect(createXAdapter(xNetworkFailureRunner()).extract({
+    url: new URL(X_VIDEO_URL), vaultDir: '/tmp/v',
+  })).rejects.toThrow(/extraction-failed/);
+});
+
 test('keeps Bilibili CC as the preferred transcript', async () => {
   const source = await createBilibiliAdapter(bilibiliFixtureRunner()).extract({
     url: new URL(BILI_URL),
@@ -312,6 +369,80 @@ function bilibiliWithoutCcRunner(): CommandRunner {
         return { stdout: JSON.stringify({ code: 0, data: { subtitle: { subtitles: [] } } }), stderr: '', status: 0 };
       }
       throw new Error(`Unexpected command arguments: ${args.join(' ')}`);
+    },
+  };
+}
+
+function xArticleRunner(): CommandRunner {
+  return {
+    run(command, args) {
+      if (command === 'yt-dlp') return { stdout: '', stderr: 'not a video', status: 1 };
+      if (command === 'defuddle') {
+        expect(args).toEqual(['parse', X_ARTICLE_URL, '--md']);
+        return { stdout: fixtureText('x-article.md'), stderr: '', status: 0 };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    },
+  };
+}
+
+function xVideoRunner(): CommandRunner {
+  return {
+    run(command, args) {
+      if (command !== 'yt-dlp') throw new Error(`Unexpected command: ${command}`);
+      if (args[0] === '--dump-single-json') {
+        expect(args).toEqual(['--dump-single-json', X_VIDEO_URL]);
+        return {
+          stdout: JSON.stringify({
+            id: '456', title: 'Public X video', uploader: 'example', duration: 42,
+            ext: 'mp4', webpage_url: X_VIDEO_URL, formats: [{ format_id: 'best' }],
+          }),
+          stderr: '', status: 0,
+        };
+      }
+      expect(args).toEqual(['-o', expect.any(String), X_VIDEO_URL]);
+      fs.writeFileSync(args[1], 'video-fixture');
+      return { stdout: '', stderr: '', status: 0 };
+    },
+  };
+}
+
+function loginPageRunner(): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'yt-dlp') return { stdout: '', stderr: 'not a video', status: 1 };
+      if (command === 'defuddle') return { stdout: '# Log in to X\n\nSign in to see what is happening.', stderr: '', status: 0 };
+      throw new Error(`Unexpected command: ${command}`);
+    },
+  };
+}
+
+function shortXArticleRunner(): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'yt-dlp') return { stdout: '', stderr: 'not a video', status: 1 };
+      if (command === 'defuddle') {
+        return { stdout: `# ${'An unusually long heading '.repeat(12)}\n\nToo short.`, stderr: '', status: 0 };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    },
+  };
+}
+
+function xAuthProbeRunner(): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'yt-dlp') return { stdout: '', stderr: 'ERROR: Sign in to confirm you are not a bot', status: 1 };
+      throw new Error(`Article fallback must not run after an auth failure: ${command}`);
+    },
+  };
+}
+
+function xNetworkFailureRunner(): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'yt-dlp') return { stdout: '', stderr: 'ERROR: Unable to download webpage: timed out', status: 1 };
+      throw new Error(`Article fallback must not run after a network failure: ${command}`);
     },
   };
 }
