@@ -378,8 +378,11 @@ bin/vault-write/
 ├── contracts.ts
 ├── path-safety.ts
 ├── schema.ts
+├── graph.ts
 ├── index.ts
 └── transaction.ts
+templates/schema-profiles/
+└── me-schema-v1.json
 ```
 
 不让 v1 直接调用或重构 `bin/ingest/finalize.ts`。后者包含 raw ingest 专用的
@@ -397,32 +400,111 @@ writer 会复用已经验证过的原则，但重新实现更窄的通用 primit
 
 待 writer 稳定后，是否让 ingest 迁移到这些 primitives 另开 spec。本轮不做。
 
-### 19.4 配置、schema 与 template
+### 19.4 Machine-readable schema profile、配置与 template
 
-writer 读取：
+writer **不解析 `SCHEMA.md` prose 或 Markdown table**。公共插件新增
+`templates/schema-profiles/me-schema-v1.json`，它是当前 LOCKED schema revision 的
+唯一 machine-readable contract：
+
+```json
+{
+  "id": "me-schema-v1",
+  "revision": 1,
+  "schemaDocumentSha256": [
+    "9894ec60c4c7e583a215938ec71186e8a12d24eaedc6dc96a42e2a4aa24480b5"
+  ],
+  "templateSha256": {
+    "raw": "28e24f3e835c3a34a123c4ef8082abfcef8cfdcce3a913371869dbc9e6f2a4d4",
+    "practices": "ad169bbe8a74d5be0fa615eeae436380e8eb75dc8f4a3342df50482d7608323b",
+    "cognition": "a8084f5b1a601cdcdf1460247fa82bdb9fc2b24281ecca5fc48a0e3d32338a7b"
+  },
+  "core": {
+    "title":  { "type": "string", "required": true, "minLength": 1 },
+    "created": { "type": "date", "required": true, "format": "YYYY-MM-DD" },
+    "tags": {
+      "type": "string-list",
+      "required": true,
+      "unique": true,
+      "itemPattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "type":   { "type": "enum", "required": true },
+    "source": { "type": "string", "required": true, "minLength": 1 }
+  },
+  "layers": {
+    "raw": {
+      "types": ["article", "concept"],
+      "source": { "kind": "http-url", "schemes": ["http", "https"] },
+      "extensions": {}
+    },
+    "practices": {
+      "types": ["experiment", "reflection"],
+      "source": { "kind": "existing-path-qualified-wikilink" },
+      "extensions": {
+        "project": { "type": "string", "required": false, "allowEmpty": true }
+      }
+    },
+    "cognition": {
+      "types": ["insight"],
+      "source": { "kind": "existing-path-qualified-wikilink" },
+      "extensions": {
+        "confidence": {
+          "type": "enum",
+          "required": true,
+          "values": ["low", "medium", "high"]
+        }
+      }
+    }
+  }
+}
+```
+
+实施时 JSON 必须包含以上 exact semantics；property ordering/indentation 不属于
+contract。profile loader 拒绝 unknown profile key、unknown field type 和 unknown
+revision。
+
+writer 读取并 fingerprint：
 
 1. `{vault}/.me/config.yaml` 中 `layers.raw/practices/cognition`；
-2. `{vault}/SCHEMA.md`；
-3. 当前安装的 ME plugin 中 `templates/<layer>-template.md`。
+2. `{vault}/SCHEMA.md` 的 exact bytes；
+3. 当前插件的 `me-schema-v1.json`；
+4. 当前插件的 `templates/<layer>-template.md`。
 
-三个输入都是 contract：
+`SCHEMA.md` SHA-256 必须出现在 profile 的 `schemaDocumentSha256`，selected template
+SHA-256 必须 exact match `templateSha256[layer]`。不支持的 schema revision、用户修改
+过的 LOCKED schema、未来 schema 或 template drift 一律
+`validation_failed/UNSUPPORTED_SCHEMA`，提示先运行 ME upgrade；writer 不猜版本、
+不迁移、不从 prose 推导。将来 schema 变化必须发布新的 profile/revision 与明确
+migration。
 
-- layer 配置缺失时沿用 ME 既有默认值；
-- 配置的 layer、`.me`、`SCHEMA.md`、target parent、README 和所有已存在 path
-  prefix 必须同时通过 lexical 与 canonical containment；
-- dangling symlink、逃逸 symlink、非普通文件或无法 canonicalize 均 fail closed；
-- `SCHEMA.md` 必须包含 `LOCKED` 标记，并能无歧义解析 core/per-layer field table；
-- template frontmatter 的字段集合必须与 schema 对该 layer 允许的字段兼容；
-- 请求 Markdown 的 frontmatter 必须只含 schema 字段、必填字段齐全、类型与
-  controlled vocabulary 合法；禁止 duplicate key、YAML alias/tag、mapping/对象型
-  scalar 和 schema 未声明字段；
-- raw 的 `source` 必须是 HTTP(S) URL；practices/cognition 的 `source` 必须是
-  单条非空字符串，若是 wikilink则必须通过 link validation；
-- cognition 请求额外要求 `acknowledgeCognition: true`。这只是防误操作，不等于
-  语义验证；调用 Skill 仍必须先满足 vault 自己的 cognition 门槛。
+path-qualified wikilink 的规范形式为
+`[[<vault-relative-posix-path-without-.md>]]`，例如
+`[[knowledge/raw/2026-07-25-source-note]]`。schema `source` 不接受 basename-only link、
+alias、heading、block、`.md` suffix、absolute path 或 traversal；它必须 exact resolve
+到一个已存在、contained、普通 Markdown file。
 
-若 vault schema 与当前安装 template 不兼容，writer 不猜测、不迁移，返回
-`validation_failed`。schema/template 文件自身不会被 writer 修改。
+请求 frontmatter 必须只含 profile 字段、必填字段齐全、类型/enum/source semantics
+合法；禁止 duplicate key、YAML alias/tag、mapping/对象型 scalar 和未声明字段。
+cognition 请求额外要求 `acknowledgeCognition: true`；这只是防误操作，不替代调用
+Skill 的语义门槛。
+
+### 19.4.1 Layer 与内部目录拓扑
+
+layer 配置缺失时沿用 ME 默认值，但 resolved layout 必须满足：
+
+- raw/practices/cognition 三个 root 都已存在且 canonical target 是 directory；
+- 三个 lexical/canonical root pairwise distinct，且不存在相同、ancestor/descendant、
+  nested 或其他 overlap；
+- 任一 layer 不能等于 vault root、`.me`、`.me/tmp`、`.me/locks`、
+  `.me/tmp/vault-write-*` recovery、`SCHEMA.md` 或上述路径的 ancestor/descendant；
+- `.me` 必须是 vault 内已存在的 real directory，不接受 symlink；`tmp`/`locks`
+  缺失时可在 write 的 pre-lock bootstrap 以 tracked mkdir 创建（preview 不创建），
+  存在时必须是 contained real directory；
+- config、schema、target parent、README、lock、staging、journal、original/recovery
+  和每个 existing prefix 都同时通过 lexical/canonical containment；
+- dangling symlink、逃逸 symlink、non-directory layer、reserved/root target 或无法
+  canonicalize 均 fail closed。
+
+这些约束在 preview、持锁后、每个 mutation boundary 和 post-validation 都重验。
 
 ### 19.5 Request contract
 
@@ -494,7 +576,10 @@ interface VaultWriteResultV1 {
   unlinkedMentions: string[];
   warnings: string[];
   error?: { code: string; message: string };
-  recovery?: {
+  recoveryState: 'none' | 'retained-originals' | 'incomplete';
+  recoveries: Array<{
+    operationId: string;
+    state: 'retained-original' | 'incomplete-operation' | 'ownership-conflict';
     directory: string;        // always under .me/tmp, vault-relative
     journal: string;
     preservedPaths: string[];
@@ -505,14 +590,37 @@ interface VaultWriteResultV1 {
       from?: string;
       condition: string;
     }>;
-  };
+  }>;
 }
 ```
 
 结果不得回显 Markdown、frontmatter、绝对 vault path、用户名、home path、环境变量、
 command stderr、secret-looking value 或原始 exception message。`message` 来自固定的
 public error catalog；详细 path、fingerprint 与内部 error 只写入权限受限的本地
-journal。
+journal。多个未完成 operation 必须聚合进 `recoveries[]`，不得只返回扫描到的第一
+项；`recoveryState` 是数组的 aggregate state。
+
+固定 error catalog 随 `contracts.ts` 实现，不留到 CLI 临时决定：
+
+| Code | Status | Exit | Public message |
+| --- | --- | --- | --- |
+| `INVALID_REQUEST` | validation_failed | 2 | Request does not match vault-write v1. |
+| `INVALID_CONFIG` | validation_failed | 2 | Vault layer configuration is invalid. |
+| `UNSAFE_PATH` | validation_failed | 2 | A required path is outside the safe vault layout. |
+| `UNSUPPORTED_SCHEMA` | validation_failed | 2 | Vault schema revision is not supported by this ME version. |
+| `INVALID_NOTE` | validation_failed | 2 | Note does not match the selected schema profile. |
+| `DUPLICATE_STEM` | conflict | 3 | A note with this stem already exists. |
+| `TARGET_EXISTS` | conflict | 3 | The requested target already exists. |
+| `LOCK_HELD` | conflict | 3 | Another vault-write operation may still be active. |
+| `INPUT_CHANGED` | conflict | 3 | Vault inputs changed after planning; nothing new was published. |
+| `UNSUPPORTED_FILESYSTEM` | unsupported | 5 | Filesystem cannot provide the required no-clobber primitive. |
+| `POST_VALIDATION_FAILED` | validation_failed | 2 | Post-write validation failed and owned changes were restored. |
+| `INCOMPLETE_OPERATION` | manual_recovery | 4 | One or more incomplete operations require inspection. |
+| `RECOVERY_REQUIRED` | manual_recovery | 4 | Conflicting content was preserved; manual recovery is required. |
+| `INTERNAL_ERROR` | validation_failed | 1 | Vault write could not complete safely. |
+
+`INTERNAL_ERROR` 只有在确定零 target mutation 时使用；一旦 mutation state 不明，
+必须改用 `RECOVERY_REQUIRED`/manual_recovery/exit 4。
 
 ### 19.7 Preview
 
@@ -530,26 +638,46 @@ digest、backlinks 和 mentions；`operationId` 与时间字段不参与该断�
 
 ### 19.8 索引可达性与 backlinks
 
-writer 在写前扫描配置的三层 Markdown：
+writer 新增自己的 `bin/vault-write/graph.ts`。v1 不修改或依赖既有
+`wikilink-graph.js`，避免改变 checklinks/backlinks 的历史行为。scanner contract：
 
-1. 忽略 frontmatter、inline code、正确配对的 fenced code、`.me/tmp` 与 writer
-   recovery；
-2. 如果已有有效 `[[stem]]` 入链，则 `indexAction: none`；
-3. 否则固定更新 `{configured-layer-root}/README.md`，不根据遍历顺序选择别的
-   README；
-4. 在 README 的 managed block 中维护按 Unicode code point 排序的
-   `- [[stem]]`：
+- 只递归扫描三个 validated layer roots；每个 directory entry 和 existing prefix 都
+  做 symlink containment，dangling/escaping link fail closed；
+- frontmatter、inline code、正确配对的 fenced code 不参与 wikilink/mention；
+- `.me`、staging、journal、recovery 永远不进入 graph；
+- `README.md` 是 index document：它的 wikilink可形成入链，但它不作为 note 参与
+  duplicate-stem、orphan 或 unlinked-mention suggestion；
+- note stem 按 Unicode simple case fold 比较，三层中任何 duplicate 都
+  `DUPLICATE_STEM`，即便所有 link 已 path-qualified；
+- graph 可读取 `[[target]]`、`[[target|alias]]`、`[[target#heading]]`、
+  `[[target#^block]]`。含 `/` 的 target 按 vault-relative POSIX path exact resolve；
+  basename-only target 只有在全 vault 唯一时可 resolve，否则是 ambiguous/broken；
+- writer 自己生成的 source/index link 永远使用不带 alias/fragment/`.md` 的
+  path-qualified form；
+- backlink count 是同一 source document 的实际出现次数；mentions 忽略已在同一
+  document 成为 wikilink 的 title/stem，按 `(path, offset)` 计数；
+- output 先按 vault-relative POSIX path code-point sort，再按 count/offset 固定排序，
+  不依赖 filesystem enumeration order。
+
+写前：
+
+1. 如果已有 resolved 入链指向 planned path，则 `indexAction: none`；
+2. 否则固定更新 `{configured-layer-root}/README.md`；
+3. managed entry 使用 target 的 layer-relative path-qualified link，例如 target 为
+   `knowledge/practices/decisions/2026-07-26-orchid-choice.md`，practices README 写
+   `[[decisions/2026-07-26-orchid-choice]]`；
+4. managed block 按 normalized target code point 排序：
 
 ```markdown
 <!-- me:index:start -->
-- [[2026-07-26-example]]
+- [[decisions/2026-07-26-example]]
 <!-- me:index:end -->
 ```
 
 已有且格式合法的 managed block 被规范化；没有 block 时在保留原文 exact bytes 的
 前提下追加一个 block；重复、嵌套或 malformed marker 导致 validation failure。
 
-写后使用 ME native wikilink graph 做 no-regression validation：
+写后重新运行同一个 writer-owned scanner 做 no-regression validation：
 
 - note 通过既有 backlink 或 layer README 的 managed link 可达；
 - 新 note 不进入 orphan set；
@@ -558,18 +686,61 @@ writer 在写前扫描配置的三层 Markdown：
 
 backlinks 和 unlinked mentions 只作为结果建议返回，不修改其他笔记。
 
+### 19.8.1 Markdown destination grammar
+
+writer 对 request Markdown fail closed，只接受：
+
+- 普通文本与 CommonMark fenced/inline code；
+- writer-owned scanner 支持的 Obsidian wikilink；
+- inline Markdown link/image：`[label](destination)`、
+  `![alt](destination)`，destination 可为 `<...>` 或支持反斜线 escape 与 balanced
+  parentheses 的 unwrapped form；v1 不接受 optional title；
+- normal link 的 `https://`/`http://` remote destination；
+- fragment-only normal link（`#heading`）；
+- contained、已存在的 vault-local relative destination；local fragment 可保留。
+
+明确拒绝：
+
+- full/collapsed/shortcut reference link 与 reference definition；
+- raw HTML、HTML `<a>/<img>`、HTML/autolink；
+- Obsidian embed `![[...]]`；
+- remote image；
+- `file:`、`data:`、`javascript:` 或其他 scheme；
+- protocol-relative、absolute/drive/UNC path；
+- local query string、empty destination、control character、NUL、unbalanced destination；
+- local path 的 `.`/`..`、backslash 或 encoded traversal/separator。
+
+校验 destination path 时先拆 fragment，再对 path component 反复
+`decodeURIComponent` 直至稳定（最多 4 轮）。每轮先拒绝 encoded `/` 或 `\`
+（`%2f/%5c`，case-insensitive），decode 后同时按 `/`/`\` 检查 component；任一轮产生
+`.` 或 `..` component 即拒绝。`%25` 本身不是错误，但必须继续 decode，若最终形成
+encoded separator/dot traversal则拒绝；invalid escape 或第 4 轮后仍会变化也拒绝。
+因此 `file%2emd` 可解析为普通 filename，而 `%2e%2e`、`%252e%252e`、
+`a%2fb`、`a%255cb` 均拒绝。解析后的 local path 必须通过 lexical/canonical
+containment并 exact resolve 到普通 file。Markdown link grammar 与 frontmatter
+`source` grammar 是两个独立 contract；source 仍只能使用 §19.4 的 path-qualified
+wikilink。
+
 ### 19.9 Transaction model
 
 #### Cooperative lock
 
-`write` 首先以 Node `open(..., 'wx')` 创建
-`.me/locks/vault-write.lock`。它只串行化遵守同一协议的 writer：
+`write` 按固定顺序处理全局状态：validate internal layout → inspect lock → 若无 lock
+则扫描 incomplete journals → 以 Node `open(..., 'wx')` 创建
+`.me/locks/vault-write.lock`。最后一步的 `EEXIST` 仍映射为 `LOCK_HELD`。lock 只
+串行化遵守同一协议的 writer：
 
 - lock 内容只有 version、operationId、startedAt；
 - lock path 与 `.me` 先做 symlink containment；
-- 已存在 lock 返回 `conflict/LOCK_HELD`；
-- v1 不自动删除“看似过期”的 lock。crash journal/lock 由 recovery result 指引，
-  避免误杀仍在运行的 writer。
+- **只要 lock 存在，永远先返回 `conflict/LOCK_HELD`**；即使同时发现 incomplete
+  journal 也不把可能仍 active 的 operation 宣布为 recovery；
+- 仅在 lock 不存在时扫描所有 `.me/tmp/vault-write-*/journal.json`：发现一个或多个
+  non-committed journal 返回 `manual_recovery/INCOMPLETE_OPERATION`，全部聚合到
+  `recoveries[]`；
+- v1 不用 PID、mtime 或“过期”猜测自动删除 lock/journal；
+- release 时 close 自己的 fd 后，只有 lock 的 lstat identity、bytes 和 operationId
+  仍等于 acquisition fingerprint 才能 unlink。changed/replaced lock 视为外部内容，
+  保留并返回 `manual_recovery/RECOVERY_REQUIRED`。
 
 #### Staging and publish
 
@@ -588,6 +759,10 @@ target。`link` 提供单个 directory entry 的 no-clobber create；writer 先�
 与 target 在同一 device，并对 `EXDEV`/`EPERM` 等返回 `unsupported`，不得退化成
 check-then-write、copy 或可覆盖 rename。
 
+staging/journal/request copy 为 `0600` 且受 `0700` directory 保护。publish 前把 staged
+note mode 调整为 `0666 & ~process.umask()`；hard link 后 target 继承该 mode。writer
+不承诺保留 request 指定的 mode、uid/gid、ACL、xattr 或 timestamps。
+
 README create 同样使用 staged file + `link` no-clobber。
 
 README replace 不声称 Node 提供 atomic compare-and-swap。writer 使用 journaled
@@ -602,10 +777,14 @@ preservation：
 5. 用 staged hard link no-clobber 创建新 README；
 6. 校验 ownership fingerprint 和 vault invariants。
 
+新建 README mode 为 `0666 & ~process.umask()`。替换既有 README 时，staged README
+在 publish 前复制原文件的 POSIX permission bits (`mode & 0o777`)；不复制
+uid/gid、ACL、xattr、birthtime/mtime，并在 result warning 明确该 metadata policy。
+原 README inode/metadata仍保存在 operation recovery。
+
 旧 README inode 在成功后也保留在 operation recovery directory，不立即删除。这样，
 在 rename 前已打开该 inode 的外部 editor 即使稍后写入，其 bytes 仍有保存位置。
-结果通过 warning 和 `recovery.directory` 报告 retained original；后续 cleanup 不在
-v1 自动执行。
+结果通过 warning、`recoveryState: retained-originals` 与 `recoveries[]` 报告。
 
 #### Ownership-aware rollback
 
@@ -635,6 +814,60 @@ planned -> locked -> staged -> note-published -> index-preserved
 ownership 校验与 post-validation；result 固定写
 `commitModel: journaled-cooperative`，绝不使用 `atomic: true`。
 
+#### Plan fingerprint 与 mutation-boundary revalidation
+
+preview/write plan 产生 `PlanFingerprintV1`，至少包括：
+
+- request digest；
+- config bytes + lstat identity；
+- selected schema profile bytes/hash、vault SCHEMA bytes/hash、selected template
+  bytes/hash + identities；
+- writer-owned graph 的每个 input：vault-relative path、dev/ino/type/mode/size/
+  mtimeNs/ctimeNs/content SHA-256，按 path 排序；
+- layer roots、`.me`、tmp、locks、target parent existing-prefix、target absent state、
+  README bytes/identity；
+- planned note/index bytes digest。
+
+获得 lock 后重新 plan；`afterLock`/`afterStaging` 之后且**第一次 publish 前**必须重读
+所有 fingerprint input，任何差异返回 `conflict/INPUT_CHANGED` 且零 target mutation。
+note publish 后、index preserve/publish 前，允许 operation-owned expected change，其余
+input 仍必须匹配；若变化，按 ownership rollback/manual recovery 处理。post-validation
+再次 fingerprint config/profile/schema/template/graph/README/path identities，并确认
+只有 planned changes。
+
+每次 `link`、`rename`、`unlink`、`mkdir`、`rmdir` 前立即重跑该 source/destination 及
+existing parent chain 的 lexical/canonical containment。不能只依赖 plan-time check。
+
+#### Commit cleanup 与 retained recovery
+
+commit 不能把 sensitive staging hardlink 留在 `.me/tmp`：
+
+1. 对 staged note/README 与 published target 比较 dev+ino、content fingerprint 和
+   expected link count；
+2. 只有 target 仍是 operation-owned inode、staged path 指向同 inode且 `nlink >= 2`
+   时才 unlink staged name；
+3. unlink 后重验 published target仍存在且 ownership unchanged；
+4. operation-owned request copy、rendered Markdown copy 和 transient fingerprint
+   files只有 identity/content仍匹配时才删；
+5. staged path 已变化、是最后 link、target 被 replace 或 cleanup ownership 不明时，
+   保留内容并返回 `manual_recovery`，不得以“只是 temp”删除。
+
+successful operation directory最终只允许保留：
+
+- sanitized minimal `journal.json`（operationId、state、relative paths、hash、metadata
+  policy，不含 request Markdown/frontmatter/secret/raw exception）；
+- replace README 的 `originals/README.md`。
+
+`recoveries[].actions` 对 retained original 至少包含：
+
+- `inspect` original 与 current README；
+- `compare` current expected committed digest；
+- `remove-owned` retained original，仅当用户确认 current README 含所需内容、original
+  不含待合并外部编辑。
+
+v1 不自动 cleanup retained original；文档提供条件化 guidance，不给无条件 recursive
+delete command。
+
 ### 19.10 Tested guarantees
 
 writer 的公开保证严格限定为：
@@ -660,14 +893,27 @@ writer 的公开保证严格限定为：
 
 Decision Brief 明确保存阶段性判断时：
 
-1. Skill 生成符合 practices schema/template 的完整 Markdown；
-2. 先调用 `preview`，向用户/Agent 暴露 target、index action 和 validation；
-3. 已有明确保存授权时，用同一 request 调用 `write`；
-4. 只有 `status: committed` 才报告已保存；
-5. `conflict`、`unsupported`、`validation_failed` 均报告 `not written`；
-6. `manual_recovery` 原样报告 preserved paths、remaining mutations 与 actions，不得
-   简化成“已回滚”；
-7. Skill 不设置 `acknowledgeCognition`，Decision Brief v1 自动落盘只到 practices。
+1. Skill 只生成 practices `type: reflection`：Decision Brief 记录的是当前判断和行动
+   依据，尚未执行 `最小验证实验`，因此不是 `experiment`；
+2. `source` 必须是本次简报实际使用的、已存在且通过 scanner resolution 的
+   path-qualified wikilink。多个来源时选择对推荐影响最大的 primary local note，
+   其余放正文；若没有合法 local provenance，先 ingest raw 或保持 chat-only，明确
+   `not written`，不得用空字符串、当前 note 自链、虚构 link 或 remote URL 绕过
+   practices profile；
+3. target 固定为 configured practices layer 下
+   `decisions/YYYY-MM-DD-<slug>.md`。slug 从 Decision title 生成 lowercase ASCII
+   kebab-case；无法生成时使用 `decision-<requestDigest前12位>`。existing path 或
+   case-fold stem collision 返回 conflict，不自动加 `-2` 或改写别的文件；
+4. frontmatter `project` 仅在 Decision Contract 有明确项目时填写 path-qualified
+   wikilink/plain string，否则使用 template 允许的 empty string；
+5. 先调用 `preview`，向用户/Agent 暴露 target、index action 和 validation；
+6. 已有明确保存授权时，用同一 request 调用 `write`；
+7. 只有 `status: committed` 才报告已保存；
+8. `conflict`、`unsupported`、`validation_failed` 均报告 `not written`；
+9. `manual_recovery` 原样逐项报告全部 `recoveries[]` 的 state、preserved paths、
+   remaining mutations 与 actions，并报告 aggregate `recoveryState`；不得只报第一项
+   或简化成“已回滚”；
+10. Skill 不设置 `acknowledgeCognition`，Decision Brief v1 自动落盘只到 practices。
 
 ### 19.12 新增验收标准
 
@@ -675,11 +921,19 @@ Decision Brief 明确保存阶段性判断时：
 2. practices note 与 layer README 形成可达入链，且不新增 broken link。
 3. target 已存在、大小写 stem 冲突、path traversal、symlink escape 均无 target
    mutation。
-4. schema/template mismatch 与非法 YAML field/type 在 publish 前失败。
-5. concurrent target create、README edit、README atomic replace、post-publish note
+4. unsupported SCHEMA fingerprint/profile revision、template fingerprint mismatch 与
+   非法 YAML field/type 在 publish 前失败；runtime 不解析 SCHEMA prose。
+5. concurrent target create、README edit、README external rename replacement、post-publish note
    edit 全部保留外部 bytes。
-6. rollback 无法证明 ownership 时返回结构化 manual recovery。
+6. rollback/lock release/staging cleanup 无法证明 ownership 时返回聚合的结构化
+   `recoveries[]`；既有 lock 始终只报 `LOCK_HELD`。
 7. preview 对 vault 为零写入。
 8. stdin/JSON output 不泄漏 Markdown、绝对路径、用户名或 secret-like input。
 9. hard link 不可用时 fail closed 为 `unsupported`，不降级到覆盖性 primitive。
 10. Decision Brief 只在 writer 返回 `committed` 时声称 saved。
+11. 重叠/nested/duplicate layer roots、reserved/internal overlap、non-directory root
+    全部在 mutation 前拒绝。
+12. config/schema/profile/template/graph/README/path identity 在 first publish 前与
+    post-validation 重验，四个 hook boundary 的变更均被检测。
+13. Decision Brief practices note 固定为 reflection、path-qualified existing source
+    和 deterministic `decisions/` target；无 provenance 或 collision 时 not written。
