@@ -257,6 +257,7 @@ export function validateSourceBundle(value: unknown, bundleDir: string): SourceB
   const issues: string[] = [];
   rejectForbiddenKeys(value, issues);
   const bundle = requireRecord(value, 'bundle', issues) ?? {};
+  rejectUnknownKeys(bundle, ['version', 'source', 'blocks', 'transcript', 'media', 'provenance', 'warnings'], 'bundle', issues);
   if (bundle.version !== 1) issues.push('version must be 1');
   const source = validateSource(bundle.source, issues);
   const blocks = validateBlocks(bundle.blocks, issues);

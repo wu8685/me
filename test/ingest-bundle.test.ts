@@ -33,6 +33,13 @@ test('accepts http(s) source URLs', () => {
     .toBe('https://example.com/source');
 });
 
+test('rejects an unknown top-level field containing a local absolute path', () => {
+  expect(() => validateSourceBundle(
+    bundle({ localPath: '/Users/name/private' }),
+    fixture('bundle-valid'),
+  )).toThrow(BundleValidationError);
+});
+
 test.each([
   { source: { url: 'file:///Users/name/private', kind: 'article', title: 'Source' } },
   { source: { url: 'https://example.com/source', kind: 'article', title: 'Source', localPath: '/Users/name/private' } },
