@@ -2997,6 +2997,17 @@ test_ingest_script_cli_help() {
   fi
 }
 
+test_ingest_help_lists_bundle_and_handout() {
+  output=$(bun run "$PLUGIN_ROOT/bin/ingest.ts" --help 2>&1) || return 1
+  echo "$output" | grep -q -- "--bundle" || return 1
+  echo "$output" | grep -q "handout" || return 1
+}
+
+test_ingest_rejects_url_and_bundle_together() {
+  bun run "$PLUGIN_ROOT/bin/ingest.ts" "https://example.com" --bundle "$PLUGIN_ROOT/test/fixtures/ingest/bundle-valid" >/dev/null 2>&1
+  [ "$?" -ne 0 ]
+}
+
 test_ingest_skill_calls_script() {
   # SKILL.md must reference bin/ingest.ts (thin orchestrator pattern)
   assert_file_exists "$PLUGIN_ROOT/skills/ingest/SKILL.md" || return 1
@@ -4404,6 +4415,8 @@ main() {
     # Quick 260406-bxt: Ingest Script Integration
     run_test test_ingest_script_exists
     run_test test_ingest_script_cli_help
+    run_test test_ingest_help_lists_bundle_and_handout
+    run_test test_ingest_rejects_url_and_bundle_together
     run_test test_ingest_skill_calls_script
     run_test test_ingest_skill_thin_orchestrator
     run_test test_ingest_skill_llm_only_for_translate_summarize

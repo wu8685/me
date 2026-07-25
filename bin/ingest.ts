@@ -4,7 +4,8 @@
 // Exports pure functions for all deterministic ingest steps.
 // LLM reasoning is only used for translate-cn and summarize modes in SKILL.md.
 //
-// CLI usage: bun run bin/ingest.ts <url> [--mode translate-cn|summarize|raw] [--vault-dir DIR]
+// CLI usage: bun run bin/ingest.ts <url> [--mode MODE] [--vault-dir DIR] [--write]
+//            bun run bin/ingest.ts --bundle DIR [--mode MODE] [--vault-dir DIR] [--write]
 //            bun run bin/ingest.ts --download-images --vault-dir DIR --target-dir DIR --urls url1,url2,...
 //            bun run bin/ingest.ts --help
 
@@ -16,7 +17,11 @@ import * as http from 'http';
 import { execSync } from 'child_process';
 import { defaultCommandRunner, type CommandRunner } from './ingest/command.ts';
 import { extractHtmlSource } from './ingest/adapters/html.ts';
+import { createHtmlAdapter } from './ingest/adapters/html.ts';
+import { createPdfAdapter } from './ingest/adapters/pdf.ts';
+import { createXAdapter } from './ingest/adapters/x.ts';
 import {
+  createBilibiliAdapter,
   extractBilibiliSource,
   fetchBilibiliMeta as fetchBilibiliMetaFromAdapter,
   fetchBilibiliSubtitleBody as fetchBilibiliSubtitleBodyFromAdapter,
@@ -24,6 +29,19 @@ import {
   isBilibiliUrl as isBilibiliUrlFromAdapter,
   parseBilibiliBvid as parseBilibiliBvidFromAdapter,
 } from './ingest/adapters/bilibili.ts';
+import { loadSourceBundle } from './ingest/bundle.ts';
+import { resolveIngestConfig } from './ingest/config.ts';
+import type {
+  CapabilityReport,
+  ExtractMode,
+  ExtractedSource,
+  SourceAdapter,
+  SourceKind,
+} from './ingest/contracts.ts';
+import { finalizeIngest, type FinalizeResult } from './ingest/finalize.ts';
+import { formatHandout, type HandoutResult } from './ingest/handout.ts';
+import { createAdapterRegistry } from './ingest/registry.ts';
+import { discoverTranscriptionProvider } from './ingest/media/transcription.ts';
 
 export type {
   Capability,
@@ -119,6 +137,12 @@ export interface IngestPipelineResult {
   relatedNotes: RelatedNote[];
   needsTranscription?: boolean;
   transcriptionAvailable?: boolean;
+  sourceKind?: SourceKind;
+  adapterId?: string;
+  capabilities?: CapabilityReport['capabilities'];
+  warnings?: string[];
+  handoutKind?: HandoutResult['kind'];
+  writeResult?: FinalizeResult;
 }
 
 // ── resolveConfig ─────────────────────────────────────────────────────────────
@@ -814,19 +838,369 @@ export function downloadImage(url: string, targetDir: string, filename: string):
   return false;
 }
 
+// ── Rich ingest orchestration ─────────────────────────────────────────────────
+
+export interface IngestCliOptions {
+  url?: URL;
+  bundleDir?: string;
+  mode?: ExtractMode;
+  vaultDir: string;
+  topic?: string;
+  processedMarkdown?: string;
+  write: boolean;
+}
+
+const INGEST_MODES = new Set<ExtractMode>(['raw', 'translate-cn', 'summarize', 'transcribe', 'handout']);
+const TOPIC_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)*$/;
+
+export function parseIngestCliOptions(args: string[], cwd = process.cwd()): IngestCliOptions {
+  let url: URL | undefined;
+  let bundleDir: string | undefined;
+  let mode: ExtractMode | undefined;
+  let vaultDir = cwd;
+  let topic: string | undefined;
+  let processedMarkdown: string | undefined;
+  let write = false;
+
+  const takeValue = (index: number, flag: string): string => {
+    const value = args[index + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    return value;
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (!argument.startsWith('--')) {
+      if (url) throw new Error('exactly one URL or --bundle is required');
+      try {
+        const parsed = new URL(argument);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error();
+        url = parsed;
+      } catch {
+        throw new Error('URL must be an http(s) URL');
+      }
+      continue;
+    }
+    if (argument === '--write') {
+      write = true;
+      continue;
+    }
+    if (argument === '--bundle') {
+      bundleDir = takeValue(index, argument);
+      index += 1;
+      continue;
+    }
+    if (argument === '--mode') {
+      const value = takeValue(index, argument);
+      if (!INGEST_MODES.has(value as ExtractMode)) throw new Error(`unknown ingest mode: ${value}`);
+      mode = value as ExtractMode;
+      index += 1;
+      continue;
+    }
+    if (argument === '--vault-dir') {
+      vaultDir = takeValue(index, argument);
+      index += 1;
+      continue;
+    }
+    if (argument === '--topic') {
+      topic = takeValue(index, argument);
+      if (!TOPIC_PATTERN.test(topic)) throw new Error('topic must be an ASCII kebab slug');
+      index += 1;
+      continue;
+    }
+    if (argument === '--processed-markdown') {
+      processedMarkdown = takeValue(index, argument);
+      index += 1;
+      continue;
+    }
+    throw new Error(`unknown option: ${argument}`);
+  }
+
+  if (Boolean(url) === Boolean(bundleDir)) throw new Error('exactly one URL or --bundle is required');
+  if (processedMarkdown && !write) throw new Error('--processed-markdown requires --write');
+  return {
+    ...(url ? { url } : {}),
+    ...(bundleDir ? { bundleDir: path.resolve(bundleDir) } : {}),
+    ...(mode ? { mode } : {}),
+    vaultDir: path.resolve(vaultDir),
+    ...(topic ? { topic } : {}),
+    ...(processedMarkdown ? { processedMarkdown: path.resolve(processedMarkdown) } : {}),
+    write,
+  };
+}
+
+export function resolveIngestMode(
+  explicitMode: ExtractMode | undefined,
+  sourceKind: SourceKind,
+  language: 'en' | 'zh',
+  defaultVideoMode: ExtractMode,
+): ExtractMode {
+  if (explicitMode) return explicitMode;
+  if (sourceKind === 'video' || sourceKind === 'course') return defaultVideoMode;
+  return language === 'en' ? 'translate-cn' : 'summarize';
+}
+
+export function createRichIngestRegistry(runner: CommandRunner = defaultCommandRunner): {
+  adapters: SourceAdapter[];
+  registry: ReturnType<typeof createAdapterRegistry>;
+} {
+  const bili = createBilibiliAdapter(runner, {
+    transcribe(sourceUrl, cid) {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-bili-transcript-'));
+      try {
+        return transcribeBilibili(sourceUrl, cid, directory, runner);
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    },
+    transcriptionAvailable: () => whichYtDlp(runner) !== null && whichWhisperCli(runner) !== null,
+  });
+  const adapters = [bili, createXAdapter(runner), createPdfAdapter(runner), createHtmlAdapter(runner)];
+  const registry = createAdapterRegistry(adapters, {
+    async resolveContentType(url) {
+      const result = runner.run('curl', [
+        '-sS', '-L', '--fail', '--max-time', '15', '-I', '-o', '/dev/null',
+        '-w', '%{content_type}', url.toString(),
+      ], { timeoutMs: 18000 });
+      return result.stdout.trim() || undefined;
+    },
+  });
+  return { adapters, registry };
+}
+
+function isInside(root: string, candidate: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function readProcessedMarkdown(vaultDir: string, filename: string | undefined): string | undefined {
+  if (!filename) return undefined;
+  const tmpRoot = path.resolve(vaultDir, '.me', 'tmp');
+  const candidate = path.resolve(filename);
+  if (!isInside(tmpRoot, candidate) || !fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
+    throw new Error('--processed-markdown must be a file inside <vault>/.me/tmp/');
+  }
+  const realVault = fs.realpathSync(vaultDir);
+  const realTmp = fs.realpathSync(tmpRoot);
+  const realCandidate = fs.realpathSync(candidate);
+  if (!isInside(realVault, realTmp) || !isInside(realTmp, realCandidate)) {
+    throw new Error('--processed-markdown must be a file inside <vault>/.me/tmp/');
+  }
+  return fs.readFileSync(realCandidate, 'utf8');
+}
+
+function mediaExtension(asset: import('./ingest/contracts.ts').MediaAsset): string {
+  const fromPath = asset.url ? path.extname(new URL(asset.url).pathname).toLowerCase() : '';
+  return /^\.[a-z0-9]{1,10}$/.test(fromPath) ? fromPath : '.jpg';
+}
+
+function prepareUrlMedia(
+  source: ExtractedSource,
+  workspace: string,
+  runner: CommandRunner,
+  downloadRemote: boolean,
+): ExtractedSource {
+  const mediaDirectory = path.join(workspace, 'media');
+  fs.mkdirSync(mediaDirectory, { recursive: true });
+  const media = source.media.map((asset, index) => {
+    if (asset.path) {
+      const sourcePath = path.resolve(asset.path);
+      if (isInside(path.resolve(workspace), sourcePath)) return asset;
+      if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) return asset;
+      const extension = path.extname(sourcePath).toLowerCase();
+      const destination = path.join(mediaDirectory, `asset-${String(index + 1).padStart(3, '0')}${extension}`);
+      fs.copyFileSync(sourcePath, destination);
+      return { ...asset, path: destination };
+    }
+    if (!downloadRemote || !asset.url || !['image', 'figure', 'slide', 'frame'].includes(asset.kind)) {
+      return asset;
+    }
+    const destination = path.join(
+      mediaDirectory,
+      `asset-${String(index + 1).padStart(3, '0')}${mediaExtension(asset)}`,
+    );
+    runner.run('curl', [
+      '-sS', '-L', '--fail', '--max-time', '30', '-o', destination, asset.url,
+    ], { timeoutMs: 35000 });
+    if (!fs.existsSync(destination) || fs.statSync(destination).size === 0) {
+      throw new Error(`failed to stage media asset: ${asset.id}`);
+    }
+    return { ...asset, path: destination };
+  });
+  return { ...source, media };
+}
+
+function transcribeLocalMedia(
+  source: ExtractedSource,
+  workspace: string,
+  config: ReturnType<typeof resolveIngestConfig>,
+  runner: CommandRunner,
+): ExtractedSource {
+  if (source.transcript?.length) return source;
+  const inputs = source.media.filter(asset =>
+    (asset.kind === 'audio' || asset.kind === 'video') && asset.path);
+  if (inputs.length === 0) return source;
+  const provider = discoverTranscriptionProvider(config.transcriptionPreference, runner, config);
+  if (!provider) {
+    return { ...source, warnings: [...source.warnings, 'transcription-unavailable'] };
+  }
+  let offset = 0;
+  const transcript = inputs.flatMap((asset, index) => {
+    const output = path.join(workspace, `transcript-${String(index + 1).padStart(3, '0')}`);
+    const segments = provider.transcribe(asset.path as string, output)
+      .map(segment => ({ ...segment, start: segment.start + offset, end: segment.end + offset }));
+    offset = segments.at(-1)?.end ?? offset;
+    return segments;
+  });
+  return transcript.length > 0
+    ? { ...source, transcript, warnings: source.warnings.filter(warning => warning !== 'needs-transcription') }
+    : { ...source, warnings: [...source.warnings, 'transcription-empty'] };
+}
+
+function sourceCapabilities(source: ExtractedSource, probed: CapabilityReport['capabilities']): CapabilityReport['capabilities'] {
+  const capabilities = new Set(probed);
+  if (source.blocks.length > 0) capabilities.add('body');
+  if (source.transcript?.length) capabilities.add('transcript');
+  if (source.media.some(asset => asset.kind === 'image' || asset.kind === 'figure')) capabilities.add('images');
+  if (source.media.some(asset => asset.kind === 'slide')) capabilities.add('slides');
+  if (source.media.some(asset => asset.kind === 'audio')) capabilities.add('audio');
+  if (source.media.some(asset => asset.kind === 'video')) capabilities.add('video');
+  return [...capabilities];
+}
+
+export async function runRichIngest(
+  options: IngestCliOptions,
+  runner: CommandRunner = defaultCommandRunner,
+): Promise<IngestPipelineResult> {
+  if (!fs.existsSync(options.vaultDir) || !fs.statSync(options.vaultDir).isDirectory()) {
+    throw new Error('vault directory does not exist');
+  }
+  const config = resolveIngestConfig(options.vaultDir);
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-run-'));
+  let processedMarkdown: string | undefined;
+  let processedPath: string | undefined;
+
+  try {
+    processedMarkdown = readProcessedMarkdown(options.vaultDir, options.processedMarkdown);
+    processedPath = options.processedMarkdown ? fs.realpathSync(options.processedMarkdown) : undefined;
+
+    let source: ExtractedSource;
+    let adapterId: string;
+    let capabilityReport: CapabilityReport;
+    let trustedResourceRoots: string[];
+    if (options.bundleDir) {
+      source = loadSourceBundle(options.bundleDir);
+      adapterId = 'source-bundle-v1';
+      capabilityReport = {
+        adapterId,
+        readable: true,
+        capabilities: sourceCapabilities(source, []),
+        degradation: source.warnings.length > 0 ? 'partial' : 'none',
+        warnings: [...source.warnings],
+      };
+      trustedResourceRoots = [fs.realpathSync(options.bundleDir)];
+    } else {
+      const url = options.url as URL;
+      const { registry } = createRichIngestRegistry(runner);
+      capabilityReport = await registry.probe(url, { vaultDir: options.vaultDir, tempDir: workspace });
+      if (capabilityReport.degradation === 'blocked') {
+        throw new Error(JSON.stringify({
+          code: 'source-blocked',
+          adapterId: capabilityReport.adapterId,
+          warnings: capabilityReport.warnings,
+        }));
+      }
+      const directAdapter = registry.match(url);
+      const guessedMode = options.mode
+        ?? (directAdapter.id === 'bilibili' || directAdapter.id === 'x' ? config.defaultVideoMode : undefined);
+      const extractionMode = guessedMode === 'handout' ? 'transcribe' : guessedMode;
+      source = await registry.extract(url, {
+        vaultDir: options.vaultDir,
+        tempDir: workspace,
+        ...(extractionMode ? { mode: extractionMode } : {}),
+      });
+      adapterId = capabilityReport.adapterId;
+      source = prepareUrlMedia(source, workspace, runner, options.write);
+      trustedResourceRoots = [workspace];
+    }
+
+    const body = source.blocks.map(block => block.markdown).join('\n\n');
+    const language = detectLanguage(`${source.source.title}\n${body}`);
+    const mode = resolveIngestMode(options.mode, source.source.kind, language, config.defaultVideoMode);
+    if (mode === 'handout' || mode === 'transcribe') {
+      source = transcribeLocalMedia(source, workspace, config, runner);
+    }
+    const handout = mode === 'handout'
+      ? formatHandout(source, { topicHeadings: [] })
+      : undefined;
+    const previewBody = processedMarkdown ?? handout?.markdown ?? body;
+    const slug = deriveSlug(source.source.title) || 'ingest';
+    const today = new Date().toISOString().slice(0, 10);
+    const stem = `${today}-${slug}`;
+    const frontmatter = generateFrontmatter(source.source.title, today, [], source.source.url);
+    const vaultIndex = buildVaultIndex(options.vaultDir);
+    const autoLinkResult = autoLink(`${frontmatter}\n\n${previewBody}`, vaultIndex);
+    const relatedNotes = scoreRelatedNotes([], source.source.title, vaultIndex, options.vaultDir).slice(0, 5);
+    const capabilities = sourceCapabilities(source, capabilityReport.capabilities);
+    const warnings = [...new Set([...capabilityReport.warnings, ...source.warnings, ...(handout?.warnings ?? [])])];
+
+    let writeResult: FinalizeResult | undefined;
+    if (options.write) {
+      writeResult = finalizeIngest({
+        vaultDir: options.vaultDir,
+        source,
+        ...(handout ? { handout } : {}),
+        ...(processedMarkdown ? { processedMarkdown } : {}),
+        ...(options.topic ? { topic: options.topic } : {}),
+        stem,
+        created: today,
+        trustedResourceRoots,
+      });
+      if (processedPath) fs.rmSync(processedPath, { force: true });
+    }
+
+    return {
+      title: source.source.title,
+      slug,
+      language,
+      mode,
+      frontmatter,
+      content: autoLinkResult.linkedBody,
+      images: source.media.flatMap(asset => asset.kind === 'image' && asset.url ? [asset.url] : []),
+      autoLinks: autoLinkResult.links,
+      relatedNotes,
+      sourceKind: source.source.kind,
+      adapterId,
+      capabilities,
+      warnings,
+      ...(handout ? { handoutKind: handout.kind } : {}),
+      ...(writeResult ? { writeResult } : {}),
+      ...(source.warnings.includes('needs-transcription') ? { needsTranscription: true } : {}),
+      ...(capabilities.includes('transcript') ? { transcriptionAvailable: true } : {}),
+    };
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
 // ── CLI Entry Point ───────────────────────────────────────────────────────────
 
 if (import.meta.main) {
   const args = process.argv.slice(2);
 
   if (args.length === 0 || args.includes('--help')) {
-    console.log(`Usage: bun run bin/ingest.ts <url> [--mode translate-cn|summarize|raw|transcribe] [--vault-dir DIR]
+    console.log(`Usage: bun run bin/ingest.ts <url> [--mode translate-cn|summarize|raw|transcribe|handout] [--vault-dir DIR] [--topic SLUG] [--processed-markdown FILE] [--write]
+       bun run bin/ingest.ts --bundle <directory> [--mode translate-cn|summarize|raw|transcribe|handout] [--vault-dir DIR] [--topic SLUG] [--processed-markdown FILE] [--write]
        bun run bin/ingest.ts --download-images --vault-dir DIR --target-dir DIR --urls url1,url2,...
 
 Options:
   --mode       Processing mode: translate-cn (default for English), summarize (default for Chinese),
-               raw, or transcribe (Bilibili only — run whisper when CC subtitles are absent)
+               raw, transcribe, or handout (default for video/course)
+  --bundle     Load a validated Source Bundle v1 directory instead of a URL
   --vault-dir  Vault directory (default: current directory)
+  --topic      Optional ASCII kebab topic path under the configured raw layer
+  --processed-markdown
+               Agent-edited Markdown inside <vault>/.me/tmp/ (requires --write)
+  --write      Atomically finalize the note and assets; otherwise emit JSON preview only
   --help       Show this help
 
 Download mode:
@@ -834,8 +1208,8 @@ Download mode:
   --target-dir       Target directory for images
   --urls             Comma-separated list of image URLs
 
-Output: JSON with { title, slug, language, mode, frontmatter, content, images, autoLinks,
-        relatedNotes, needsTranscription?, transcriptionAvailable? }
+Output: JSON preview with legacy fields plus { sourceKind, adapterId, capabilities, warnings,
+        handoutKind?, writeResult? }
 `);
     process.exit(0);
   }
@@ -861,69 +1235,9 @@ Output: JSON with { title, slug, language, mode, frontmatter, content, images, a
     process.exit(0);
   }
 
-  // Standard pipeline mode
-  const url = args[0];
-  const modeIdx = args.indexOf('--mode');
-  const vaultDirIdx = args.indexOf('--vault-dir');
-
-  const vaultDir = vaultDirIdx !== -1 ? args[vaultDirIdx + 1] : process.cwd();
-  const explicitMode = modeIdx !== -1 ? args[modeIdx + 1] : null;
-
   try {
-    // Step 1: Extract content. For Bilibili URLs, plumb --mode transcribe through
-    // to the source adapter; HTML path ignores opts.
-    const extractOpts: { mode?: 'metadata' | 'transcribe' } | undefined =
-      isBilibiliUrl(url)
-        ? { mode: explicitMode === 'transcribe' ? 'transcribe' : 'metadata' }
-        : undefined;
-    const extracted = extractContent(url, extractOpts);
-
-    // Step 2: Detect language and mode
-    const language = detectLanguage(extracted.content);
-    // 'transcribe' is a Bilibili adapter mode, not a content-transformation mode.
-    // Fall back to language-based default for the IngestPipelineResult.mode field.
-    const contentMode = explicitMode && explicitMode !== 'transcribe'
-      ? explicitMode
-      : (language === 'en' ? 'translate-cn' : 'summarize');
-
-    // Step 3: Derive slug
-    const slug = deriveSlug(extracted.title);
-
-    // Step 4: Generate frontmatter
-    const today = new Date().toISOString().split('T')[0];
-    const frontmatter = generateFrontmatter(extracted.title, today, [], url);
-
-    // Step 5: Build vault index
-    const vaultIndex = buildVaultIndex(vaultDir);
-
-    // Step 6: Auto-link
-    const fullContent = frontmatter + '\n\n' + extracted.content;
-    const autoLinkResult = autoLink(fullContent, vaultIndex);
-
-    // Step 7: Score related notes
-    const relatedNotes = scoreRelatedNotes([], extracted.title, vaultIndex, vaultDir);
-
-    const result: IngestPipelineResult = {
-      title: extracted.title,
-      slug,
-      language,
-      mode: contentMode,
-      frontmatter,
-      content: autoLinkResult.linkedBody,
-      images: extracted.images,
-      autoLinks: autoLinkResult.links,
-      relatedNotes: relatedNotes.slice(0, 5),
-    };
-
-    // Attach Bilibili-only optional fields (non-Bilibili → keys omitted from JSON).
-    if (extracted.needsTranscription !== undefined) {
-      result.needsTranscription = extracted.needsTranscription;
-    }
-    if (extracted.transcriptionAvailable !== undefined) {
-      result.transcriptionAvailable = extracted.transcriptionAvailable;
-    }
-
-    console.log(JSON.stringify(result, null, 2));
+    const options = parseIngestCliOptions(args);
+    console.log(JSON.stringify(await runRichIngest(options), null, 2));
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(JSON.stringify({ error: message }));

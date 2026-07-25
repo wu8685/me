@@ -243,7 +243,9 @@ function outputPathFromPrint(stdout: string, directory: string): string {
 function persistMedia(source: string, context: ExtractContext): string {
   const extension = path.extname(source);
   if (!/^\.[a-z0-9]{1,10}$/i.test(extension)) throw new Error('yt-dlp produced media without a safe extension');
-  const directory = path.join(context.vaultDir, '.me', 'ingest-media');
+  const directory = context.tempDir
+    ? path.join(context.tempDir, 'x-media')
+    : path.join(context.vaultDir, '.me', 'ingest-media');
   fs.mkdirSync(directory, { recursive: true });
   const filename = `x-media-${randomUUID()}${extension.toLowerCase()}`;
   const destination = path.join(directory, filename);

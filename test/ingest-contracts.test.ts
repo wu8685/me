@@ -1,6 +1,16 @@
 import { describe, expect, test } from 'bun:test';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { createAdapterRegistry, AdapterExtractionError } from '../bin/ingest/registry.ts';
 import type { SourceAdapter } from '../bin/ingest/contracts.ts';
+import {
+  createRichIngestRegistry,
+  parseIngestCliOptions,
+  resolveIngestMode,
+  runRichIngest,
+} from '../bin/ingest.ts';
+import type { CommandRunner } from '../bin/ingest/command.ts';
 
 const html: SourceAdapter = {
   id: 'html',
@@ -87,5 +97,159 @@ describe('createAdapterRegistry', () => {
     });
 
     await expect(registry.resolve(new URL('https://example.com/download?id=42'))).resolves.toMatchObject({ id: 'html' });
+  });
+});
+
+describe('rich ingest CLI orchestration', () => {
+  test('parses URL and Bundle entries explicitly', () => {
+    expect(parseIngestCliOptions(['https://example.com', '--vault-dir', '/tmp/vault'])).toMatchObject({
+      url: new URL('https://example.com'),
+      vaultDir: '/tmp/vault',
+      write: false,
+    });
+    expect(parseIngestCliOptions(['--bundle', '/tmp/bundle', '--write'])).toMatchObject({
+      bundleDir: '/tmp/bundle',
+      write: true,
+    });
+  });
+
+  test('rejects ambiguous, incomplete, and unsafe options', () => {
+    expect(() => parseIngestCliOptions(['https://example.com', '--bundle', '/tmp/bundle'])).toThrow(/exactly one/i);
+    expect(() => parseIngestCliOptions(['--bundle'])).toThrow(/value/i);
+    expect(() => parseIngestCliOptions(['https://example.com', '--mode', 'metadata'])).toThrow(/mode/i);
+    expect(() => parseIngestCliOptions(['https://example.com', '--topic', '../escape'])).toThrow(/topic/i);
+    expect(() => parseIngestCliOptions(['https://example.com', '--processed-markdown', '/tmp/note.md'])).toThrow(/--write/i);
+    expect(() => parseIngestCliOptions(['https://example.com', '--unknown'])).toThrow(/unknown/i);
+  });
+
+  test('defaults video and course sources to handout while preserving article language defaults', () => {
+    expect(resolveIngestMode(undefined, 'video', 'zh', 'handout')).toBe('handout');
+    expect(resolveIngestMode(undefined, 'course', 'en', 'raw')).toBe('raw');
+    expect(resolveIngestMode(undefined, 'article', 'en', 'handout')).toBe('translate-cn');
+    expect(resolveIngestMode(undefined, 'paper', 'zh', 'handout')).toBe('summarize');
+    expect(resolveIngestMode('raw', 'video', 'zh', 'handout')).toBe('raw');
+  });
+
+  test('registers adapters in fixed order and probes suffixless Content-Type through argv curl', async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: CommandRunner = {
+      run(command, args) {
+        calls.push({ command, args });
+        if (command === 'curl') return { stdout: 'application/pdf', stderr: '', status: 0 };
+        return { stdout: '', stderr: '', status: 0 };
+      },
+    };
+    const registry = createRichIngestRegistry(runner);
+
+    expect(registry.adapters.map(adapter => adapter.id)).toEqual(['bilibili', 'x', 'pdf', 'html']);
+    await expect(registry.registry.resolve(new URL('https://example.com/download?id=42')))
+      .resolves.toMatchObject({ id: 'pdf' });
+    expect(calls[0]).toEqual({
+      command: 'curl',
+      args: ['-sS', '-L', '--fail', '--max-time', '15', '-I', '-o', '/dev/null', '-w', '%{content_type}', 'https://example.com/download?id=42'],
+    });
+  });
+
+  test('previews a video Bundle as a topic handout by default', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-cli-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    fs.mkdirSync(vault);
+    fs.mkdirSync(bundle);
+    fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+      version: 1,
+      source: {
+        url: 'https://example.com/course',
+        kind: 'course',
+        title: 'Course preview',
+        durationSec: 60,
+      },
+      blocks: [{ id: 'b1', kind: 'heading', markdown: '# Course preview' }],
+      transcript: [{ start: 0, end: 60, text: 'Complete transcript.' }],
+      media: [],
+      provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: ['fixture'] },
+      warnings: [],
+    }));
+    try {
+      const result = await runRichIngest(parseIngestCliOptions([
+        '--bundle', bundle, '--vault-dir', vault,
+      ]));
+      expect(result).toMatchObject({
+        mode: 'handout',
+        sourceKind: 'course',
+        adapterId: 'source-bundle-v1',
+        handoutKind: 'topic',
+      });
+      expect(result.capabilities).toContain('transcript');
+      expect(result.writeResult).toBeUndefined();
+      expect(fs.readdirSync(vault)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('writes a Bundle through the finalizer and consumes processed Markdown', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-cli-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    const edit = path.join(vault, '.me', 'tmp', 'edited.md');
+    fs.mkdirSync(path.dirname(edit), { recursive: true });
+    fs.mkdirSync(bundle);
+    fs.writeFileSync(edit, '# Edited article\n\nReviewed body.\n');
+    fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+      version: 1,
+      source: { url: 'https://example.com/article', kind: 'article', title: 'Bundle article' },
+      blocks: [{ id: 'b1', kind: 'paragraph', markdown: 'Original body.' }],
+      media: [],
+      provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: ['fixture'] },
+      warnings: [],
+    }));
+    try {
+      const result = await runRichIngest(parseIngestCliOptions([
+        '--bundle', bundle,
+        '--vault-dir', vault,
+        '--mode', 'raw',
+        '--processed-markdown', edit,
+        '--write',
+      ]));
+      const today = new Date().toISOString().slice(0, 10);
+      expect(result.writeResult?.notePath).toBe(
+        path.join(vault, 'raw', `${today}-bundle-article`, `${today}-bundle-article.md`),
+      );
+      expect(fs.readFileSync(result.writeResult!.notePath, 'utf8')).toContain('Reviewed body.');
+      expect(fs.existsSync(edit)).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects processed Markdown outside the vault temporary directory', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-cli-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    const edit = path.join(root, 'outside.md');
+    fs.mkdirSync(vault);
+    fs.mkdirSync(bundle);
+    fs.writeFileSync(edit, 'outside');
+    fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+      version: 1,
+      source: { url: 'https://example.com/article', kind: 'article', title: 'Bundle article' },
+      blocks: [{ id: 'b1', kind: 'paragraph', markdown: 'Original body.' }],
+      media: [],
+      provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: ['fixture'] },
+      warnings: [],
+    }));
+    try {
+      await expect(runRichIngest(parseIngestCliOptions([
+        '--bundle', bundle,
+        '--vault-dir', vault,
+        '--mode', 'raw',
+        '--processed-markdown', edit,
+        '--write',
+      ]))).rejects.toThrow(/\.me\/tmp/);
+      expect(fs.existsSync(edit)).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

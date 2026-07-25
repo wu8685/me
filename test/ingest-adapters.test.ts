@@ -235,6 +235,23 @@ test('classifies public X media as video and persists its media path', async () 
   }
 });
 
+test('persists X media inside the caller-provided per-run workspace', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-workspace-vault-'));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-workspace-run-'));
+  try {
+    const source = await createXAdapter(xVideoRunner()).extract({
+      url: new URL(X_VIDEO_URL), vaultDir, tempDir, mode: 'handout',
+    });
+
+    expect(source.media[0].path?.startsWith(tempDir + path.sep)).toBe(true);
+    expect(fs.existsSync(source.media[0].path!)).toBe(true);
+    expect(fs.existsSync(path.join(vaultDir, '.me', 'ingest-media'))).toBe(false);
+  } finally {
+    fs.rmSync(vaultDir, { recursive: true, force: true });
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('extracts every public X playlist entry in source order using final media extensions', async () => {
   const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-playlist-vault-'));
   try {
