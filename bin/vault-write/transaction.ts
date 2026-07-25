@@ -80,6 +80,8 @@ export interface VaultWriterOptions {
     mkdirSync: typeof fs.mkdirSync;
     rmdirSync: typeof fs.rmdirSync;
   }>;
+  /** Test-only injection. Production callers omit this. */
+  directoryFsync?(directory: string): void;
 }
 
 type MutationKind = 'link' | 'rename' | 'unlink' | 'mkdir' | 'rmdir';
@@ -108,6 +110,16 @@ interface OwnedFile {
   path: string;
   identity: string;
   sha256: string;
+}
+
+interface OwnedDirectory {
+  path: string;
+  identity: string;
+}
+
+interface OwnedLock {
+  file: OwnedFile;
+  descriptor: number;
 }
 
 interface FileOperations {
@@ -157,6 +169,15 @@ function requestDigest(request: VaultWriteRequestV1): string {
   return sha256(Buffer.from(JSON.stringify(request), 'utf8'));
 }
 
+function lexicalVaultRelative(layout: ResolvedVaultLayout, absolute: string): string {
+  const candidate = path.resolve(absolute);
+  if (
+    candidate !== layout.lexicalVault
+    && !candidate.startsWith(`${layout.lexicalVault}${path.sep}`)
+  ) throw new VaultWriterError('UNSAFE_PATH');
+  return path.relative(layout.lexicalVault, candidate).split(path.sep).join('/') || '.';
+}
+
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
 }
@@ -198,6 +219,27 @@ function ownedFile(file: string): OwnedFile {
   };
 }
 
+function ownedDirectory(directory: string): OwnedDirectory {
+  const stat = fs.lstatSync(directory, { bigint: true });
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new VaultWriterError('UNSAFE_PATH');
+  return {
+    path: directory,
+    identity: JSON.stringify({ type: 'directory', dev: stat.dev.toString(), ino: stat.ino.toString() }),
+  };
+}
+
+function sameOwnedDirectory(expected: OwnedDirectory): boolean {
+  try {
+    const stat = fs.lstatSync(expected.path, { bigint: true });
+    return stat.isDirectory()
+      && !stat.isSymbolicLink()
+      && JSON.stringify({ type: 'directory', dev: stat.dev.toString(), ino: stat.ino.toString() })
+        === expected.identity;
+  } catch {
+    return false;
+  }
+}
+
 function sameOwnedFile(expected: OwnedFile): boolean {
   try {
     return fileIdentity(expected.path) === expected.identity
@@ -220,6 +262,32 @@ function sameOwnedLineage(expected: OwnedFile): boolean {
       && current.isFile()
       && recorded.target.type === 'file'
       && sha256(fs.readFileSync(expected.path)) === expected.sha256;
+  } catch {
+    return false;
+  }
+}
+
+function sameMovedFile(expected: OwnedFile, destination: string): boolean {
+  try {
+    const recorded = JSON.parse(expected.identity) as {
+      target: {
+        dev: string;
+        ino: string;
+        mode: string;
+        size: string;
+        mtimeNs: string;
+        type: string;
+      };
+    };
+    const current = fs.statSync(destination, { bigint: true });
+    return current.isFile()
+      && recorded.target.type === 'file'
+      && current.dev.toString() === recorded.target.dev
+      && current.ino.toString() === recorded.target.ino
+      && current.mode.toString() === recorded.target.mode
+      && current.size.toString() === recorded.target.size
+      && current.mtimeNs.toString() === recorded.target.mtimeNs
+      && sha256(fs.readFileSync(destination)) === expected.sha256;
   } catch {
     return false;
   }
@@ -292,13 +360,27 @@ function makeFingerprint(
   const template = path.join(pluginRoot, `templates/${request.layer}-template.md`);
   const config = path.join(layout.meDir, 'config.yaml');
   const readme = snapshotOptionalFile(target.indexPath);
-  const identities = [
+  const directPaths = [
     ...Object.values(layout.layers),
     layout.meDir,
+    layout.tmpDir,
+    layout.lockDir,
+    path.join(layout.lockDir, 'vault-write.lock'),
     path.dirname(target.notePath),
     target.notePath,
     target.indexPath,
-  ].map(item => pathState(layout, item))
+  ];
+  const allPaths = new Set<string>(directPaths);
+  for (const candidate of directPaths) {
+    let current = path.resolve(candidate);
+    while (current !== layout.lexicalVault) {
+      allPaths.add(current);
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  const identities = [...allPaths].map(item => pathState(layout, item))
     .sort((first, second) => first.path < second.path ? -1 : first.path > second.path ? 1 : 0);
   return {
     requestDigest: requestDigest(request),
@@ -468,6 +550,62 @@ function journalHasContradictoryPaths(value: Record<string, unknown>): boolean {
   return false;
 }
 
+function validCommittedOperation(
+  directory: string,
+  value: Record<string, unknown>,
+  operations: FileOperations,
+): boolean {
+  const allowed = new Set([
+    'version',
+    'operationId',
+    'state',
+    'notePath',
+    'indexPath',
+    'requestDigest',
+    'plannedNoteSha256',
+    'plannedIndexSha256',
+    'metadataPolicy',
+  ]);
+  if (
+    value.state !== 'committed'
+    || Object.keys(value).some(key => !allowed.has(key))
+    || typeof value.notePath !== 'string'
+    || typeof value.requestDigest !== 'string'
+    || typeof value.plannedNoteSha256 !== 'string'
+    || value.metadataPolicy !== METADATA_POLICY
+    || !/^[a-f0-9]{64}$/.test(value.requestDigest)
+    || !/^[a-f0-9]{64}$/.test(value.plannedNoteSha256)
+    || (value.indexPath === undefined) !== (value.plannedIndexSha256 === undefined)
+    || (value.plannedIndexSha256 !== undefined
+      && (typeof value.plannedIndexSha256 !== 'string'
+        || !/^[a-f0-9]{64}$/.test(value.plannedIndexSha256)))
+  ) return false;
+  let entries: string[];
+  try {
+    entries = (operations.readdirSync(directory) as string[]).sort();
+  } catch {
+    return false;
+  }
+  if (
+    entries.some(entry => entry !== 'journal.json' && entry !== 'originals')
+    || !entries.includes('journal.json')
+  ) return false;
+  if (entries.includes('originals')) {
+    const originals = path.join(directory, 'originals');
+    try {
+      const stat = operations.lstatSync(originals) as fs.Stats;
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
+      const children = operations.readdirSync(originals) as string[];
+      if (children.length !== 1 || children[0] !== 'README.md') return false;
+      const original = operations.lstatSync(path.join(originals, 'README.md')) as fs.Stats;
+      if (!original.isFile() || original.isSymbolicLink()) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 function scanRecoveries(
   layout: ResolvedVaultLayout,
   operations: FileOperations,
@@ -583,6 +721,24 @@ function scanRecoveries(
     }
     const operationId = (value as { operationId: string }).operationId;
     const state = (value as { state: JournalState }).state;
+    if (
+      state === 'committed'
+      && !validCommittedOperation(directory, value as Record<string, unknown>, operations)
+    ) {
+      candidates.push({
+        name,
+        operationId,
+        recovery: recoveryAction(
+          operationId,
+          relativeDirectory,
+          'unrecognized-operation',
+          [relativeDirectory],
+          ['Inspect the contradictory committed operation.'],
+          relativeJournal,
+        ),
+      });
+      continue;
+    }
     candidates.push({
       name,
       operationId,
@@ -625,9 +781,13 @@ class Transaction {
   readonly operations: FileOperations;
   readonly hooks: VaultWriteHooks;
   readonly warnings: string[] = [];
-  readonly createdDirectories: string[] = [];
+  readonly createdDirectories: OwnedDirectory[] = [];
   journal?: Journal;
   journalPath?: string;
+  journalDescriptor?: number;
+  journalOwned?: OwnedFile;
+  journalConflict = false;
+  readonly directoryFsync?: (directory: string) => void;
 
   constructor(
     public plan: PlannedWrite,
@@ -635,17 +795,8 @@ class Transaction {
     options: VaultWriterOptions,
   ) {
     this.hooks = options.hooks ?? {};
-    this.operations = {
-      readdirSync: options.fileOps?.readdirSync ?? fs.readdirSync,
-      lstatSync: options.fileOps?.lstatSync ?? fs.lstatSync,
-      realpathSync: options.fileOps?.realpathSync ?? fs.realpathSync,
-      readFileSync: options.fileOps?.readFileSync ?? fs.readFileSync,
-      linkSync: options.fileOps?.linkSync ?? fs.linkSync,
-      renameSync: options.fileOps?.renameSync ?? fs.renameSync,
-      unlinkSync: options.fileOps?.unlinkSync ?? fs.unlinkSync,
-      mkdirSync: options.fileOps?.mkdirSync ?? fs.mkdirSync,
-      rmdirSync: options.fileOps?.rmdirSync ?? fs.rmdirSync,
-    };
+    this.directoryFsync = options.directoryFsync;
+    this.operations = makeFileOperations(options);
   }
 
   private relative(file: string): string {
@@ -662,9 +813,14 @@ class Transaction {
   private syncDirectory(directory: string): void {
     let descriptor: number | undefined;
     try {
+      if (this.directoryFsync) {
+        this.directoryFsync(directory);
+        return;
+      }
       descriptor = fs.openSync(directory, 'r');
       fs.fsyncSync(descriptor);
-    } catch {
+    } catch (error) {
+      if (!['ENOTSUP', 'EOPNOTSUPP', 'EINVAL'].includes(errno(error) ?? '')) throw error;
       if (!this.warnings.includes('Directory fsync is not supported on this filesystem.')) {
         this.warnings.push('Directory fsync is not supported on this filesystem.');
       }
@@ -698,7 +854,7 @@ class Transaction {
       if (errno(error) !== 'ENOENT') throw error;
     }
     this.operations.mkdirSync(directory, { mode: 0o700 });
-    this.createdDirectories.push(directory);
+    this.createdDirectories.push(ownedDirectory(directory));
     this.afterMutation([directory]);
   }
 
@@ -722,10 +878,34 @@ class Transaction {
     for (const candidate of missing.reverse()) this.mkdir(candidate);
   }
 
-  link(source: string, destination: string): void {
+  ownedDirectoryFor(directory: string): OwnedDirectory {
+    const found = this.createdDirectories.find(item => item.path === directory);
+    if (!found) throw new VaultWriterError('RECOVERY_REQUIRED');
+    return found;
+  }
+
+  link(
+    source: string,
+    destination: string,
+    expectedSource: OwnedFile,
+    expectedLinkCount: bigint,
+  ): void {
     this.beforeMutation('link', [source, destination]);
     this.validateMutation('link', [source, destination]);
-    if (!fs.lstatSync(source).isFile()) throw new VaultWriterError('UNSAFE_PATH');
+    let sourceStat: fs.BigIntStats;
+    try {
+      sourceStat = fs.lstatSync(source, { bigint: true });
+    } catch {
+      throw new VaultWriterError('RECOVERY_REQUIRED');
+    }
+    if (
+      !sourceStat.isFile()
+      || sourceStat.isSymbolicLink()
+      || !sameOwnedLineage(expectedSource)
+      || sourceStat.nlink !== expectedLinkCount
+    ) {
+      throw new VaultWriterError('RECOVERY_REQUIRED');
+    }
     try {
       fs.lstatSync(destination);
       throw new VaultWriterError('TARGET_EXISTS');
@@ -771,32 +951,71 @@ class Transaction {
     this.afterMutation([expected.path]);
   }
 
-  rmdir(directory: string): void {
-    this.beforeMutation('rmdir', [directory]);
-    this.validateMutation('rmdir', [directory]);
-    if ((fs.readdirSync(directory) as string[]).length !== 0) {
+  rmdir(expected: OwnedDirectory): void {
+    this.beforeMutation('rmdir', [expected.path]);
+    this.validateMutation('rmdir', [expected.path]);
+    if (
+      !sameOwnedDirectory(expected)
+      || (fs.readdirSync(expected.path) as string[]).length !== 0
+    ) {
       throw new VaultWriterError('RECOVERY_REQUIRED');
     }
-    this.operations.rmdirSync(directory);
-    this.afterMutation([directory]);
+    this.operations.rmdirSync(expected.path);
+    this.afterMutation([expected.path]);
   }
 
   startJournal(journalPath: string, journal: Journal): void {
     this.journalPath = journalPath;
     this.journal = journal;
+    try {
+      this.journalDescriptor = fs.openSync(journalPath, 'wx', 0o600);
+    } catch {
+      throw new VaultWriterError('RECOVERY_REQUIRED');
+    }
     this.writeJournal();
   }
 
-  writeJournal(): void {
-    if (!this.journalPath || !this.journal) return;
-    const descriptor = fs.openSync(this.journalPath, 'w', 0o600);
+  verifyJournalOwnership(): boolean {
+    if (!this.journalPath || this.journalDescriptor === undefined || !this.journalOwned) return false;
     try {
-      fs.writeFileSync(descriptor, `${JSON.stringify(this.journal, null, 2)}\n`);
-      fs.fsyncSync(descriptor);
-      fs.fchmodSync(descriptor, 0o600);
-    } finally {
-      fs.closeSync(descriptor);
+      assertSafeWriterPath(this.plan.layout, this.journalPath, 'journal ownership');
+      const entry = fs.lstatSync(this.journalPath, { bigint: true });
+      const opened = fs.fstatSync(this.journalDescriptor, { bigint: true });
+      return entry.isFile()
+        && !entry.isSymbolicLink()
+        && entry.dev === opened.dev
+        && entry.ino === opened.ino
+        && sameOwnedFile(this.journalOwned)
+        && JSON.parse(fs.readFileSync(this.journalPath, 'utf8')).operationId === this.operationId;
+    } catch {
+      return false;
     }
+  }
+
+  writeJournal(): void {
+    if (!this.journalPath || !this.journal || this.journalDescriptor === undefined) return;
+    if (this.journalOwned && !this.verifyJournalOwnership()) {
+      this.journalConflict = true;
+      throw new VaultWriterError('RECOVERY_REQUIRED');
+    }
+    const bytes = Buffer.from(`${JSON.stringify(this.journal, null, 2)}\n`);
+    fs.ftruncateSync(this.journalDescriptor, 0);
+    fs.writeSync(this.journalDescriptor, bytes, 0, bytes.length, 0);
+    fs.fsyncSync(this.journalDescriptor);
+    fs.fchmodSync(this.journalDescriptor, 0o600);
+    this.journalOwned = ownedFile(this.journalPath);
+  }
+
+  closeJournal(): OwnedFile | undefined {
+    const owned = this.journalOwned;
+    if (this.journalDescriptor !== undefined) {
+      fs.closeSync(this.journalDescriptor);
+      this.journalDescriptor = undefined;
+    }
+    this.journalPath = undefined;
+    this.journal = undefined;
+    this.journalOwned = undefined;
+    return owned;
   }
 
   state(state: JournalState): void {
@@ -884,7 +1103,7 @@ function lockExists(
   }
 }
 
-function acquireLock(lockPath: string, operationId: string): OwnedFile {
+function acquireLock(lockPath: string, operationId: string): OwnedLock {
   const bytes = Buffer.from(`${JSON.stringify({
     version: 1,
     operationId,
@@ -897,14 +1116,80 @@ function acquireLock(lockPath: string, operationId: string): OwnedFile {
     if (errno(error) === 'EEXIST') throw new VaultWriterError('LOCK_HELD');
     throw error;
   }
-  try {
-    fs.writeFileSync(descriptor, bytes);
-    fs.fsyncSync(descriptor);
-    fs.fchmodSync(descriptor, 0o600);
-  } finally {
+  fs.writeFileSync(descriptor, bytes);
+  fs.fsyncSync(descriptor);
+  fs.fchmodSync(descriptor, 0o600);
+  const opened = fs.fstatSync(descriptor, { bigint: true });
+  const entry = fs.lstatSync(lockPath, { bigint: true });
+  if (opened.dev !== entry.dev || opened.ino !== entry.ino || !entry.isFile()) {
     fs.closeSync(descriptor);
+    throw new VaultWriterError('RECOVERY_REQUIRED');
   }
-  return ownedFile(lockPath);
+  return { file: ownedFile(lockPath), descriptor };
+}
+
+function makeFileOperations(options: VaultWriterOptions): FileOperations {
+  return {
+    readdirSync: options.fileOps?.readdirSync ?? fs.readdirSync,
+    lstatSync: options.fileOps?.lstatSync ?? fs.lstatSync,
+    realpathSync: options.fileOps?.realpathSync ?? fs.realpathSync,
+    readFileSync: options.fileOps?.readFileSync ?? fs.readFileSync,
+    linkSync: options.fileOps?.linkSync ?? fs.linkSync,
+    renameSync: options.fileOps?.renameSync ?? fs.renameSync,
+    unlinkSync: options.fileOps?.unlinkSync ?? fs.unlinkSync,
+    mkdirSync: options.fileOps?.mkdirSync ?? fs.mkdirSync,
+    rmdirSync: options.fileOps?.rmdirSync ?? fs.rmdirSync,
+  };
+}
+
+function bootstrapDirectory(
+  layout: ResolvedVaultLayout,
+  directory: string,
+  options: VaultWriterOptions,
+  operations: FileOperations,
+): void {
+  try {
+    const stat = operations.lstatSync(directory) as fs.Stats;
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new VaultWriterError('UNSAFE_PATH');
+    return;
+  } catch (error) {
+    if (error instanceof VaultWriterError) throw error;
+    if (errno(error) !== 'ENOENT') throw error;
+  }
+  options.hooks?.beforeFsMutation?.('mkdir', [directory]);
+  assertSafeWriterPath(layout, directory, 'bootstrap directory');
+  try {
+    operations.lstatSync(directory);
+    throw new VaultWriterError('INPUT_CHANGED');
+  } catch (error) {
+    if (error instanceof VaultWriterError) throw error;
+    if (errno(error) !== 'ENOENT') throw error;
+  }
+  operations.mkdirSync(directory, { mode: 0o700 });
+}
+
+function releaseOwnedLockEarly(
+  layout: ResolvedVaultLayout,
+  lock: OwnedLock,
+  options: VaultWriterOptions,
+  operations: FileOperations,
+): boolean {
+  options.hooks?.beforeLockRelease?.(lock.file.path);
+  try { fs.closeSync(lock.descriptor); } catch { return false; }
+  if (!sameOwnedFile(lock.file)) return false;
+  options.hooks?.beforeFsMutation?.('unlink', [lock.file.path]);
+  try {
+    assertSafeWriterPath(layout, lock.file.path, 'lock release');
+  } catch {
+    return false;
+  }
+  if (!sameOwnedFile(lock.file)) return false;
+  try {
+    operations.unlinkSync(lock.file.path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function writeTransient(file: string, bytes: Buffer | string): OwnedFile {
@@ -926,7 +1211,7 @@ function recoveryForOwnership(
   preserved: string[],
   remaining: string[],
 ): VaultWriteRecovery {
-  return recoveryAction(
+  const recovery = recoveryAction(
     operationId,
     vaultRelative(plan.layout, operationDir),
     'ownership-conflict',
@@ -934,6 +1219,28 @@ function recoveryForOwnership(
     [...new Set(remaining)],
     `${vaultRelative(plan.layout, operationDir)}/journal.json`,
   );
+  const original = recovery.preservedPaths.find(item => item.endsWith('/originals/README.md'));
+  if (original) {
+    recovery.actions = [
+      {
+        kind: 'inspect',
+        path: original,
+        condition: 'Inspect the retained original README for edits that may still need merging.',
+      },
+      {
+        kind: 'compare',
+        path: plan.index.path,
+        from: original,
+        condition: 'Compare the current README with the retained original.',
+      },
+      {
+        kind: 'remove-owned',
+        path: original,
+        condition: 'Only after confirming the current README contains all required content.',
+      },
+    ];
+  }
+  return recovery;
 }
 
 export function executeVaultWrite(
@@ -943,25 +1250,84 @@ export function executeVaultWrite(
 ): VaultWriteResultV1 {
   const operationId = crypto.randomUUID();
   let digest = '';
-  let initialPlan: PlannedWrite;
+  let parsed: VaultWriteRequestV1;
+  let minimalLayout: ResolvedVaultLayout;
   try {
-    const parsed = parseVaultWriteRequest(requestValue);
+    parsed = parseVaultWriteRequest(requestValue);
     digest = requestDigest(parsed);
-    initialPlan = planWrite(vaultDir, parsed, options.pluginRoot);
+    minimalLayout = resolveVaultLayout(vaultDir);
   } catch (error) {
     const code = errorCode(error, false);
     return codeResult(operationId, digest, code);
   }
-  if (options.mode === 'preview') return previewResult(operationId, initialPlan);
+  if (options.mode === 'preview') {
+    try {
+      return previewResult(operationId, planWrite(vaultDir, parsed, options.pluginRoot));
+    } catch (error) {
+      return codeResult(operationId, digest, errorCode(error, false));
+    }
+  }
 
-  const plannedPaths = [
+  const operations = makeFileOperations(options);
+  const layout = minimalLayout;
+  const lockPath = path.join(layout.lockDir, 'vault-write.lock');
+  let lockOwned: OwnedLock | undefined;
+  try {
+    bootstrapDirectory(layout, layout.lockDir, options, operations);
+    assertSafeWriterPath(layout, lockPath, 'lock');
+    if (lockExists(lockPath, operations)) {
+      return codeResult(operationId, digest, 'LOCK_HELD');
+    }
+    lockOwned = acquireLock(lockPath, operationId);
+    bootstrapDirectory(layout, layout.tmpDir, options, operations);
+    const startupRecoveries = scanRecoveries(layout, operations);
+    if (startupRecoveries.length > 0) {
+      if (!releaseOwnedLockEarly(layout, lockOwned, options, operations)) {
+        const lockRecovery = recoveryAction(
+          operationId,
+          '.me/tmp',
+          'ownership-conflict',
+          ['.me/locks/vault-write.lock'],
+          ['Inspect the changed cooperative lock.'],
+        );
+        return codeResult(operationId, digest, 'RECOVERY_REQUIRED', 'none', [lockRecovery]);
+      }
+      return codeResult(
+        operationId,
+        digest,
+        'INCOMPLETE_OPERATION',
+        'none',
+        startupRecoveries,
+      );
+    }
+  } catch (error) {
+    if (lockOwned) releaseOwnedLockEarly(layout, lockOwned, options, operations);
+    return codeResult(operationId, digest, errorCode(error, false));
+  }
+
+  let initialPlan: PlannedWrite;
+  try {
+    initialPlan = planWrite(vaultDir, parsed, options.pluginRoot);
+  } catch (error) {
+    const released = releaseOwnedLockEarly(layout, lockOwned, options, operations);
+    if (!released) {
+      const recovery = recoveryAction(
+        operationId,
+        '.me/tmp',
+        'ownership-conflict',
+        ['.me/locks/vault-write.lock'],
+        ['Inspect the changed cooperative lock.'],
+      );
+      return codeResult(operationId, digest, 'RECOVERY_REQUIRED', 'none', [recovery]);
+    }
+    return codeResult(operationId, digest, errorCode(error, false));
+  }
+
+  let plannedPaths = [
     initialPlan.target.vaultRelativePath,
     ...(initialPlan.index.action === 'none' ? [] : [initialPlan.index.path]),
   ];
   const tx = new Transaction(initialPlan, operationId, options);
-  const layout = initialPlan.layout;
-  const lockPath = path.join(layout.lockDir, 'vault-write.lock');
-  let lockOwned: OwnedFile | undefined;
   let operationDir = path.join(layout.tmpDir, `vault-write-${operationId}`);
   let stagingDir = path.join(operationDir, 'staging');
   let originalsDir = path.join(operationDir, 'originals');
@@ -983,7 +1349,7 @@ export function executeVaultWrite(
   const recoveries: VaultWriteRecovery[] = [];
 
   const markPreserved = (absolute: string, mutation: string): void => {
-    preserved.push(vaultRelative(layout, absolute));
+    preserved.push(lexicalVaultRelative(layout, absolute));
     remaining.push(mutation);
   };
 
@@ -1019,7 +1385,12 @@ export function executeVaultWrite(
         markPreserved(originalReadme.path, 'Compare retained original README.');
       } else {
         try {
-          tx.link(originalReadme.path, initialPlan.target.indexPath);
+          tx.link(
+            originalReadme.path,
+            initialPlan.target.indexPath,
+            originalReadme,
+            fs.statSync(originalReadme.path, { bigint: true }).nlink,
+          );
         } catch {
           markPreserved(originalReadme.path, 'Restore retained original README with no-clobber create.');
         }
@@ -1037,27 +1408,6 @@ export function executeVaultWrite(
   };
 
   try {
-    /* Fixed startup precedence: validated layout -> lock inspection -> scan -> acquire. */
-    assertSafeWriterPath(layout, lockPath, 'lock');
-    if (lockExists(lockPath, tx.operations)) {
-      return codeResult(operationId, digest, 'LOCK_HELD', initialPlan.index.action, [], plannedPaths);
-    }
-    const startupRecoveries = scanRecoveries(layout, tx.operations);
-    if (startupRecoveries.length > 0) {
-      return codeResult(
-        operationId,
-        digest,
-        'INCOMPLETE_OPERATION',
-        initialPlan.index.action,
-        startupRecoveries,
-        plannedPaths,
-      );
-    }
-
-    if (!fs.existsSync(layout.tmpDir)) tx.mkdirParents(layout.tmpDir);
-    if (!fs.existsSync(layout.lockDir)) tx.mkdirParents(layout.lockDir);
-    lockOwned = acquireLock(lockPath, operationId);
-
     tx.mkdir(operationDir);
     const journalPath = path.join(operationDir, 'journal.json');
     tx.startJournal(journalPath, {
@@ -1080,6 +1430,10 @@ export function executeVaultWrite(
      */
     initialPlan = planWrite(vaultDir, requestValue, options.pluginRoot);
     tx.plan = initialPlan;
+    plannedPaths = [
+      initialPlan.target.vaultRelativePath,
+      ...(initialPlan.index.action === 'none' ? [] : [initialPlan.index.path]),
+    ];
     tx.hooks.afterLock?.();
     const afterLockPlan = replanAfterLock(vaultDir, requestValue, options.pluginRoot);
     if (!compareFingerprints(initialPlan.fingerprint, afterLockPlan.fingerprint)) {
@@ -1123,6 +1477,48 @@ export function executeVaultWrite(
     }
 
     tx.mkdirParents(path.dirname(initialPlan.target.notePath));
+    const preflightLink = (
+      staged: OwnedFile,
+      destinationParent: string,
+      label: string,
+    ): OwnedFile => {
+      const probe = path.join(
+        destinationParent,
+        `.me-vault-write-${operationId}-${label}.probe`,
+      );
+      try {
+        tx.link(staged.path, probe, staged, 1n);
+        const probeOwned = ownedFile(probe);
+        tx.unlink(probeOwned);
+      } catch (error) {
+        try {
+          if (fs.existsSync(probe) && sameInode(staged.path, probe)) {
+            tx.unlink(ownedFile(probe));
+          } else if (fs.existsSync(probe)) {
+            markPreserved(probe, 'Inspect the conflicting hard-link preflight path.');
+          }
+        } catch {
+          markPreserved(probe, 'Remove the operation-owned hard-link preflight path.');
+        }
+        throw error;
+      }
+      if (!sameOwnedLineage(staged) || fs.statSync(staged.path, { bigint: true }).nlink !== 1n) {
+        throw new VaultWriterError('RECOVERY_REQUIRED');
+      }
+      return ownedFile(staged.path);
+    };
+    noteStaged = preflightLink(
+      noteStaged,
+      path.dirname(initialPlan.target.notePath),
+      'note',
+    );
+    if (indexStaged) {
+      indexStaged = preflightLink(
+        indexStaged,
+        path.dirname(initialPlan.target.indexPath),
+        'index',
+      );
+    }
     const expectedAfterParentCreation = snapshotFingerprintPaths(initialPlan);
     tx.hooks.beforeNotePublish?.(initialPlan.target.notePath);
     /* Recheck all inputs immediately before the first publish. */
@@ -1135,7 +1531,7 @@ export function executeVaultWrite(
       throw new VaultWriterError('INPUT_CHANGED');
     }
     targetMutationStarted = true;
-    tx.link(noteStaged.path, initialPlan.target.notePath);
+    tx.link(noteStaged.path, initialPlan.target.notePath, noteStaged, 1n);
     notePublished = ownedFile(initialPlan.target.notePath);
     tx.state('note-published');
     let boundaryPaths = snapshotFingerprintPaths(initialPlan);
@@ -1165,6 +1561,11 @@ export function executeVaultWrite(
       const originalPath = path.join(originalsDir, 'README.md');
       tx.rename(initialPlan.target.indexPath, originalPath, originalSnapshot);
       indexPreserved = true;
+      if (!sameMovedFile(originalSnapshot, originalPath)) {
+        originalReadme = ownedFile(originalPath);
+        markPreserved(originalPath, 'Compare moved README with its pre-rename snapshot.');
+        throw new VaultWriterError('RECOVERY_REQUIRED');
+      }
       originalReadme = ownedFile(originalPath);
       tx.state('index-preserved');
       boundaryPaths = snapshotFingerprintPaths(initialPlan);
@@ -1181,7 +1582,7 @@ export function executeVaultWrite(
     }
 
     if (initialPlan.index.action !== 'none') {
-      tx.link(indexStaged!.path, initialPlan.target.indexPath);
+      tx.link(indexStaged!.path, initialPlan.target.indexPath, indexStaged!, 1n);
       indexPublished = ownedFile(initialPlan.target.indexPath);
       tx.state('index-published');
       boundaryPaths = snapshotFingerprintPaths(initialPlan);
@@ -1243,7 +1644,9 @@ export function executeVaultWrite(
     cleanupOwnedTransient(renderedCopy);
     cleanupOwnedTransient(fingerprintCopy);
     try {
-      if (fs.existsSync(stagingDir) && fs.readdirSync(stagingDir).length === 0) tx.rmdir(stagingDir);
+      if (fs.existsSync(stagingDir) && fs.readdirSync(stagingDir).length === 0) {
+        tx.rmdir(tx.ownedDirectoryFor(stagingDir));
+      }
     } catch {
       markPreserved(stagingDir, 'Inspect the non-empty staging directory.');
     }
@@ -1254,6 +1657,9 @@ export function executeVaultWrite(
   } catch (error) {
     mainCode = errorCode(error, targetMutationStarted);
     if (targetMutationStarted && !completed) rollback();
+    if (tx.journalConflict && tx.journalPath) {
+      markPreserved(tx.journalPath, 'Inspect the replaced or modified journal.');
+    }
     if (mainCode === 'RECOVERY_REQUIRED' && remaining.length === 0) {
       const foreignOriginal = path.join(originalsDir, 'README.md');
       if (fs.existsSync(foreignOriginal)) {
@@ -1271,8 +1677,12 @@ export function executeVaultWrite(
       cleanupOwnedTransient(renderedCopy);
       cleanupOwnedTransient(fingerprintCopy);
       try {
-        if (fs.existsSync(stagingDir) && fs.readdirSync(stagingDir).length === 0) tx.rmdir(stagingDir);
-      } catch { /* a retained operation is safer than deletion */ }
+        if (fs.existsSync(stagingDir) && fs.readdirSync(stagingDir).length === 0) {
+          tx.rmdir(tx.ownedDirectoryFor(stagingDir));
+        }
+      } catch {
+        markPreserved(stagingDir, 'Inspect the replaced staging directory.');
+      }
       if (originalReadme && fs.existsSync(originalReadme.path)) {
         try {
           if (
@@ -1291,20 +1701,22 @@ export function executeVaultWrite(
       }
       try {
         if (fs.existsSync(originalsDir) && fs.readdirSync(originalsDir).length === 0) {
-          tx.rmdir(originalsDir);
+          tx.rmdir(tx.ownedDirectoryFor(originalsDir));
         }
-      } catch { /* preserve on uncertainty */ }
+      } catch {
+        markPreserved(originalsDir, 'Inspect the replaced originals directory.');
+      }
 
       for (const directory of [...tx.createdDirectories].reverse()) {
         if (
-          directory === operationDir
-          || directory === stagingDir
-          || directory === originalsDir
-          || directory === layout.tmpDir
-          || directory === layout.lockDir
-          || directory === layout.meDir
+          directory.path === operationDir
+          || directory.path === stagingDir
+          || directory.path === originalsDir
+          || directory.path === layout.tmpDir
+          || directory.path === layout.lockDir
+          || directory.path === layout.meDir
         ) continue;
-        const relative = path.relative(initialPlan.target.layerRoot, directory);
+        const relative = path.relative(initialPlan.target.layerRoot, directory.path);
         if (
           relative
           && relative !== '..'
@@ -1312,16 +1724,22 @@ export function executeVaultWrite(
           && !path.isAbsolute(relative)
         ) {
           try {
-            if (fs.existsSync(directory) && fs.readdirSync(directory).length === 0) tx.rmdir(directory);
-          } catch { /* leave a non-empty or externally changed directory */ }
+            if (fs.existsSync(directory.path) && fs.readdirSync(directory.path).length === 0) {
+              tx.rmdir(directory);
+            }
+          } catch {
+            markPreserved(directory.path, 'Inspect the replaced operation-created directory.');
+          }
         }
       }
 
-      if (remaining.length === 0 && tx.journalPath && fs.existsSync(tx.journalPath)) {
+      if (remaining.length === 0 && tx.journalPath) {
         try {
-          const journalOwned = ownedFile(tx.journalPath);
-          tx.journalPath = undefined;
-          tx.journal = undefined;
+          if (!tx.verifyJournalOwnership()) {
+            throw new VaultWriterError('RECOVERY_REQUIRED');
+          }
+          const journalOwned = tx.closeJournal();
+          if (!journalOwned) throw new VaultWriterError('RECOVERY_REQUIRED');
           tx.unlink(journalOwned);
         } catch {
           markPreserved(path.join(operationDir, 'journal.json'), 'Inspect the changed journal.');
@@ -1330,7 +1748,7 @@ export function executeVaultWrite(
       if (remaining.length === 0) {
         try {
           if (fs.existsSync(operationDir) && fs.readdirSync(operationDir).length === 0) {
-            tx.rmdir(operationDir);
+            tx.rmdir(tx.ownedDirectoryFor(operationDir));
           }
         } catch {
           markPreserved(operationDir, 'Inspect the operation directory.');
@@ -1340,8 +1758,20 @@ export function executeVaultWrite(
 
     if (lockOwned) {
       tx.hooks.beforeLockRelease?.(lockPath);
-      if (sameOwnedFile(lockOwned)) {
-        try { tx.unlink(lockOwned); } catch {
+      if (tx.journalDescriptor !== undefined) {
+        if (!tx.verifyJournalOwnership()) {
+          markPreserved(
+            path.join(operationDir, 'journal.json'),
+            'Inspect the changed journal before any cleanup.',
+          );
+        }
+        tx.closeJournal();
+      }
+      try { fs.closeSync(lockOwned.descriptor); } catch {
+        markPreserved(lockPath, 'Inspect the lock whose acquisition descriptor could not close.');
+      }
+      if (sameOwnedFile(lockOwned.file)) {
+        try { tx.unlink(lockOwned.file); } catch {
           markPreserved(lockPath, 'Remove the lock only if it still belongs to this operation.');
         }
       } else {

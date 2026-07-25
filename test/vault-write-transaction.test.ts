@@ -60,6 +60,21 @@ function request(secret = 'orchid-body'): VaultWriteRequestV1 {
   };
 }
 
+function requestAt(
+  relativePath: string,
+  title: string,
+  secret = 'body',
+): VaultWriteRequestV1 {
+  const created = path.posix.basename(relativePath).slice(0, 10);
+  return {
+    ...request(secret),
+    relativePath,
+    markdown: request(secret).markdown
+      .replace('title: Orchid Choice', `title: ${title}`)
+      .replace('created: 2026-07-26', `created: ${created}`),
+  };
+}
+
 function manifest(root: string): Array<{ path: string; type: string; sha?: string }> {
   const result: Array<{ path: string; type: string; sha?: string }> = [];
   function walk(directory: string): void {
@@ -220,7 +235,7 @@ describe('lock precedence and operation discovery', () => {
       .toBe('incomplete-operation');
   });
 
-  test('recognized committed operations do not block another writer', () => {
+  test('a minimal committed marker without exact committed content is unrecognized', () => {
     const vault = makeVault();
     fs.mkdirSync(path.join(vault, '.me/tmp/vault-write-done'), { recursive: true });
     fs.writeFileSync(path.join(vault, '.me/tmp/vault-write-done/journal.json'), JSON.stringify({
@@ -228,7 +243,9 @@ describe('lock precedence and operation discovery', () => {
       operationId: 'done',
       state: 'committed',
     }));
-    expect(write(vault).status).toBe('committed');
+    const result = write(vault);
+    expect(result.status).toBe('manual_recovery');
+    expect(result.recoveries[0].state).toBe('unrecognized-operation');
   });
 
   test.each([
@@ -345,6 +362,112 @@ describe('lock precedence and operation discovery', () => {
     expect(nested?.status).toBe('conflict');
     expect(nested?.error?.code).toBe('LOCK_HELD');
     expect(outer.status).toBe('committed');
+  });
+
+  test('LOCK_HELD precedes schema, target, graph, and recovery planning failures', () => {
+    const vault = makeVault();
+    fs.mkdirSync(path.join(vault, '.me/locks'), { recursive: true });
+    fs.mkdirSync(path.join(vault, '.me/tmp/vault-write-bad'), { recursive: true });
+    fs.writeFileSync(path.join(vault, '.me/tmp/vault-write-bad/journal.json'), '{bad');
+    fs.writeFileSync(path.join(vault, '.me/locks/vault-write.lock'), 'foreign lock');
+    fs.writeFileSync(path.join(vault, 'SCHEMA.md'), 'unsupported schema');
+    fs.mkdirSync(path.join(
+      vault,
+      'practices/decisions/2026-07-26-orchid-choice.md',
+    ), { recursive: true });
+
+    const result = write(vault);
+    expect(result.status).toBe('conflict');
+    expect(result.error?.code).toBe('LOCK_HELD');
+    expect(result.recoveries).toEqual([]);
+  });
+
+  test('a committed journal with pending mutation or leftover staging blocks a new write', () => {
+    const vault = makeVault();
+    const first = write(vault);
+    expect(first.status).toBe('committed');
+    const directory = path.join(vault, '.me/tmp', `vault-write-${first.operationId}`);
+    const journalPath = path.join(directory, 'journal.json');
+    const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    journal.pendingMutation = { kind: 'unlink', paths: ['staging/note.md'] };
+    fs.writeFileSync(journalPath, JSON.stringify(journal));
+    fs.mkdirSync(path.join(directory, 'staging'));
+    fs.writeFileSync(path.join(directory, 'staging/note.md'), 'leftover');
+
+    const second = executeVaultWrite(
+      vault,
+      requestAt('decisions/2026-07-27-lotus-choice.md', 'Lotus Choice'),
+      { pluginRoot, mode: 'write' },
+    );
+    expect(second.status).toBe('manual_recovery');
+    expect(second.error?.code).toBe('INCOMPLETE_OPERATION');
+    expect(second.recoveries[0].state).toBe('unrecognized-operation');
+  });
+
+  test('a valid committed operation does not block a different target', () => {
+    const vault = makeVault();
+    expect(write(vault).status).toBe('committed');
+    const second = executeVaultWrite(
+      vault,
+      requestAt('decisions/2026-07-27-lotus-choice.md', 'Lotus Choice'),
+      { pluginRoot, mode: 'write' },
+    );
+    expect(second.status).toBe('committed');
+  });
+});
+
+describe('journal acquisition and phase ownership', () => {
+  test.each([
+    'afterLock',
+    'afterStaging',
+    'afterNotePublish',
+    'afterIndexPublish',
+    'beforePostValidation',
+    'beforeCommitCleanup',
+    'beforeLockRelease',
+  ] as const)('preserves a foreign journal replacement at %s', hookName => {
+    const vault = makeVault();
+    let replacement = '';
+    const hooks: VaultWriteHooks = {
+      [hookName]: (...args: string[]) => {
+        const operationDirectory = hookName === 'beforeCommitCleanup'
+          ? args[0]
+          : path.join(
+            vault,
+            '.me/tmp',
+            fs.readdirSync(path.join(vault, '.me/tmp'))
+              .find(name => name.startsWith('vault-write-'))!,
+          );
+        const journal = path.join(operationDirectory, 'journal.json');
+        if (!fs.existsSync(journal)) return;
+        fs.unlinkSync(journal);
+        replacement = `foreign-journal-${hookName}`;
+        fs.writeFileSync(journal, replacement);
+      },
+    };
+    const result = write(vault, hooks);
+    expect(result.status).toBe('manual_recovery');
+    const journal = result.recoveries.flatMap(item => item.preservedPaths)
+      .find(item => item.endsWith('/journal.json'))!;
+    expect(fs.readFileSync(path.join(vault, ...journal.split('/')), 'utf8')).toBe(replacement);
+  });
+
+  test('never follows or truncates a symlink substituted for the journal', () => {
+    const vault = makeVault();
+    const outside = temporaryDirectory('me-journal-outside-');
+    const foreign = path.join(outside, 'foreign');
+    fs.writeFileSync(foreign, 'outside-bytes');
+    const result = write(vault, {
+      afterStaging() {
+        const operationName = fs.readdirSync(path.join(vault, '.me/tmp'))
+          .find(name => name.startsWith('vault-write-'))!;
+        const journal = path.join(vault, '.me/tmp', operationName, 'journal.json');
+        fs.unlinkSync(journal);
+        fs.symlinkSync(foreign, journal);
+      },
+    });
+    expect(result.status).toBe('manual_recovery');
+    expect(fs.readFileSync(foreign, 'utf8')).toBe('outside-bytes');
   });
 });
 
@@ -539,6 +662,33 @@ describe('fingerprint, no-clobber, and rollback windows', () => {
     expect(result.status).toBe('conflict');
     expect(result.error?.code).toBe('INPUT_CHANGED');
   });
+
+  test.each(['tmp', 'locks'] as const)(
+    'fingerprints .me/%s metadata after lock acquisition',
+    internal => {
+      const vault = makeVault();
+      const result = write(vault, {
+        afterLock() {
+          fs.chmodSync(path.join(vault, '.me', internal), 0o755);
+        },
+      });
+      expect(result.status).toBe('conflict');
+      expect(result.error?.code).toBe('INPUT_CHANGED');
+    },
+  );
+
+  test('fingerprints every existing target-prefix directory', () => {
+    const vault = makeVault();
+    const parent = path.join(vault, 'practices/decisions');
+    fs.mkdirSync(parent);
+    const result = write(vault, {
+      afterLock() {
+        fs.chmodSync(parent, 0o700);
+      },
+    });
+    expect(result.status).toBe('conflict');
+    expect(result.error?.code).toBe('INPUT_CHANGED');
+  });
 });
 
 describe('README concurrency and cleanup ownership', () => {
@@ -718,5 +868,158 @@ describe('README concurrency and cleanup ownership', () => {
       .find(item => item.endsWith('/staging/note.md'))!;
     expect(fs.readFileSync(path.join(vault, ...staged.split('/')), 'utf8'))
       .toBe('foreign unlink bytes');
+  });
+
+  test.each(['replace', 'edit', 'hardlink'] as const)(
+    'revalidates staged note source after the universal link hook: %s',
+    mutation => {
+      const vault = makeVault();
+      const extra = path.join(vault, 'staged-extra');
+      let injected = false;
+      const result = write(vault, {
+        beforeFsMutation(kind, paths) {
+          if (
+            kind !== 'link'
+            || injected
+            || !paths[1].endsWith('/2026-07-26-orchid-choice.md')
+          ) return;
+          injected = true;
+          if (mutation === 'replace') {
+            fs.unlinkSync(paths[0]);
+            fs.writeFileSync(paths[0], 'foreign staged replacement');
+          } else if (mutation === 'edit') {
+            fs.writeFileSync(paths[0], 'foreign staged edit');
+          } else {
+            fs.linkSync(paths[0], extra);
+          }
+        },
+      });
+      expect(result.status).not.toBe('committed');
+      expect(fs.existsSync(path.join(
+        vault,
+        'practices/decisions/2026-07-26-orchid-choice.md',
+      ))).toBeFalse();
+      if (mutation === 'hardlink') {
+        expect(fs.readFileSync(extra, 'utf8')).toContain('Orchid Choice');
+      }
+    },
+  );
+
+  test.each(['staging', 'target-parent'] as const)(
+    'does not rmdir a contained directory substituted for owned %s',
+    target => {
+      const vault = makeVault();
+      let injected = false;
+      const result = write(vault, {
+        beforePostValidation() {
+          fs.writeFileSync(path.join(vault, 'raw/source.md'), '# force rollback\n');
+        },
+        beforeFsMutation(kind, paths) {
+          if (kind !== 'rmdir' || injected) return;
+          const matches = target === 'staging'
+            ? paths[0].endsWith('/staging')
+            : paths[0].endsWith('/practices/decisions');
+          if (!matches) return;
+          injected = true;
+          fs.rmdirSync(paths[0]);
+          fs.mkdirSync(paths[0]);
+        },
+      });
+      expect(result.status).toBe('manual_recovery');
+      const replaced = result.recoveries.flatMap(item => item.preservedPaths)
+        .find(item => target === 'staging'
+          ? item.endsWith('/staging')
+          : item.endsWith('practices/decisions'))!;
+      expect(fs.statSync(path.join(vault, ...replaced.split('/'))).isDirectory()).toBeTrue();
+    },
+  );
+
+  test('compares a moved README against the pre-rename snapshot', () => {
+    const vault = makeVault('# Original\n');
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      fileOps: {
+        renameSync(source, destination) {
+          fs.renameSync(source, destination);
+          fs.writeFileSync(destination, '# Changed after rename\n');
+        },
+      },
+    });
+    expect(result.status).toBe('manual_recovery');
+    const recovery = result.recoveries.find(item =>
+      item.preservedPaths.some(itemPath => itemPath.endsWith('/originals/README.md')))!;
+    expect(recovery.actions.map(action => action.kind)).toEqual([
+      'inspect',
+      'compare',
+      'remove-owned',
+    ]);
+  });
+
+  test('preflights both links before publishing the note', () => {
+    const vault = makeVault('# Existing\n');
+    let links = 0;
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      fileOps: {
+        linkSync(source, destination) {
+          links += 1;
+          if (links === 2) {
+            const error = new Error('second link unsupported') as NodeJS.ErrnoException;
+            error.code = 'EXDEV';
+            throw error;
+          }
+          fs.linkSync(source, destination);
+        },
+      },
+    });
+    expect(result.status).toBe('unsupported');
+    expect(result.error?.code).toBe('UNSUPPORTED_FILESYSTEM');
+    expect(fs.existsSync(path.join(
+      vault,
+      'practices/decisions/2026-07-26-orchid-choice.md',
+    ))).toBeFalse();
+    expect(fs.readFileSync(path.join(vault, 'practices/README.md'), 'utf8'))
+      .toBe('# Existing\n');
+  });
+
+  test('treats directory fsync EIO as a safe failure, never a warning-only commit', () => {
+    const vault = makeVault();
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      ...({
+        directoryFsync(directory: string) {
+          if (directory.endsWith('/decisions')) {
+            const error = new Error('disk failure') as NodeJS.ErrnoException;
+            error.code = 'EIO';
+            throw error;
+          }
+        },
+      } as object),
+    } as Parameters<typeof executeVaultWrite>[2]);
+    expect(result.status).not.toBe('committed');
+    expect(fs.existsSync(path.join(
+      vault,
+      'practices/decisions/2026-07-26-orchid-choice.md',
+    ))).toBeFalse();
+  });
+
+  test('downgrades a known unsupported directory fsync errno to a warning', () => {
+    const vault = makeVault();
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      ...({
+        directoryFsync() {
+          const error = new Error('unsupported') as NodeJS.ErrnoException;
+          error.code = 'ENOTSUP';
+          throw error;
+        },
+      } as object),
+    } as Parameters<typeof executeVaultWrite>[2]);
+    expect(result.status).toBe('committed');
+    expect(result.warnings).toContain('Directory fsync is not supported on this filesystem.');
   });
 });
