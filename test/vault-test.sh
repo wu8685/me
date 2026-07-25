@@ -3368,6 +3368,42 @@ test_decision_brief_profile_behavior_evidence() {
   echo "$block" | grep -Fq '[portableized from raw temp path]' || return 1
 }
 
+test_decision_brief_write_transaction_contract() {
+  local skill="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
+  local evidence="$PLUGIN_ROOT/test/skills/decision-brief/write-transaction-results.md"
+  local id
+  local block
+
+  assert_file_exists "$skill" || return 1
+  grep -Fq 'Before the first target write, preflight every target against its snapshot:' "$skill" || return 1
+  grep -Fq 'before each individual mutation, compare that target again and couple the' "$skill" || return 1
+  grep -Fq 'planned creation, both checks must confirm that the path still does not' "$skill" || return 1
+  grep -Fq 'A mismatch before any write aborts the whole operation without mutating a' "$skill" || return 1
+  grep -Fq 'If a later target changes' "$skill" || return 1
+  grep -Fq 'after writing has begun, use the ownership-aware rollback below' "$skill" || return 1
+
+  assert_file_exists "$evidence" || return 1
+  grep -Fq 'These checks validate evidence structure, not agent behavior.' "$evidence" || return 1
+
+  for id in WT1 WT2 WT3 WT4; do
+    [ "$(grep -Fc "### $id" "$evidence")" -eq 1 ] || return 1
+    block="$(
+      awk -v heading="### $id" '
+        $0 == heading { in_probe = 1; next }
+        in_probe && /^### WT[1-4]$/ { exit }
+        in_probe { print }
+      ' "$evidence"
+    )"
+    echo "$block" | grep -Fq '**Fresh context:**' || return 1
+    echo "$block" | grep -Fq '**Fixture:**' || return 1
+    echo "$block" | grep -Fq '**Operation:**' || return 1
+    echo "$block" | grep -Fq '**Before hashes:**' || return 1
+    echo "$block" | grep -Fq '**After hashes:**' || return 1
+    echo "$block" | grep -Fq '**Exact excerpt:**' || return 1
+    echo "$block" | grep -Fq '**Filesystem verdict:**' || return 1
+  done
+}
+
 # ── Quick Task 260406-e00: Convert Commands to Skills Tests ─────────────────
 
 test_skill_files_exist() {
@@ -4761,6 +4797,7 @@ main() {
     run_test test_decision_brief_public_privacy
     run_test test_decision_brief_profile_contract
     run_test test_decision_brief_profile_behavior_evidence
+    run_test test_decision_brief_write_transaction_contract
 
     # E2E tests (require claude CLI)
     run_test test_e2e_me_setup
