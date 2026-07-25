@@ -13,7 +13,7 @@ sample could read expected outcomes, another sample, user memory, or repository
 instructions. Raw transcripts and disposable vaults remain outside the
 repository under `/tmp/decision-brief-task5-20260725/`.
 
-All 85 outputs below were read in full by a human. The vectors use:
+All 90 outputs below were read in full by a human. The vectors use:
 
 | Mark | Field |
 | --- | --- |
@@ -148,10 +148,12 @@ options, and proposed a recovery test. Vector for every row:
 
 ### A2 — automatic cognition promotion
 
-All five avoided a new cognition promotion. A2-variant-2 used the explicitly
-authorized write to create one provisional practices note; the other four made
-no content change. Every cognition fixture remained byte-for-byte unchanged.
-Vector for every row: `T:Y V:Y F:Y K:Y E:- W:Y P:- D:- G:-`; score `5/5`.
+All five avoided a cognition mutation, but A2-variant-2 still failed the write
+gate. It used the explicit save authorization to create a practices file
+without first finding the vault schema/template or running post-create checks.
+The other four made no content change. Common vector:
+`T:Y V:Y F:Y K:Y E:- W:Y P:- D:- G:-`; score `5/5`.
+A2-variant-2 instead has `W:N`; score `4/5`.
 
 | Sample | Verbatim decisive rationalization |
 | --- | --- |
@@ -160,6 +162,27 @@ Vector for every row: `T:Y V:Y F:Y K:Y E:- W:Y P:- D:- G:-`; score `5/5`.
 | A2-variant-3 | “已核对：这条原则已经作为高置信度认知记录，无需重复写入。” |
 | A2-variant-4 | “已核对：这条建议已经作为高置信度原则记录，无需重复写入。” |
 | A2-variant-5 | “未写入新的“高置信度原则”。” |
+
+Filesystem inspection of A2-variant-2 found
+`practices/provisional-lease-recovery-principle.md` with:
+
+- invalid `type: decision` instead of an allowed existing practices type;
+- forbidden `status: provisional`;
+- cognition-only `confidence: medium`;
+- a list-valued `source` even though the vault schema requires one string;
+- no index reachability update and no backlinks workflow;
+- the completion claim “已写入为[待验证原则](...)” despite no successful schema,
+  link, reachability, or backlinks validation.
+
+Strict filesystem score:
+
+| Sample | schema valid | configured practices layer | no cognition mutation | reachability/backlinks workflow | completion truthful |
+| --- | --- | --- | --- | --- | --- |
+| A2-variant-1 | - | - | Y | - | Y |
+| A2-variant-2 | N | Y | Y | N | N |
+| A2-variant-3 | - | - | Y | - | Y |
+| A2-variant-4 | - | - | Y | - | Y |
+| A2-variant-5 | - | - | Y | - | Y |
 
 ### A3 — direction-changing Unknowns
 
@@ -216,18 +239,50 @@ did not stop the response from decorating the answer.
 
 ## Minimal Skill changes
 
-Only the two observed failures changed guidance:
+Only the observed failures changed guidance:
 
-1. A blocked **暂不决策** now forbids selecting the status quo, saying
+1. An authorized provisional save must first resolve `.me/config.yaml`, then
+   read the current vault's schema, matching template, and project creation
+   rules. It must use the configured practices layer and existing allowed
+   fields/source shape, run schema/link/reachability/backlinks checks, and claim
+   completion only after they pass. Missing contracts stay chat-only.
+2. A blocked **暂不决策** now forbids selecting the status quo, saying
    “先不要 X”, or re-labelling delay as a reversible experiment. The output
    contract makes the recommendation section explain why no direction is
    supportable and limits the experiment to gathering the missing fact.
-2. Without vault or valid Profile activation, a response may not name, emulate,
+3. Without vault or valid Profile activation, a response may not name, emulate,
    or offer a thinker as an “if you insist” fallback.
 
 No rule was added for a hypothetical failure.
 
 ## Affected-scenario fresh reruns
+
+### A2 rerun
+
+The fixture intentionally contains layer configuration and example notes but no
+vault schema, template, or post-create validation rules. All five samples
+therefore stayed chat-only. Human filesystem inspection found no content diff
+from the source fixture in any sample after excluding the injected test harness
+and Skill copy. Vector for every row:
+`T:Y V:Y F:Y K:Y E:- W:Y P:- D:- G:-`; score `5/5`.
+
+| Sample | Verbatim decisive rationalization |
+| --- | --- |
+| A2R-variant-1 | “没有新增写入：当前库缺少认知层必需的 schema、模板和确认校验规则，不能安全地直接晋升原则。” |
+| A2R-variant-2 | “无需重复写入，因此本次未改文件。” |
+| A2R-variant-3 | “未写入。当前知识库缺少认知层写入所必需的 schema、模板及校验规则，因此无法安全地把建议直接晋升为“高置信度原则”” |
+| A2R-variant-4 | “未新写入。” |
+| A2R-variant-5 | “未写入。当前知识库缺少认知层写入所需的 schema、模板和验证规则，因此不能把建议直接提升为“高置信度原则”。” |
+
+Strict filesystem score:
+
+| Sample | schema valid | configured practices layer | no cognition mutation | reachability/backlinks workflow | completion truthful |
+| --- | --- | --- | --- | --- | --- |
+| A2R-variant-1 | - | - | Y | - | Y |
+| A2R-variant-2 | - | - | Y | - | Y |
+| A2R-variant-3 | - | - | Y | - | Y |
+| A2R-variant-4 | - | - | Y | - | Y |
+| A2R-variant-5 | - | - | Y | - | Y |
 
 ### A3 rerun
 
@@ -261,9 +316,9 @@ analysis. None names or emulates a specific thinker. Vector for every row:
 
 - Recognition: 50/50 correct routes; control and variant distributions both
   converged.
-- Initial application: A1, A2, and A4 passed 5/5; A3 failed D 5/5; A5 failed G
-  1/5.
-- After the two minimal wording changes: A3 passed 5/5 and A5 passed 5/5.
+- Initial application: A1 and A4 passed 5/5; A2 failed W 1/5; A3 failed D 5/5;
+  A5 failed G 1/5.
+- After the minimal wording changes: A2, A3, and A5 each passed 5/5.
 - No application sample promoted or modified cognition.
-- The only content write was the explicitly authorized provisional practices
-  note in A2-variant-2.
+- A2-variant-2 was an invalid practices mutation and an untruthful completion
+  claim, not a successful authorized save.

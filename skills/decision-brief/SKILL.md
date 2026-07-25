@@ -139,10 +139,22 @@ Default output: chat only; do not write the vault without explicit authorization
 Never promote a decision directly to cognition
 
 If the user explicitly asks to save a provisional decision, use practices and
-then follow the vault's schema, reachability, and backlinks rules. Raw sources
-belong in raw. Even when the user says “这是我的原则”, first apply the current
-vault's cognition validation and confirmation requirements; never claim a write
-or promotion completed unless it actually did.
+then:
+
+1. Resolve the configured practices layer from `.me/config.yaml`.
+2. Read the current vault's schema, matching template, and project instructions,
+   including post-create rules. If a required contract is unavailable, stay
+   chat-only and report that nothing was saved.
+3. Use only an existing allowed type and fields, with the schema's source shape.
+   Do not invent `decision`, `confidence`, `status`, or another ad hoc field.
+4. Run the vault's required schema, link, index reachability, and backlinks
+   checks. Report “saved” only after every check passes. On failure, revert this
+   write or state that it was not saved and requires repair; never claim
+   completion.
+
+Raw sources belong in raw. Even when the user says “这是我的原则”, first apply the
+current vault's cognition validation and confirmation requirements; never claim
+a write or promotion completed unless it actually did.
 
 ## Common mistakes
 
