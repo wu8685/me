@@ -308,6 +308,7 @@ function extractVideo(runner: CommandRunner, context: ExtractContext, probe: XVi
         kind: entry.kind,
         path: downloadMedia(runner, context, entry),
         url: entry.url,
+        ...(entry.durationSec === undefined ? {} : { durationSec: entry.durationSec }),
         caption: entry.title,
       });
     }

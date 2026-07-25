@@ -134,6 +134,7 @@ export interface MediaAsset {
   kind: 'image' | 'figure' | 'audio' | 'video' | 'slide' | 'frame';
   path?: string;
   url?: string;
+  durationSec?: number;
   alt?: string;
   caption?: string;
   timestampSec?: number;
@@ -164,6 +165,7 @@ export interface CapabilityReport {
   capabilities: Capability[];
   missingDependencies?: string[];
   degradation?: 'none' | 'partial' | 'blocked';
+  completeness?: 'complete' | 'partial' | 'unknown';
   warnings: string[];
 }
 
@@ -738,7 +740,8 @@ interface IngestCliOptions {
 
 CLI 不提供 `--trusted-resource-root`。Orchestration 必须按来源建立
 `FinalizeInput.trustedResourceRoots`：URL adapter 使用本次 extraction 的窄范围 media
-workspace；Bundle 使用经 `loadSourceBundle` 验证的 bundle directory。不得从用户参数、
+workspace；Bundle 的本地或 URL-only media 也先复制/下载到本次运行 workspace，
+finalizer 只信任该 workspace。不得从用户参数、
 `MediaAsset.path` 的任意祖先或整个 vault 推断宽根。生成的 stem 必须是
 `YYYY-MM-DD-<ascii-kebab-slug>`，并让 finalizer 做 vault-wide uniqueness gate。
 
@@ -748,7 +751,8 @@ workspace；Bundle 使用经 `loadSourceBundle` 验证的 bundle directory。不
 
 - [ ] **Step 5: 保持 preview JSON 兼容**
 
-旧字段继续存在；新增 `sourceKind`、`adapterId`、`capabilities`、`warnings`、`handoutKind?`、`writeResult?`。视频在未显式 mode 时默认 `handout`，图文仍按语言选择 `translate-cn`/`summarize`。
+旧字段继续存在；新增 `sourceKind`、`adapterId`、`capabilities`、`degradation`、
+`completeness?`、`warnings`、`handoutKind?`、`writeResult?`。视频在未显式 mode 时默认 `handout`，图文仍按语言选择 `translate-cn`/`summarize`。
 
 - [ ] **Step 6: 运行 CLI 与全量测试**
 

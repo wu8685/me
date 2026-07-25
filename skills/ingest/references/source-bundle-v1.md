@@ -40,8 +40,8 @@ Optional source fields are `canonicalUrl`, `author`, `publishedAt`, `language`,
 and `durationSec`. Blocks use unique `id`, `kind`, and `markdown`, with optional
 `mediaId`/`page`. Transcript entries use `start`, `end`, `text`, and optional
 `speaker`. Media uses unique `id`, `kind`, and either a public HTTP(S) `url` or
-bundle-local `path`, plus optional alt/caption/timestamp/page. Warnings contain
-`code`, `message`, and optional `mediaId`.
+bundle-local `path`, plus optional `durationSec`/alt/caption/timestamp/page.
+Warnings contain `code`, `message`, and optional `mediaId`.
 
 ## Trust boundary
 
@@ -50,9 +50,14 @@ bundle-local `path`, plus optional alt/caption/timestamp/page. Warnings contain
   machine.
 - Transcript segments are ordered, non-overlapping, and satisfy
   `0 <= start < end`.
+- Audio/video `durationSec`, when present, is a positive finite number. ME uses
+  per-media duration—not transcript tail length—to offset multipart transcripts.
 - Media IDs are unique and block references must resolve.
-- The JSON contains no cookie, Authorization header, token, secret, decrypt key,
-  browser profile, or local absolute path.
+- Public URL-only media is staged into one per-run workspace with argv-safe
+  download, extension/content-type checks, and a size limit before finalization.
+- Non-body metadata contains no URL userinfo, sensitive URL query, cookie,
+  Authorization header, token, secret, decrypt key, browser profile, or local
+  absolute path. Quoted source prose and transcript text remain source content.
 - ME validates the complete bundle before writing anything.
 - A bundle cannot carry or request DRM circumvention.
 

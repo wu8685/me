@@ -106,6 +106,45 @@ test('reports a scanned PDF without OCR as degraded', async () => {
   expect(report.warnings).toContain('ocr-required');
 });
 
+test('classifies an abstract-only PDF preview as partial instead of complete', async () => {
+  const report = await createPdfAdapter(pdfPreviewRunner()).probe({
+    url: new URL(PDF_URL),
+    vaultDir: '/tmp/v',
+  });
+
+  expect(report.completeness).toBe('partial');
+  expect(report.degradation).toBe('partial');
+  expect(report.warnings).toContain('pdf-pages-incomplete');
+});
+
+test('classifies a full-page PDF extraction as complete when document and XML page counts agree', async () => {
+  const report = await createPdfAdapter(pdfFixtureRunner()).probe({
+    url: new URL(PDF_URL),
+    vaultDir: '/tmp/v',
+  });
+
+  expect(report.completeness).toBe('complete');
+  expect(report.degradation).toBe('none');
+  expect(report.warnings).toEqual([]);
+});
+
+test('classifies PDF completeness as unknown when document page evidence is unavailable', async () => {
+  const runner = pdfFixtureRunner();
+  const originalRun = runner.run.bind(runner);
+  runner.run = (command, args, options) => command === 'pdfinfo'
+    ? { stdout: '', stderr: '', status: 0 }
+    : originalRun(command, args, options);
+
+  const report = await createPdfAdapter(runner).probe({
+    url: new URL(PDF_URL),
+    vaultDir: '/tmp/v',
+  });
+
+  expect(report.completeness).toBe('unknown');
+  expect(report.degradation).toBe('partial');
+  expect(report.warnings).toContain('pdf-completeness-unknown');
+});
+
 test('reports an encrypted PDF as blocked instead of falling back', async () => {
   const report = await createPdfAdapter(encryptedPdfRunner()).probe({ url: new URL(PDF_URL), vaultDir: '/tmp/v' });
 
@@ -191,7 +230,13 @@ test('projects inline Markdown images through the extractContent compatibility w
   }));
 
   expect(result.images).toEqual(['https://cdn.example.com/inline.png']);
-  expect(result.content).toContain('Before ![inline chart](https://cdn.example.com/inline.png) after');
+  expect(result.content).toContain([
+    'Before',
+    '',
+    '![inline chart](https://cdn.example.com/inline.png)',
+    '',
+    'after',
+  ].join('\n'));
 });
 
 test('associates a standalone duplicate image with its own Markdown occurrence', async () => {
@@ -201,6 +246,34 @@ test('associates a standalone duplicate image with its own Markdown occurrence',
 
   expect(source.media.map((asset) => asset.id)).toEqual(['image-001', 'image-002']);
   expect(source.blocks.at(-1)).toMatchObject({ kind: 'image', mediaId: 'image-002' });
+});
+
+test('splits every inline and duplicate Markdown image occurrence into an associated ordered block', async () => {
+  const source = await createHtmlAdapter(recordingRunner({
+    stdout: [
+      '# Inline images',
+      '',
+      'Before ![same](https://cdn.example.com/same.png) between ![other](https://cdn.example.com/other.png) after',
+      '',
+      '![same](https://cdn.example.com/same.png)',
+      '',
+    ].join('\n'),
+  })).extract({ url: new URL('https://example.com/article'), vaultDir: '/tmp/v' });
+
+  expect(source.media.map((asset) => [asset.id, asset.url])).toEqual([
+    ['image-001', 'https://cdn.example.com/same.png'],
+    ['image-002', 'https://cdn.example.com/other.png'],
+    ['image-003', 'https://cdn.example.com/same.png'],
+  ]);
+  expect(source.blocks.map((block) => [block.kind, block.markdown, block.mediaId])).toEqual([
+    ['heading', '# Inline images', undefined],
+    ['paragraph', 'Before', undefined],
+    ['image', '![same](https://cdn.example.com/same.png)', 'image-001'],
+    ['paragraph', 'between', undefined],
+    ['image', '![other](https://cdn.example.com/other.png)', 'image-002'],
+    ['paragraph', 'after', undefined],
+    ['image', '![same](https://cdn.example.com/same.png)', 'image-003'],
+  ]);
 });
 
 test('extracts an X Article body and ordered images', async () => {
@@ -819,10 +892,31 @@ function pdfRunner({ text }: { text: string }): CommandRunner & { calls: Array<{
       calls.push({ command, args });
       if (command === 'which') return { stdout: '/safe/bin/tool\n', stderr: '', status: 0 };
       if (command === 'curl') fs.writeFileSync(args[5], '%PDF-fixture');
+      if (command === 'pdfinfo') return { stdout: 'Pages:           1\n', stderr: '', status: 0 };
       if (command === 'pdftotext') fs.writeFileSync(args[2], text);
       if (command === 'pdftohtml') {
         fs.writeFileSync(args.at(-1)!, fixtureText('paper.xml'));
         fs.writeFileSync(path.join(path.dirname(args.at(-1)!), 'figure-1.png'), 'fixture-image');
+      }
+      return { stdout: '', stderr: '', status: 0 };
+    },
+  };
+}
+
+function pdfPreviewRunner(): CommandRunner {
+  return {
+    run(command, args) {
+      if (command === 'which') return { stdout: '/safe/bin/tool\n', stderr: '', status: 0 };
+      if (command === 'curl') fs.writeFileSync(args[5], '%PDF-preview');
+      if (command === 'pdfinfo') return { stdout: 'Pages:           12\n', stderr: '', status: 0 };
+      if (command === 'pdftotext') fs.writeFileSync(args[2], 'Abstract preview text');
+      if (command === 'pdftohtml') {
+        fs.writeFileSync(args.at(-1)!, [
+          '<?xml version="1.0" encoding="UTF-8"?>',
+          '<pdf2xml>',
+          '  <page number="1"><text top="10" left="10">Abstract preview text</text></page>',
+          '</pdf2xml>',
+        ].join('\n'));
       }
       return { stdout: '', stderr: '', status: 0 };
     },

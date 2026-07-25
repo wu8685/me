@@ -19,21 +19,11 @@ function blockId(index: number): string {
 /** Convert the Markdown emitted by defuddle into ordered source blocks and media. */
 export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]; media: MediaAsset[] } {
   const blocks: SourceBlock[] = [];
+  const media: MediaAsset[] = [];
   const normalizedMarkdown = markdown.replace(/\r\n/g, '\n');
   const imagePattern = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+)(?:\s+"[^"]*")?\)/g;
-  const imageOccurrences = Array.from(normalizedMarkdown.matchAll(imagePattern), (match, index) => ({
-    offset: match.index!,
-    media: {
-      id: `image-${String(index + 1).padStart(3, '0')}`,
-      kind: 'image' as const,
-      url: match[2],
-      alt: match[1] || undefined,
-    },
-  }));
-  const media = imageOccurrences.map((occurrence) => occurrence.media);
   const lines = normalizedMarkdown.split('\n');
   let paragraph: string[] = [];
-  let lineOffset = 0;
 
   const addBlock = (kind: SourceBlock['kind'], value: string, mediaId?: string) => {
     blocks.push({ id: blockId(blocks.length + 1), kind, markdown: value, ...(mediaId ? { mediaId } : {}) });
@@ -46,27 +36,40 @@ export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]
 
   for (const line of lines) {
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
-    const image = line.match(/^!\[([^\]]*)\]\((https?:\/\/[^)\s]+)(?:\s+"[^"]*")?\)$/);
-    if (heading) {
+    imagePattern.lastIndex = 0;
+    const images = [...line.matchAll(imagePattern)];
+    if (heading && images.length === 0) {
       flushParagraph();
       addBlock('heading', line);
-      lineOffset += line.length + 1;
-      continue;
-    }
-    if (image) {
-      flushParagraph();
-      const occurrence = imageOccurrences.find((candidate) => candidate.offset === lineOffset);
-      addBlock('image', line, occurrence?.media.id);
-      lineOffset += line.length + 1;
       continue;
     }
     if (line.trim() === '') {
       flushParagraph();
-      lineOffset += line.length + 1;
       continue;
     }
-    paragraph.push(line);
-    lineOffset += line.length + 1;
+    if (images.length === 0) {
+      paragraph.push(line);
+      continue;
+    }
+
+    let cursor = 0;
+    for (const image of images) {
+      const before = line.slice(cursor, image.index).trim();
+      if (before) paragraph.push(before);
+      flushParagraph();
+
+      const asset: MediaAsset = {
+        id: `image-${String(media.length + 1).padStart(3, '0')}`,
+        kind: 'image',
+        url: image[2],
+        ...(image[1] ? { alt: image[1] } : {}),
+      };
+      media.push(asset);
+      addBlock('image', image[0], asset.id);
+      cursor = image.index + image[0].length;
+    }
+    const after = line.slice(cursor).trim();
+    if (after) paragraph.push(after);
   }
   flushParagraph();
 

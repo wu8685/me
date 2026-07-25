@@ -140,6 +140,8 @@ export interface IngestPipelineResult {
   sourceKind?: SourceKind;
   adapterId?: string;
   capabilities?: CapabilityReport['capabilities'];
+  degradation?: CapabilityReport['degradation'];
+  completeness?: CapabilityReport['completeness'];
   warnings?: string[];
   handoutKind?: HandoutResult['kind'];
   writeResult?: FinalizeResult;
@@ -971,17 +973,10 @@ export function createRichIngestRegistry(runner: CommandRunner = defaultCommandR
   adapters: SourceAdapter[];
   registry: ReturnType<typeof createAdapterRegistry>;
 } {
-  const bili = createBilibiliAdapter(runner, {
-    transcribe(sourceUrl, cid) {
-      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-bili-transcript-'));
-      try {
-        return transcribeBilibili(sourceUrl, cid, directory, runner);
-      } finally {
-        fs.rmSync(directory, { recursive: true, force: true });
-      }
-    },
-    transcriptionAvailable: () => whichYtDlp(runner) !== null && whichWhisperCli(runner) !== null,
-  });
+  // Rich ingest deliberately routes every source through the configured generic
+  // transcription providers. The legacy Bilibili whisper-cpp callback remains
+  // available only through the compatibility wrapper above.
+  const bili = createBilibiliAdapter(runner);
   const adapters = [bili, createXAdapter(runner), createPdfAdapter(runner), createHtmlAdapter(runner)];
   const registry = createAdapterRegistry(adapters, {
     async resolveContentType(url) {
@@ -1015,16 +1010,46 @@ function readProcessedMarkdown(vaultDir: string, filename: string | undefined): 
   return fs.readFileSync(realCandidate, 'utf8');
 }
 
-function mediaExtension(asset: import('./ingest/contracts.ts').MediaAsset): string {
-  const fromPath = asset.url ? path.extname(new URL(asset.url).pathname).toLowerCase() : '';
-  return /^\.[a-z0-9]{1,10}$/.test(fromPath) ? fromPath : '.jpg';
+const REMOTE_MEDIA_EXTENSIONS = {
+  visual: new Set(['.avif', '.bmp', '.gif', '.jpeg', '.jpg', '.png', '.tif', '.tiff', '.webp']),
+  audio: new Set(['.aac', '.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav']),
+  video: new Set(['.m4v', '.mkv', '.mov', '.mp4', '.webm']),
+};
+const MAX_REMOTE_MEDIA_BYTES = 256 * 1024 * 1024;
+
+function safeRemoteMediaExtension(asset: import('./ingest/contracts.ts').MediaAsset): string {
+  const pathname = asset.url ? new URL(asset.url).pathname : '';
+  const extension = path.extname(pathname).toLowerCase();
+  if (['image', 'figure', 'slide', 'frame'].includes(asset.kind)) {
+    if (!extension) return '.jpg';
+    if (REMOTE_MEDIA_EXTENSIONS.visual.has(extension)) return extension;
+  } else if (asset.kind === 'audio' && REMOTE_MEDIA_EXTENSIONS.audio.has(extension)) {
+    return extension;
+  } else if (asset.kind === 'video' && REMOTE_MEDIA_EXTENSIONS.video.has(extension)) {
+    return extension;
+  }
+  throw new Error(`remote media has an incompatible extension for ${asset.kind}`);
 }
 
-function prepareUrlMedia(
+function requireCompatibleRemoteContentType(
+  asset: import('./ingest/contracts.ts').MediaAsset,
+  contentTypeOutput: string,
+): void {
+  const contentType = contentTypeOutput.trim().split(';', 1)[0].toLowerCase();
+  const compatible = ['image', 'figure', 'slide', 'frame'].includes(asset.kind)
+    ? contentType.startsWith('image/')
+    : asset.kind === 'audio'
+      ? contentType.startsWith('audio/') || contentType === 'application/octet-stream'
+      : contentType.startsWith('video/') || contentType === 'application/octet-stream';
+  if (!compatible) throw new Error(`remote media content type is incompatible with ${asset.kind}`);
+}
+
+function prepareSourceMedia(
   source: ExtractedSource,
   workspace: string,
   runner: CommandRunner,
   downloadRemote: boolean,
+  includePlayableRemote = false,
 ): ExtractedSource {
   const mediaDirectory = path.join(workspace, 'media');
   fs.mkdirSync(mediaDirectory, { recursive: true });
@@ -1038,22 +1063,97 @@ function prepareUrlMedia(
       fs.copyFileSync(sourcePath, destination);
       return { ...asset, path: destination };
     }
-    if (!downloadRemote || !asset.url || !['image', 'figure', 'slide', 'frame'].includes(asset.kind)) {
+    const isVisual = ['image', 'figure', 'slide', 'frame'].includes(asset.kind);
+    if (!downloadRemote || !asset.url || (!isVisual && !includePlayableRemote)) {
       return asset;
     }
+    const extension = safeRemoteMediaExtension(asset);
     const destination = path.join(
       mediaDirectory,
-      `asset-${String(index + 1).padStart(3, '0')}${mediaExtension(asset)}`,
+      `asset-${String(index + 1).padStart(3, '0')}${extension}`,
     );
-    runner.run('curl', [
-      '-sS', '-L', '--fail', '--max-time', '30', '-o', destination, asset.url,
+    const staging = `${destination}.part`;
+    const result = runner.run('curl', [
+      '-sS', '-L', '--fail', '--max-time', '30',
+      '--max-filesize', String(MAX_REMOTE_MEDIA_BYTES),
+      '-o', staging, '-w', '%{content_type}', asset.url,
     ], { timeoutMs: 35000 });
-    if (!fs.existsSync(destination) || fs.statSync(destination).size === 0) {
+    if (result.status !== 0) throw new Error(`failed to stage media asset: ${asset.id}`);
+    requireCompatibleRemoteContentType(asset, result.stdout);
+    if (
+      !fs.existsSync(staging)
+      || !fs.statSync(staging).isFile()
+      || fs.statSync(staging).size === 0
+      || fs.statSync(staging).size > MAX_REMOTE_MEDIA_BYTES
+    ) {
+      fs.rmSync(staging, { force: true });
       throw new Error(`failed to stage media asset: ${asset.id}`);
     }
+    fs.renameSync(staging, destination);
     return { ...asset, path: destination };
   });
   return { ...source, media };
+}
+
+function stageBilibiliAudio(
+  source: ExtractedSource,
+  workspace: string,
+  runner: CommandRunner,
+): ExtractedSource {
+  if (source.transcript?.length || source.media.some(asset => asset.kind === 'audio' && asset.path)) {
+    return source;
+  }
+  const ytdlp = whichYtDlp(runner);
+  if (!ytdlp) {
+    return { ...source, warnings: [...new Set([...source.warnings, 'transcription-unavailable'])] };
+  }
+  const directory = path.join(workspace, 'bilibili-audio');
+  fs.mkdirSync(directory, { recursive: true });
+  const template = path.join(directory, 'audio.%(ext)s');
+  const result = runner.run(ytdlp, ['-x', '--audio-format', 'wav', '-o', template, source.source.url], {
+    timeoutMs: 600000,
+  });
+  if (result.status !== 0) throw new Error('yt-dlp failed to stage Bilibili audio');
+  const audioPath = fs.readdirSync(directory)
+    .map(name => path.join(directory, name))
+    .find(candidate =>
+      path.extname(candidate).toLowerCase() === '.wav'
+      && fs.statSync(candidate).isFile()
+      && fs.statSync(candidate).size > 0);
+  if (!audioPath || !isInside(path.resolve(directory), path.resolve(audioPath))) {
+    throw new Error('yt-dlp did not produce a usable Bilibili audio file');
+  }
+  return {
+    ...source,
+    media: [
+      ...source.media,
+      {
+        id: 'audio-001',
+        kind: 'audio',
+        path: audioPath,
+        url: source.source.url,
+        ...(source.source.durationSec === undefined ? {} : { durationSec: source.source.durationSec }),
+      },
+    ],
+  };
+}
+
+function mediaDuration(asset: import('./ingest/contracts.ts').MediaAsset, runner: CommandRunner): number {
+  if (asset.durationSec !== undefined) {
+    if (Number.isFinite(asset.durationSec) && asset.durationSec > 0) return asset.durationSec;
+    throw new Error('media duration is invalid');
+  }
+  const result = runner.run('ffprobe', [
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    asset.path as string,
+  ], { timeoutMs: 30000 });
+  const duration = Number.parseFloat(result.stdout.trim());
+  if (result.status !== 0 || !Number.isFinite(duration) || duration <= 0) {
+    throw new Error('media duration is unavailable');
+  }
+  return duration;
 }
 
 function transcribeLocalMedia(
@@ -1072,14 +1172,37 @@ function transcribeLocalMedia(
   }
   let offset = 0;
   const transcript = inputs.flatMap((asset, index) => {
+    const duration = mediaDuration(asset, runner);
     const output = path.join(workspace, `transcript-${String(index + 1).padStart(3, '0')}`);
-    const segments = provider.transcribe(asset.path as string, output)
+    const localSegments = provider.transcribe(asset.path as string, output);
+    if (localSegments.some(segment =>
+      segment.start < 0
+      || segment.start >= segment.end
+      || segment.end > duration)) {
+      throw new Error('transcript exceeds media duration bound');
+    }
+    const segments = localSegments
       .map(segment => ({ ...segment, start: segment.start + offset, end: segment.end + offset }));
-    offset = segments.at(-1)?.end ?? offset;
+    offset += duration;
     return segments;
   });
+  if (
+    source.source.durationSec !== undefined
+    && (!Number.isFinite(source.source.durationSec)
+      || source.source.durationSec <= 0
+      || offset > source.source.durationSec)
+  ) {
+    throw new Error('cumulative media duration exceeds source duration bound');
+  }
   return transcript.length > 0
-    ? { ...source, transcript, warnings: source.warnings.filter(warning => warning !== 'needs-transcription') }
+    ? {
+      ...source,
+      transcript,
+      warnings: source.warnings.filter(warning =>
+        warning !== 'needs-transcription'
+        && warning !== 'transcription-unavailable'
+        && warning !== 'transcription-empty'),
+    }
     : { ...source, warnings: [...source.warnings, 'transcription-empty'] };
 }
 
@@ -1151,7 +1274,16 @@ export async function runRichIngest(
         degradation: source.warnings.length > 0 ? 'partial' : 'none',
         warnings: [...source.warnings],
       };
-      trustedResourceRoots = [fs.realpathSync(options.bundleDir)];
+      const shouldStageRemote = options.write
+        || options.mode === 'transcribe'
+        || options.mode === 'handout'
+        || (
+          !options.mode
+          && (source.source.kind === 'video' || source.source.kind === 'course')
+          && (config.defaultVideoMode === 'transcribe' || config.defaultVideoMode === 'handout')
+        );
+      source = prepareSourceMedia(source, workspace, runner, shouldStageRemote, true);
+      trustedResourceRoots = [workspace];
     } else {
       const url = options.url as URL;
       const { registry } = createRichIngestRegistry(runner);
@@ -1169,7 +1301,7 @@ export async function runRichIngest(
         ...(extractionMode ? { mode: extractionMode } : {}),
       });
       adapterId = session.adapter.id;
-      source = prepareUrlMedia(source, workspace, runner, options.write);
+      source = prepareSourceMedia(source, workspace, runner, options.write);
       trustedResourceRoots = [workspace];
     }
 
@@ -1177,6 +1309,7 @@ export async function runRichIngest(
     const language = detectLanguage(`${source.source.title}\n${body}`);
     const mode = resolveIngestMode(options.mode, source.source.kind, language, config.defaultVideoMode);
     if (mode === 'handout' || mode === 'transcribe') {
+      if (adapterId === 'bilibili') source = stageBilibiliAudio(source, workspace, runner);
       source = transcribeLocalMedia(source, workspace, config, runner);
     }
     const handout = mode === 'handout'
@@ -1229,6 +1362,8 @@ export async function runRichIngest(
       sourceKind: source.source.kind,
       adapterId,
       capabilities,
+      degradation: warnings.length > 0 ? 'partial' : 'none',
+      ...(capabilityReport.completeness ? { completeness: capabilityReport.completeness } : {}),
       warnings,
       ...(handout ? { handoutKind: handout.kind } : {}),
       ...(writeResult ? { writeResult } : {}),

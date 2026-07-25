@@ -18,6 +18,9 @@ export interface SourceBundleV1 {
 }
 
 const FORBIDDEN_KEYS = /^(cookie|authorization|token|decrypt(?:ion)?key|secret)$/i;
+const SENSITIVE_QUERY_VALUE = /^(?:Bearer|Basic)\s+\S+|^(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{8,}|^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/i;
+const CREDENTIAL_VALUE = /\b(?:Bearer|Basic)\s+\S+|\b(?:proxy-)?authorization\s*:\s*\S+|\bcookie\s*:\s*\S+|\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+/i;
+const ABSOLUTE_LOCAL_PATH = /(?:^|[\s"'=(])(?:\/(?!\/)[^\s"']+|[A-Za-z]:\\[^\s"']+)/;
 const SOURCE_KINDS = new Set(['article', 'paper', 'video', 'course']);
 const BLOCK_KINDS = new Set(['heading', 'paragraph', 'quote', 'code', 'image', 'figure']);
 const MEDIA_KINDS = new Set(['image', 'figure', 'audio', 'video', 'slide', 'frame']);
@@ -57,7 +60,7 @@ function requireString(value: unknown, label: string, issues: string[]): value i
 function requireUniqueId(id: string, ids: Set<string>, label: string, issues: string[]): void {
   if (!id) return;
   if (ids.has(id)) {
-    issues.push(`duplicate ${label} id: ${id}`);
+    issues.push(`duplicate ${label} id`);
     return;
   }
   ids.add(id);
@@ -66,14 +69,26 @@ function requireUniqueId(id: string, ids: Set<string>, label: string, issues: st
 function rejectUnknownKeys(value: RecordValue, allowed: string[], label: string, issues: string[]): void {
   const allowedKeys = new Set(allowed);
   for (const key of Object.keys(value)) {
-    if (!allowedKeys.has(key)) issues.push(`${label} contains unknown field: ${key}`);
+    if (!allowedKeys.has(key)) issues.push(`${label} contains an unknown field`);
   }
 }
 
-function isHttpUrl(value: string): boolean {
+function isHttpUrl(value: string, label: string, issues: string[]): boolean {
   try {
     const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    if (url.username || url.password) issues.push(`${label} contains credentials`);
+    for (const [key, queryValue] of url.searchParams) {
+      const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (
+        /^(?:accesstoken|apikey|authorization|authtoken|clientsecret|cookie|credential|decryptkey|password|refreshtoken|secret|sessionid|signature|token)$/.test(normalizedKey)
+        || SENSITIVE_QUERY_VALUE.test(queryValue)
+      ) {
+        issues.push(`${label} contains sensitive query data`);
+        break;
+      }
+    }
+    return true;
   } catch {
     return false;
   }
@@ -81,7 +96,7 @@ function isHttpUrl(value: string): boolean {
 
 function requireHttpUrl(value: unknown, label: string, issues: string[]): value is string {
   if (!requireString(value, label, issues)) return false;
-  if (!isHttpUrl(value)) {
+  if (!isHttpUrl(value, label, issues)) {
     issues.push(`${label} must be an http(s) URL`);
     return false;
   }
@@ -97,9 +112,15 @@ function rejectForbiddenKeys(value: unknown, issues: string[], seen = new WeakSe
   if (typeof value !== 'object' || value === null || seen.has(value)) return;
   seen.add(value);
   for (const [key, child] of Object.entries(value)) {
-    if (FORBIDDEN_KEYS.test(key)) issues.push(`forbidden key: ${key}`);
+    if (FORBIDDEN_KEYS.test(key)) issues.push('forbidden credential field');
     rejectForbiddenKeys(child, issues, seen);
   }
+}
+
+function rejectSensitiveMetadata(value: string | undefined, label: string, issues: string[]): void {
+  if (!value) return;
+  if (CREDENTIAL_VALUE.test(value)) issues.push(`${label} contains sensitive credential data`);
+  if (ABSOLUTE_LOCAL_PATH.test(value)) issues.push(`${label} contains a local path`);
 }
 
 function validateSource(value: unknown, issues: string[]): ExtractedSource['source'] | undefined {
@@ -114,7 +135,13 @@ function validateSource(value: unknown, issues: string[]): ExtractedSource['sour
   const author = optionalString(source.author, 'source.author', issues);
   const publishedAt = optionalString(source.publishedAt, 'source.publishedAt', issues);
   const language = optionalString(source.language, 'source.language', issues);
-  if (source.durationSec !== undefined && (typeof source.durationSec !== 'number' || !Number.isFinite(source.durationSec))) issues.push('source.durationSec must be a finite number');
+  rejectSensitiveMetadata(title, 'source.title', issues);
+  rejectSensitiveMetadata(author, 'source.author', issues);
+  rejectSensitiveMetadata(publishedAt, 'source.publishedAt', issues);
+  rejectSensitiveMetadata(language, 'source.language', issues);
+  if (source.durationSec !== undefined && (typeof source.durationSec !== 'number' || !Number.isFinite(source.durationSec) || source.durationSec <= 0)) {
+    issues.push('source.durationSec must be a positive finite number');
+  }
   return {
     url,
     ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
@@ -138,9 +165,11 @@ function validateBlocks(value: unknown, issues: string[]): SourceBlock[] {
     rejectUnknownKeys(block, ['id', 'kind', 'markdown', 'mediaId', 'page'], `blocks[${index}]`, issues);
     const id = requireString(block.id, `blocks[${index}].id`, issues) ? block.id : '';
     requireUniqueId(id, ids, 'block', issues);
+    rejectSensitiveMetadata(id, `blocks[${index}].id`, issues);
     if (typeof block.kind !== 'string' || !BLOCK_KINDS.has(block.kind)) issues.push(`blocks[${index}].kind is invalid`);
     const markdown = requireString(block.markdown, `blocks[${index}].markdown`, issues) ? block.markdown : '';
     const mediaId = optionalString(block.mediaId, `blocks[${index}].mediaId`, issues);
+    rejectSensitiveMetadata(mediaId, `blocks[${index}].mediaId`, issues);
     if (block.page !== undefined && (!Number.isInteger(block.page) || block.page < 1)) issues.push(`blocks[${index}].page must be a positive integer`);
     return {
       id,
@@ -162,13 +191,23 @@ function validateMedia(value: unknown, bundleDir: string, issues: string[]): Med
   const ids = new Set<string>();
   return value.map((item, index) => {
     const media = requireRecord(item, `media[${index}]`, issues) ?? {};
-    rejectUnknownKeys(media, ['id', 'kind', 'path', 'url', 'alt', 'caption', 'timestampSec', 'page'], `media[${index}]`, issues);
+    rejectUnknownKeys(media, ['id', 'kind', 'path', 'url', 'durationSec', 'alt', 'caption', 'timestampSec', 'page'], `media[${index}]`, issues);
     const id = requireString(media.id, `media[${index}].id`, issues) ? media.id : '';
     requireUniqueId(id, ids, 'media', issues);
+    rejectSensitiveMetadata(id, `media[${index}].id`, issues);
     if (typeof media.kind !== 'string' || !MEDIA_KINDS.has(media.kind)) issues.push(`media[${index}].kind is invalid`);
     const url = media.url === undefined ? undefined : (requireHttpUrl(media.url, `media[${index}].url`, issues) ? media.url : undefined);
     const alt = optionalString(media.alt, `media[${index}].alt`, issues);
     const caption = optionalString(media.caption, `media[${index}].caption`, issues);
+    rejectSensitiveMetadata(alt, `media[${index}].alt`, issues);
+    rejectSensitiveMetadata(caption, `media[${index}].caption`, issues);
+    if (media.durationSec !== undefined && (
+      typeof media.durationSec !== 'number'
+      || !Number.isFinite(media.durationSec)
+      || media.durationSec <= 0
+    )) {
+      issues.push(`media[${index}].durationSec must be a positive finite number`);
+    }
     if (media.timestampSec !== undefined && (typeof media.timestampSec !== 'number' || !Number.isFinite(media.timestampSec))) issues.push(`media[${index}].timestampSec must be a finite number`);
     if (media.page !== undefined && (!Number.isInteger(media.page) || media.page < 1)) issues.push(`media[${index}].page must be a positive integer`);
     let assetPath: string | undefined = media.path === undefined ? undefined : media.path as string;
@@ -178,24 +217,28 @@ function validateMedia(value: unknown, bundleDir: string, issues: string[]): Med
       } else {
         const resolved = path.resolve(bundleDir, assetPath);
         if (path.isAbsolute(assetPath) || (resolved !== root && !resolved.startsWith(root + path.sep))) {
-          issues.push(`media path escapes bundle root: ${assetPath}`);
+          issues.push('media path escapes bundle root');
         } else if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
-          issues.push(`media resource does not exist: ${assetPath}`);
+          issues.push('media resource does not exist');
         } else {
           const realPath = fs.realpathSync(resolved);
           if (realPath !== realRoot && !realPath.startsWith(realRoot + path.sep)) {
-            issues.push(`media path escapes bundle root: ${assetPath}`);
+            issues.push('media path escapes bundle root');
           } else {
             assetPath = resolved;
           }
         }
       }
     }
+    if (assetPath === undefined && url === undefined) {
+      issues.push(`media[${index}] must provide path or url`);
+    }
     return {
       id,
       kind: media.kind as MediaAsset['kind'],
       ...(assetPath === undefined ? {} : { path: assetPath }),
       ...(url === undefined ? {} : { url }),
+      ...(media.durationSec === undefined ? {} : { durationSec: media.durationSec as number }),
       ...(alt === undefined ? {} : { alt }),
       ...(caption === undefined ? {} : { caption }),
       ...(media.timestampSec === undefined ? {} : { timestampSec: media.timestampSec as number }),
@@ -224,6 +267,7 @@ function validateTranscript(value: unknown, issues: string[]): TranscriptSegment
     if (typeof end === 'number' && Number.isFinite(end)) previousEnd = end;
     const text = requireString(segment.text, `transcript[${index}].text`, issues) ? segment.text : '';
     const speaker = optionalString(segment.speaker, `transcript[${index}].speaker`, issues);
+    rejectSensitiveMetadata(speaker, `transcript[${index}].speaker`, issues);
     return { start: start as number, end: end as number, text, ...(speaker === undefined ? {} : { speaker }) };
   });
 }
@@ -235,6 +279,13 @@ function validateProvenance(value: unknown, issues: string[]): ExtractedSource['
   const extractor = requireString(provenance.extractor, 'provenance.extractor', issues) ? provenance.extractor : '';
   const extractedAt = requireString(provenance.extractedAt, 'provenance.extractedAt', issues) ? provenance.extractedAt : '';
   if (!Array.isArray(provenance.methods) || provenance.methods.some(method => typeof method !== 'string')) issues.push('provenance.methods must be an array of strings');
+  rejectSensitiveMetadata(extractor, 'provenance.extractor', issues);
+  rejectSensitiveMetadata(extractedAt, 'provenance.extractedAt', issues);
+  if (Array.isArray(provenance.methods)) {
+    provenance.methods.forEach((method, index) => {
+      if (typeof method === 'string') rejectSensitiveMetadata(method, `provenance.methods[${index}]`, issues);
+    });
+  }
   return { extractor, extractedAt, methods: Array.isArray(provenance.methods) ? provenance.methods as string[] : [] };
 }
 
@@ -249,6 +300,9 @@ function validateWarnings(value: unknown, issues: string[]): SourceBundleV1['war
     const code = requireString(warning.code, `warnings[${index}].code`, issues) ? warning.code : '';
     const message = requireString(warning.message, `warnings[${index}].message`, issues) ? warning.message : '';
     const mediaId = optionalString(warning.mediaId, `warnings[${index}].mediaId`, issues);
+    rejectSensitiveMetadata(code, `warnings[${index}].code`, issues);
+    rejectSensitiveMetadata(message, `warnings[${index}].message`, issues);
+    rejectSensitiveMetadata(mediaId, `warnings[${index}].mediaId`, issues);
     return { code, message, ...(mediaId === undefined ? {} : { mediaId }) };
   });
 }
@@ -267,7 +321,7 @@ export function validateSourceBundle(value: unknown, bundleDir: string): SourceB
   const warnings = validateWarnings(bundle.warnings, issues);
   const mediaIds = new Set(media.map(asset => asset.id));
   for (const block of blocks) {
-    if (block.mediaId && !mediaIds.has(block.mediaId)) issues.push(`block ${block.id} references missing media: ${block.mediaId}`);
+    if (block.mediaId && !mediaIds.has(block.mediaId)) issues.push('block references missing media');
   }
   if (issues.length > 0) throw new BundleValidationError(issues);
   return { version: 1, source: source!, blocks, ...(transcript === undefined ? {} : { transcript }), media, provenance: provenance!, warnings };
@@ -278,9 +332,8 @@ export function loadSourceBundle(bundleDir: string): ExtractedSource {
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  } catch (cause) {
-    const reason = cause instanceof Error ? cause.message : String(cause);
-    throw new BundleValidationError([`cannot load source bundle: ${reason}`]);
+  } catch {
+    throw new BundleValidationError(['cannot load source bundle']);
   }
   const bundle = validateSourceBundle(parsed, bundleDir);
   return {

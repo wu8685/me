@@ -11,7 +11,7 @@ import type {
 } from '../contracts.ts';
 import type { CommandRunner } from '../command.ts';
 
-const PDF_DEPENDENCIES = ['curl', 'pdftotext', 'pdftohtml'];
+const PDF_DEPENDENCIES = ['curl', 'pdftotext', 'pdftohtml', 'pdfinfo'];
 const CAPTION_PREFIX = /^(?:Figure\b|Fig\.|图)/i;
 const ENCRYPTION_ERROR = /\b(?:encrypted|encryption|password|drm|protected)\b/i;
 
@@ -170,6 +170,37 @@ function sourceTitle(url: URL): string {
   return filename || 'Untitled PDF';
 }
 
+function pdfPageCount(runner: CommandRunner, pdfPath: string): number | undefined {
+  try {
+    const result = runner.run('pdfinfo', [pdfPath], { timeoutMs: 10000 });
+    if (result.status !== 0) return undefined;
+    const count = Number.parseInt(result.stdout.match(/^Pages:\s+(\d+)\s*$/im)?.[1] ?? '', 10);
+    return Number.isInteger(count) && count > 0 ? count : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractedPageCount(xml: string): number {
+  return [...xml.matchAll(/<page\b/gi)].length;
+}
+
+function pdfCompleteness(
+  text: string,
+  xml: string,
+  documentPages: number | undefined,
+): { completeness: NonNullable<CapabilityReport['completeness']>; warnings: string[] } {
+  if (!text.trim()) return { completeness: 'partial', warnings: ['ocr-required'] };
+  const extractedPages = extractedPageCount(xml);
+  if (documentPages === undefined || extractedPages === 0 || extractedPages > documentPages) {
+    return { completeness: 'unknown', warnings: ['pdf-completeness-unknown'] };
+  }
+  if (extractedPages < documentPages) {
+    return { completeness: 'partial', warnings: ['pdf-pages-incomplete'] };
+  }
+  return { completeness: 'complete', warnings: [] };
+}
+
 function reportForMissingDependencies(missing: string[]): CapabilityReport {
   return {
     adapterId: 'pdf',
@@ -177,6 +208,7 @@ function reportForMissingDependencies(missing: string[]): CapabilityReport {
     capabilities: [],
     missingDependencies: missing,
     degradation: 'partial',
+    completeness: 'unknown',
     warnings: missing.map((dependency) => `missing-dependency:${dependency}`),
   };
 }
@@ -230,23 +262,18 @@ export function createPdfAdapter(runner: CommandRunner): SourceAdapter {
       const directory = temporaryDirectory(context);
       try {
         const { pdfPath, textPath } = downloadAndExtractText(runner, context.url, directory);
-        run(runner, 'pdftohtml', ['-xml', '-hidden', '-nodrm', pdfPath, path.join(directory, 'source.xml')], 30000);
+        const xmlPath = path.join(directory, 'source.xml');
+        run(runner, 'pdftohtml', ['-xml', '-hidden', '-nodrm', pdfPath, xmlPath], 30000);
         const text = fs.readFileSync(textPath, 'utf8').trim();
-        if (!text) {
-          return {
-            adapterId: 'pdf',
-            readable: false,
-            capabilities: ['body', 'images', 'captions'],
-            degradation: 'partial',
-            warnings: ['ocr-required'],
-          };
-        }
+        const xml = fs.readFileSync(xmlPath, 'utf8');
+        const assessment = pdfCompleteness(text, xml, pdfPageCount(runner, pdfPath));
         return {
           adapterId: 'pdf',
-          readable: true,
+          readable: Boolean(text),
           capabilities: ['body', 'images', 'captions'],
-          degradation: 'none',
-          warnings: [],
+          degradation: assessment.completeness === 'complete' ? 'none' : 'partial',
+          completeness: assessment.completeness,
+          warnings: assessment.warnings,
         };
       } catch (cause) {
         if (isEncryptedOrDrm(cause)) {
@@ -255,6 +282,7 @@ export function createPdfAdapter(runner: CommandRunner): SourceAdapter {
             readable: false,
             capabilities: [],
             degradation: 'blocked',
+            completeness: 'unknown',
             warnings: ['encrypted-or-drm'],
           };
         }
@@ -273,7 +301,9 @@ export function createPdfAdapter(runner: CommandRunner): SourceAdapter {
         const xmlPath = path.join(directory, 'source.xml');
         run(runner, 'pdftohtml', ['-xml', '-hidden', '-nodrm', pdfPath, xmlPath], 30000);
         const text = fs.readFileSync(textPath, 'utf8').trim();
-        const { blocks, media } = parsePdftohtmlXml(fs.readFileSync(xmlPath, 'utf8'));
+        const xml = fs.readFileSync(xmlPath, 'utf8');
+        const assessment = pdfCompleteness(text, xml, pdfPageCount(runner, pdfPath));
+        const { blocks, media } = parsePdftohtmlXml(xml);
         const figures = persistFigureAssets(media, directory, context);
         return {
           source: { url: context.url.toString(), kind: 'paper', title: sourceTitle(context.url) },
@@ -282,9 +312,9 @@ export function createPdfAdapter(runner: CommandRunner): SourceAdapter {
           provenance: {
             extractor: 'poppler',
             extractedAt: new Date().toISOString(),
-            methods: ['curl', 'pdftotext -layout', 'pdftohtml -xml -hidden -nodrm'],
+            methods: ['curl', 'pdfinfo', 'pdftotext -layout', 'pdftohtml -xml -hidden -nodrm'],
           },
-          warnings: [...(text ? [] : ['ocr-required']), ...figures.warnings],
+          warnings: [...assessment.warnings, ...figures.warnings],
         };
       } catch (cause) {
         if (isEncryptedOrDrm(cause)) throw new Error('PDF is encrypted or DRM-protected');

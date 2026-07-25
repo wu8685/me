@@ -101,9 +101,12 @@ Map these directories? (Press Enter for defaults)
 
 **能力与 degraded 语义：**
 
-- 预览结果会报告 `adapterId`、`capabilities`、`warnings`，视频讲义另有 `handoutKind`。
+- 预览结果会报告 `adapterId`、`capabilities`、`degradation`、`warnings`，视频讲义另有
+  `handoutKind`；PDF 还会报告 `completeness: complete | partial | unknown`。
 - `warnings` 非空表示结果处于 degraded/partial 状态。调用者必须说明缺少的字幕、图片或媒体，不得把部分结果描述为完整。
 - CLI 已实现的 `blocked` cases（X auth wall、encrypted/DRM PDF）不会写入笔记。
+- 视频/课程无论选择哪种写入模式，都必须具有 transcript、实质正文或可发布媒体；
+  只有标题、作者、时长等元数据时拒绝写入。
 - 普通 HTML 错误页没有统一的 CLI auto-block；Agent 必须做 body completeness check，标题或错误提示不能当作可读正文。
 - 只有返回 `writeResult` 才表示写入成功；校验或最终写入失败时不会保留部分 artifact。
 

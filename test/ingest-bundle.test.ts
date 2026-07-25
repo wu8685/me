@@ -33,6 +33,74 @@ test('accepts http(s) source URLs', () => {
     .toBe('https://example.com/source');
 });
 
+test('rejects URL userinfo and sensitive query keys or values without leaking the matched value', () => {
+  const secret = ['very', 'private', 'value'].join('-');
+  const tokenKey = ['access', 'token'].join('_');
+  const cases = [
+    `https://reader:${secret}@example.com/source`,
+    `https://example.com/source?${tokenKey}=${secret}`,
+    `https://example.com/source?apikey=${secret}`,
+    `https://example.com/source?download=${encodeURIComponent(`Bearer ${secret}`)}`,
+  ];
+
+  for (const url of cases) {
+    let message = '';
+    try {
+      validateSourceBundle(bundle({
+        source: { url, kind: 'article', title: 'Source' },
+      }), fixture('bundle-valid'));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/sensitive|credential/i);
+    expect(message).not.toContain(secret);
+  }
+});
+
+test('rejects credential headers and absolute local paths in provenance and non-body metadata', () => {
+  const secret = ['private', 'credential', 'value'].join('-');
+  const headerName = ['Authoriza', 'tion'].join('');
+  const localPath = ['/', 'Users', '/', 'name', '/', 'private.txt'].join('');
+  const cases = [
+    { provenance: { extractor: 'test', extractedAt: NOW, methods: [`${headerName}: Bearer ${secret}`] } },
+    { provenance: { extractor: localPath, extractedAt: NOW, methods: [] } },
+    { source: { url: 'https://example.com/source', kind: 'article', title: localPath } },
+    { warnings: [{ code: 'source-warning', message: `${headerName}: Bearer ${secret}` }] },
+  ];
+
+  for (const invalid of cases) {
+    let message = '';
+    try {
+      validateSourceBundle(bundle(invalid), fixture('bundle-valid'));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/sensitive|local path/i);
+    expect(message).not.toContain(secret);
+    expect(message).not.toContain(localPath);
+  }
+});
+
+test('does not treat quoted source body prose as executable metadata', () => {
+  const headerName = ['Authoriza', 'tion'].join('');
+  const localPath = ['/', 'Users', '/', 'example', '/', 'quoted.txt'].join('');
+  const validated = validateSourceBundle(bundle({
+    blocks: [{
+      id: 'b1',
+      kind: 'quote',
+      markdown: `The article literally quotes "${headerName}: Bearer illustrative-value" and ${localPath}.`,
+    }],
+    transcript: [{
+      start: 0,
+      end: 2,
+      text: `Spoken prose mentions ${localPath} without granting filesystem access.`,
+    }],
+  }), fixture('bundle-valid'));
+
+  expect(validated.blocks).toHaveLength(1);
+  expect(validated.transcript).toHaveLength(1);
+});
+
 test('rejects an unknown top-level field containing a local absolute path', () => {
   expect(() => validateSourceBundle(
     bundle({ localPath: '/Users/name/private' }),
@@ -112,4 +180,14 @@ test('rejects a bundle-relative symlink whose target escapes the bundle root', (
 test('rejects invalid transcript bounds', () => {
   expect(() => validateSourceBundle(bundle({ transcript: [{ start: 3, end: 3, text: 'invalid' }] }), fixture('bundle-valid')))
     .toThrow(/start/i);
+});
+
+test('accepts only positive finite per-media durations', () => {
+  expect(validateSourceBundle(bundle({
+    media: [{ id: 'm1', kind: 'video', url: 'https://cdn.example.com/video.mp4', durationSec: 60 }],
+  }), fixture('bundle-valid')).media[0].durationSec).toBe(60);
+
+  expect(() => validateSourceBundle(bundle({
+    media: [{ id: 'm1', kind: 'video', url: 'https://cdn.example.com/video.mp4', durationSec: 0 }],
+  }), fixture('bundle-valid'))).toThrow(/duration/i);
 });

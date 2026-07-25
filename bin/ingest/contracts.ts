@@ -16,6 +16,7 @@ export interface MediaAsset {
   kind: 'image' | 'figure' | 'audio' | 'video' | 'slide' | 'frame';
   path?: string;
   url?: string;
+  durationSec?: number;
   alt?: string;
   caption?: string;
   timestampSec?: number;
@@ -46,6 +47,7 @@ export interface CapabilityReport {
   capabilities: Capability[];
   missingDependencies?: string[];
   degradation?: 'none' | 'partial' | 'blocked';
+  completeness?: 'complete' | 'partial' | 'unknown';
   warnings: string[];
 }
 

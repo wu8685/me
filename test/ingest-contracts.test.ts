@@ -296,26 +296,26 @@ describe('rich ingest CLI orchestration', () => {
     }
   });
 
-  test('uses successful Bilibili local transcription without stale needs-transcription warnings', async () => {
+  test('uses the configured generic mlx-whisper provider for Bilibili no-CC audio and cleans the per-run workspace', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-bili-url-'));
     const vault = path.join(root, 'vault');
-    const model = path.join(root, 'model.bin');
     fs.mkdirSync(vault);
-    fs.writeFileSync(model, 'model');
-    const previousModel = process.env.ME_WHISPER_MODEL;
-    process.env.ME_WHISPER_MODEL = model;
+    const transcribedInputs: string[] = [];
     try {
       const result = await runRichIngest(parseIngestCliOptions([
-        'https://www.bilibili.com/video/BV1fixture', '--vault-dir', vault,
-      ]), bilibiliUrlRunner());
+        'https://www.bilibili.com/video/BV1fixture', '--vault-dir', vault, '--write',
+      ]), bilibiliUrlRunner(transcribedInputs));
       expect(result.mode).toBe('handout');
       expect(result.content).toContain('Bilibili local transcript');
       expect(result.warnings).not.toContain('needs-transcription');
       expect(result.warnings).not.toContain('transcription-unavailable');
       expect(result.capabilities).toContain('transcript');
+      expect(result.writeResult?.notePath).toBeDefined();
+      expect(transcribedInputs).toHaveLength(1);
+      expect(transcribedInputs[0]).toContain(`${path.sep}me-ingest-run-`);
+      expect(fs.existsSync(transcribedInputs[0])).toBeFalse();
+      expect(fs.existsSync(path.join(vault, '.me', 'ingest-media'))).toBeFalse();
     } finally {
-      if (previousModel === undefined) delete process.env.ME_WHISPER_MODEL;
-      else process.env.ME_WHISPER_MODEL = previousModel;
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -338,9 +338,218 @@ describe('rich ingest CLI orchestration', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test.each([
+    ['HTML', 'https://example.com/inline-images'],
+    ['X Article', 'https://x.com/example/articles/inline-images'],
+  ])('writes %s inline and duplicate images in source order with stable localized associations', async (_label, url) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-inline-images-'));
+    const vault = path.join(root, 'vault');
+    fs.mkdirSync(vault);
+    try {
+      const result = await runRichIngest(parseIngestCliOptions([
+        url,
+        '--vault-dir', vault,
+        '--mode', 'raw',
+        '--write',
+      ]), inlineDuplicateArticleRunner(url));
+      const note = fs.readFileSync(result.writeResult!.notePath, 'utf8');
+
+      expect(note).toContain([
+        'Before the first occurrence.',
+        '',
+        '![same](images/image-001.png)',
+        '',
+        'Between the duplicate occurrences.',
+        '',
+        '![same](images/image-002.png)',
+        '',
+        'After the second occurrence.',
+      ].join('\n'));
+      expect(result.writeResult?.assetPaths.map(asset => path.basename(asset))).toEqual([
+        'image-001.png',
+        'image-002.png',
+      ]);
+      expect(result.writeResult?.assetPaths.map(asset => fs.readFileSync(asset, 'utf8'))).toEqual([
+        'download-1',
+        'download-2',
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects sensitive Bundle values before --write and leaves the vault empty without echoing secrets', async () => {
+    const secret = ['runtime', 'private', 'value'].join('-');
+    const tokenKey = ['access', 'token'].join('_');
+    const headerName = ['Authoriza', 'tion'].join('');
+    const invalidCases = [
+      { source: { url: `https://reader:${secret}@example.com/source`, kind: 'article', title: 'Source' } },
+      { source: { url: `https://example.com/source?${tokenKey}=${secret}`, kind: 'article', title: 'Source' } },
+      { provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: [`${headerName}: Bearer ${secret}`] } },
+    ];
+
+    for (const invalid of invalidCases) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-sensitive-bundle-'));
+      const vault = path.join(root, 'vault');
+      const bundle = path.join(root, 'bundle');
+      fs.mkdirSync(vault);
+      fs.mkdirSync(bundle);
+      fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+        version: 1,
+        source: { url: 'https://example.com/source', kind: 'article', title: 'Source' },
+        blocks: [{ id: 'b1', kind: 'paragraph', markdown: 'Substantive source body.' }],
+        media: [],
+        provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: [] },
+        warnings: [],
+        ...invalid,
+      }));
+      try {
+        let message = '';
+        try {
+          await runRichIngest(parseIngestCliOptions([
+            '--bundle', bundle, '--vault-dir', vault, '--mode', 'raw', '--write',
+          ]));
+        } catch (error) {
+          message = error instanceof Error ? error.message : String(error);
+        }
+        expect(message).toMatch(/sensitive|credential/i);
+        expect(message).not.toContain(secret);
+        expect(fs.readdirSync(vault)).toEqual([]);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('stages URL-only Bundle media into the transaction workspace before finalizing', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-url-bundle-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    fs.mkdirSync(vault);
+    fs.mkdirSync(bundle);
+    writeUrlOnlyArticleBundle(bundle);
+    const stagedPaths: string[] = [];
+    try {
+      const result = await runRichIngest(parseIngestCliOptions([
+        '--bundle', bundle, '--vault-dir', vault, '--mode', 'raw', '--write',
+      ]), remoteBundleMediaRunner(stagedPaths));
+
+      expect(result.writeResult?.assetPaths).toHaveLength(1);
+      expect(fs.readFileSync(result.writeResult!.assetPaths[0], 'utf8')).toBe('remote-image');
+      expect(fs.readFileSync(result.writeResult!.notePath, 'utf8'))
+        .toContain('![Remote diagram](images/image-001.png)');
+      expect(stagedPaths).toHaveLength(1);
+      expect(stagedPaths[0]).toContain(`${path.sep}me-ingest-run-`);
+      expect(fs.existsSync(stagedPaths[0])).toBeFalse();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('rolls back URL-only Bundle media staging failures without a partial artifact', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-url-bundle-failure-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    fs.mkdirSync(vault);
+    fs.mkdirSync(bundle);
+    writeUrlOnlyArticleBundle(bundle);
+    try {
+      await expect(runRichIngest(parseIngestCliOptions([
+        '--bundle', bundle, '--vault-dir', vault, '--mode', 'raw', '--write',
+      ]), {
+        run(command, args) {
+          if (command === 'curl') {
+            fs.writeFileSync(args[args.indexOf('-o') + 1], '<html>not an image</html>');
+            return { stdout: 'text/html', stderr: '', status: 0 };
+          }
+          throw new Error(`Unexpected command: ${command}`);
+        },
+      })).rejects.toThrow(/content type|stage media/i);
+      expect(fs.readdirSync(vault)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects explicit raw metadata-only video writes but allows a substantive raw video body', async () => {
+    for (const substantive of [false, true]) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-raw-video-'));
+      const vault = path.join(root, 'vault');
+      const bundle = path.join(root, 'bundle');
+      fs.mkdirSync(vault);
+      fs.mkdirSync(bundle);
+      fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+        version: 1,
+        source: {
+          url: 'https://example.com/video',
+          kind: 'video',
+          title: substantive ? 'Substantive raw video' : 'Metadata only video',
+          durationSec: 60,
+        },
+        blocks: substantive
+          ? [{ id: 'b1', kind: 'paragraph', markdown: 'The speaker develops a complete argument with evidence, a counterexample, and a conclusion.' }]
+          : [
+            { id: 'b1', kind: 'heading', markdown: '# Metadata only video' },
+            { id: 'b2', kind: 'paragraph', markdown: '> Author: Fixture · Duration: 60s' },
+          ],
+        media: [],
+        provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: ['metadata'] },
+        warnings: [],
+      }));
+      try {
+        const operation = runRichIngest(parseIngestCliOptions([
+          '--bundle', bundle, '--vault-dir', vault, '--mode', 'raw', '--write',
+        ]));
+        if (substantive) {
+          const result = await operation;
+          expect(fs.readFileSync(result.writeResult!.notePath, 'utf8')).toContain('complete argument');
+        } else {
+          await expect(operation).rejects.toThrow(/metadata-only|substantive|completeness/i);
+          expect(fs.readdirSync(vault)).toEqual([]);
+        }
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('offsets a 60s + 60s X playlist by media duration rather than the first transcript tail', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-x-offset-'));
+    const vault = path.join(root, 'vault');
+    fs.mkdirSync(vault);
+    try {
+      const result = await runRichIngest(parseIngestCliOptions([
+        'https://x.com/example/status/duration-offset',
+        '--vault-dir', vault,
+        '--mode', 'transcribe',
+      ]), xDurationPlaylistRunner());
+
+      expect(result.content).toContain('**00:00–00:10**');
+      expect(result.content).toContain('**01:00–01:10**');
+      expect(result.content).not.toContain('**00:10–00:20**');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects a provider transcript that exceeds its individual media duration', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-x-offset-bounds-'));
+    const vault = path.join(root, 'vault');
+    fs.mkdirSync(vault);
+    try {
+      await expect(runRichIngest(parseIngestCliOptions([
+        'https://x.com/example/status/duration-offset',
+        '--vault-dir', vault,
+        '--mode', 'transcribe',
+      ]), xDurationPlaylistRunner(61))).rejects.toThrow(/media duration|duration bound/i);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
-function bilibiliUrlRunner(): CommandRunner {
+function bilibiliUrlRunner(transcribedInputs: string[]): CommandRunner {
   const metadata = {
     code: 0,
     data: {
@@ -365,7 +574,7 @@ function bilibiliUrlRunner(): CommandRunner {
       }
       if (command === 'which') {
         const executable = args[0];
-        if (executable === 'yt-dlp' || executable === 'whisper-cli') {
+        if (executable === 'yt-dlp' || executable === 'mlx-whisper') {
           return { stdout: `/safe/${executable}\n`, stderr: '', status: 0 };
         }
         throw new Error(`missing executable: ${executable}`);
@@ -375,13 +584,13 @@ function bilibiliUrlRunner(): CommandRunner {
         fs.writeFileSync(template.replace('%(ext)s', 'wav'), 'audio');
         return { stdout: '', stderr: '', status: 0 };
       }
-      if (command === 'ffmpeg') {
-        fs.writeFileSync(args.at(-1)!, 'pcm');
-        return { stdout: '', stderr: '', status: 0 };
-      }
-      if (command === '/safe/whisper-cli') {
-        const outputBase = args[args.indexOf('-of') + 1];
-        fs.writeFileSync(`${outputBase}.txt`, 'Bilibili local transcript');
+      if (command === '/safe/mlx-whisper') {
+        const input = args[0];
+        transcribedInputs.push(input);
+        const outputDir = args[args.indexOf('--output-dir') + 1];
+        fs.writeFileSync(path.join(outputDir, `${path.basename(input, path.extname(input))}.json`), JSON.stringify({
+          segments: [{ start: 0, end: 42, text: 'Bilibili local transcript' }],
+        }));
         return { stdout: '', stderr: '', status: 0 };
       }
       throw new Error(`Unexpected command: ${command}`);
@@ -425,6 +634,149 @@ function xTranscribeUrlRunner(): CommandRunner {
         const output = path.join(outputDir, `${path.basename(input, path.extname(input))}.json`);
         fs.writeFileSync(output, JSON.stringify({
           segments: [{ start: 0, end: 42, text: 'X transcript text' }],
+        }));
+        return { stdout: '', stderr: '', status: 0 };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    },
+  };
+}
+
+function inlineDuplicateArticleRunner(url: string): CommandRunner {
+  let download = 0;
+  const markdown = [
+    '# Inline duplicate article',
+    '',
+    [
+      'Before the first occurrence.',
+      '![same](https://cdn.example.com/same.png)',
+      'Between the duplicate occurrences.',
+      '![same](https://cdn.example.com/same.png)',
+      'After the second occurrence.',
+    ].join(' '),
+    '',
+    'This substantive public article body is intentionally long enough for the X Article readability gate. '
+      + 'It contains ordinary explanatory prose, evidence, and a conclusion without depending on a live source. '.repeat(2),
+    '',
+  ].join('\n');
+  return {
+    run(command, args) {
+      if (command === 'yt-dlp') return { stdout: '', stderr: 'not a video', status: 1 };
+      if (command === 'defuddle') {
+        expect(args).toEqual(['parse', url, '--md']);
+        return { stdout: markdown, stderr: '', status: 0 };
+      }
+      if (command === 'curl' && args.includes('-I')) {
+        return { stdout: 'text/html; charset=utf-8', stderr: '', status: 0 };
+      }
+      if (command === 'curl') {
+        const destination = args[args.indexOf('-o') + 1];
+        download += 1;
+        fs.writeFileSync(destination, `download-${download}`);
+        return { stdout: 'image/png', stderr: '', status: 0 };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    },
+  };
+}
+
+function writeUrlOnlyArticleBundle(bundle: string): void {
+  fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+    version: 1,
+    source: { url: 'https://example.com/remote-article', kind: 'article', title: 'Remote media article' },
+    blocks: [
+      { id: 'b1', kind: 'paragraph', markdown: 'Before the diagram.' },
+      {
+        id: 'b2',
+        kind: 'image',
+        markdown: '![Remote diagram](https://cdn.example.com/diagram.png)',
+        mediaId: 'image-001',
+      },
+      { id: 'b3', kind: 'paragraph', markdown: 'After the diagram.' },
+    ],
+    media: [{
+      id: 'image-001',
+      kind: 'image',
+      url: 'https://cdn.example.com/diagram.png',
+      alt: 'Remote diagram',
+    }],
+    provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: ['fixture'] },
+    warnings: [],
+  }));
+}
+
+function remoteBundleMediaRunner(stagedPaths: string[]): CommandRunner {
+  return {
+    run(command, args) {
+      if (command !== 'curl') throw new Error(`Unexpected command: ${command}`);
+      const destination = args[args.indexOf('-o') + 1];
+      stagedPaths.push(destination);
+      fs.writeFileSync(destination, 'remote-image');
+      return { stdout: 'image/png', stderr: '', status: 0 };
+    },
+  };
+}
+
+function xDurationPlaylistRunner(firstSegmentEnd = 10): CommandRunner {
+  const url = 'https://x.com/example/status/duration-offset';
+  let transcription = 0;
+  return {
+    run(command, args) {
+      if (command === 'yt-dlp' && args[0] === '--dump-single-json') {
+        return {
+          stdout: JSON.stringify({
+            _type: 'playlist',
+            id: 'duration-offset',
+            title: 'Duration offset playlist',
+            entries: [
+              {
+                id: 'clip-1',
+                title: 'First 60 second clip',
+                webpage_url: url,
+                duration: 60,
+                ext: 'mp4',
+                vcodec: 'avc1',
+                acodec: 'mp4a',
+              },
+              {
+                id: 'clip-2',
+                title: 'Second 60 second clip',
+                webpage_url: url,
+                duration: 60,
+                ext: 'mp4',
+                vcodec: 'avc1',
+                acodec: 'mp4a',
+              },
+            ],
+          }),
+          stderr: '',
+          status: 0,
+        };
+      }
+      if (command === 'yt-dlp') {
+        const template = args[args.indexOf('-o') + 1];
+        const selected = args[args.indexOf('--playlist-items') + 1];
+        const actual = template
+          .replace('%(id)s', selected === '2' ? 'clip-2' : 'clip-1')
+          .replace('%(ext)s', 'mp4');
+        fs.writeFileSync(actual, selected === '2' ? 'second' : 'first');
+        return { stdout: `${actual}\n`, stderr: '', status: 0 };
+      }
+      if (command === 'which') {
+        if (args[0] === 'mlx-whisper') return { stdout: '/safe/mlx-whisper\n', stderr: '', status: 0 };
+        throw new Error(`missing executable: ${args[0]}`);
+      }
+      if (command === '/safe/mlx-whisper') {
+        transcription += 1;
+        const input = args[0];
+        const outputDir = args[args.indexOf('--output-dir') + 1];
+        const end = transcription === 1 ? firstSegmentEnd : 10;
+        fs.writeFileSync(path.join(outputDir, `${path.basename(input, path.extname(input))}.json`), JSON.stringify({
+          segments: [{
+            start: 0,
+            end,
+            text: transcription === 1 ? 'First clip transcript' : 'Second clip transcript',
+          }],
         }));
         return { stdout: '', stderr: '', status: 0 };
       }

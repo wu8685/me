@@ -122,7 +122,8 @@ interface SourceAdapter {
 - 是否能读取来源；
 - 需要哪些本地依赖；
 - 能否取得正文、字幕、音频、视频和页面图；
-- 可生成完整正文、完整讲义，还是只能降级。
+- 可生成完整正文、完整讲义，还是只能降级；PDF 必须用 `complete`、
+  `partial` 或 `unknown` 明示完整性，不能从“有正文”推断为完整。
 
 Adapter 优先级：
 
@@ -178,9 +179,15 @@ interface SourceBundleV1 {
 - bundle 内路径必须是相对路径，解析后不得逃出 bundle 根目录；
 - `source.url` 必须保留原始来源；
 - transcript segment 必须满足 `0 <= start < end`，整体按时间排序；
+- 每个 audio/video media 可携带正数 `durationSec`；多媒体转写必须按 media
+  时长累计 offset，并拒绝越过单个 media 或来源总时长的 segment；
 - media ID 必须唯一；
 - 正文与 media 通过 ID 关联，不能依赖模糊文件名匹配；
-- JSON 中禁止 cookie、Authorization header、token、解密 key 和本地绝对路径；
+- media 可使用 bundle 内相对 `path`，也可只提供公开 HTTP(S) `url`。远程资源在
+  finalizer 前下载到本次运行 workspace，校验扩展名、响应内容类型和大小上限；
+- JSON 的非正文元数据中禁止 URL userinfo、敏感 query、cookie、
+  Authorization header、token、解密 key 和本地绝对路径；正文/逐字稿中作为材料
+  内容出现的引用不按凭据处理；
 - ME 导入前完整验证 bundle；失败时不写 vault。
 
 CLI 增加：
@@ -206,6 +213,8 @@ me ingest --bundle <directory>
 - 判断 URL 或响应是否为 PDF；
 - 提取正文、页码、figure 和 caption；
 - figure 在正文中按出现位置引用；
+- 使用 PDF 文档页数与实际提取页数的可靠证据判定完整性；证据相等为
+  `complete`，只提取部分页面为 `partial`，缺少或冲突证据为 `unknown`；
 - 只得到摘要页、扫描图片或不完整正文时报告 degraded，不得宣称完成；
 - OCR 不作为 v1 强制依赖，但 capability report 必须说明扫描 PDF 需要 OCR。
 
@@ -226,7 +235,8 @@ me ingest --bundle <directory>
 ### 8.5 Bilibili
 
 - 保留 CC 字幕优先策略；
-- 无字幕时优先探测 `mlx-whisper`，再探测 `whisper.cpp`；
+- 无字幕时把音频下载到本次运行 workspace，再按配置顺序调用通用
+  transcription provider（默认先 `mlx-whisper`，再 `whisper.cpp`）；
 - 公共实现不写死用户模型路径；
 - 代理与 Range 下载的机器特定问题留在本地 Profile/Memory；
 - 公开视频默认进入 `handout`，用户可显式选择 `transcribe` 或 `summarize`。
@@ -367,7 +377,7 @@ topic exclusive lock、vault-wide stem reservation 与二次 destination check �
 
 以下情况不得报告完成：
 
-- 视频只有元数据，没有字幕或转写；
+- 视频/课程的任何写入模式只有元数据，没有 transcript、实质正文或可发布媒体；
 - 明确 adapter 返回登录页、错误页或空正文；
 - PDF 只得到摘要页却被当作全文；
 - bundle path 越界或包含禁止字段；

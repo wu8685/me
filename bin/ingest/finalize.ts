@@ -388,6 +388,37 @@ function generatedFrontmatter(input: FinalizeInput, created: string): string {
   ].join('\n');
 }
 
+function hasSubstantiveVideoBody(source: ExtractedSource): boolean {
+  return source.blocks.some((block) => {
+    if (!['paragraph', 'quote', 'code'].includes(block.kind)) return false;
+    const markdown = block.markdown.trim();
+    if (
+      /^>\s*(?:author|作者|duration|时长|published|发布日期|播放|views?)\s*[:：]/i.test(markdown)
+    ) {
+      return false;
+    }
+    const visible = markdown
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      .replace(/https?:\/\/\S+/g, '')
+      .replace(/[`*_>#]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return visible.length >= 40;
+  });
+}
+
+function hasPublishableVideoMedia(source: ExtractedSource): boolean {
+  const referenced = new Set(source.blocks
+    .filter(block => block.kind === 'image' || block.kind === 'figure')
+    .map(block => block.mediaId)
+    .filter((id): id is string => Boolean(id)));
+  return source.media.some(asset =>
+    Boolean(asset.path)
+    && VISUAL_KINDS.has(asset.kind)
+    && referenced.has(asset.id));
+}
+
 function validateSource(source: ExtractedSource, handout?: HandoutResult): void {
   if (!source.source.title.trim()) throw new Error('source title is empty');
   let sourceUrl: URL;
@@ -401,9 +432,21 @@ function validateSource(source: ExtractedSource, handout?: HandoutResult): void 
   const mediaIds = new Set<string>();
   for (const asset of source.media) {
     if (!asset.id || mediaIds.has(asset.id)) throw new Error('duplicate or empty media id');
+    if (
+      asset.durationSec !== undefined
+      && (!Number.isFinite(asset.durationSec) || asset.durationSec <= 0)
+    ) {
+      throw new Error('media duration is invalid');
+    }
     mediaIds.add(asset.id);
   }
 
+  if (
+    source.source.durationSec !== undefined
+    && (!Number.isFinite(source.source.durationSec) || source.source.durationSec <= 0)
+  ) {
+    throw new Error('source duration is invalid');
+  }
   const transcript = source.transcript ?? [];
   for (const [index, segment] of transcript.entries()) {
     if (
@@ -440,6 +483,15 @@ function validateSource(source: ExtractedSource, handout?: HandoutResult): void 
     ) {
       throw new Error('video/course handout transcript coverage is incomplete');
     }
+  }
+  if (
+    !handout
+    && (source.source.kind === 'video' || source.source.kind === 'course')
+    && transcript.length === 0
+    && !hasSubstantiveVideoBody(source)
+    && !hasPublishableVideoMedia(source)
+  ) {
+    throw new Error('video/course metadata-only ingest lacks substantive transcript, body, or publishable media');
   }
 }
 
