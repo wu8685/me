@@ -37,6 +37,13 @@ export type {
   SourceKind,
   TranscriptSegment,
 } from './ingest/contracts.ts';
+export {
+  finalizeIngest,
+  type BacklinkSuggestion,
+  type FinalizeFileOperations,
+  type FinalizeInput,
+  type FinalizeResult,
+} from './ingest/finalize.ts';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
