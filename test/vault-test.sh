@@ -271,15 +271,37 @@ test_ingest_docs_rich_media() {
     return 1
   fi
 
-  local credential_matches unexpected_credentials
-  credential_matches=$(rg -n -o -i --glob '!vault-test.sh' \
-    'Authorization:[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9_./+=-]+|Cookie:[[:space:]]*sid=[A-Za-z0-9_./+=-]+|X-Token:[[:space:]]*[A-Za-z0-9_./+=-]+|(?:cookie|authorization|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*[^[:space:],;]{12,}|(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{12,}' \
+  # PRIVACY_SELF_PROBE Authorization: Bearer test-runner-self-probe
+  local credential_matches unexpected_credentials credential_pattern
+  local runner_probe_value redaction_auth_value redaction_cookie_value redaction_token_value
+  local self_probe_matches credential_match
+  runner_probe_value="Authoriza""tion: Bearer test-runner-self-probe"
+  redaction_auth_value="Authoriza""tion: Bearer top-secret"
+  redaction_cookie_value="Coo""kie: sid=super-secret"
+  redaction_token_value="X-To""ken: token-secret"
+  credential_pattern='Authoriza''tion:[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9_./+=-]+|Coo''kie:[[:space:]]*sid=[A-Za-z0-9_./+=-]+|X-To''ken:[[:space:]]*[A-Za-z0-9_./+=-]+|(?:coo''kie|authoriza''tion|to''ken|api[_-]?key)[[:space:]]*[:=][[:space:]]*[^[:space:],;]{12,}|(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{12,}'
+  credential_matches=$(rg -n -o -i \
+    "$credential_pattern" \
     "${public_paths[@]}" || true)
-  unexpected_credentials=$(echo "$credential_matches" \
-    | grep -vE '/test/ingest-command\.test\.ts:[0-9]+:Authorization: Bearer top-secret$' \
-    | grep -vE '/test/ingest-command\.test\.ts:[0-9]+:Cookie: sid=super-secret$' \
-    | grep -vE '/test/ingest-command\.test\.ts:[0-9]+:X-Token: token-secret$' \
+  self_probe_matches=$(echo "$credential_matches" \
+    | grep -F "$PLUGIN_ROOT/test/vault-test.sh:" \
+    | grep -F ":$runner_probe_value" \
     || true)
+  if [ "$(echo "$self_probe_matches" | grep -c .)" -ne 1 ]; then
+    echo -e "    ${RED}FAIL${NC}: privacy runner did not scan its own credential self-probe"
+    return 1
+  fi
+  unexpected_credentials=""
+  while IFS= read -r credential_match; do
+    [ -z "$credential_match" ] && continue
+    case "$credential_match" in
+      "$PLUGIN_ROOT/test/ingest-command.test.ts:"*":$redaction_auth_value") ;;
+      "$PLUGIN_ROOT/test/ingest-command.test.ts:"*":$redaction_cookie_value") ;;
+      "$PLUGIN_ROOT/test/ingest-command.test.ts:"*":$redaction_token_value") ;;
+      "$PLUGIN_ROOT/test/vault-test.sh:"*":$runner_probe_value") ;;
+      *) unexpected_credentials+="${unexpected_credentials:+$'\n'}$credential_match" ;;
+    esac
+  done <<< "$credential_matches"
   if [ -n "$unexpected_credentials" ]; then
     echo "$unexpected_credentials"
     echo -e "    ${RED}FAIL${NC}: public artifacts contain a non-allowlisted credential-shaped value"
