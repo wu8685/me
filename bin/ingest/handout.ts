@@ -35,7 +35,6 @@ interface Section {
 const MIN_TOPIC_SECONDS = 5 * 60;
 const TARGET_TOPIC_SECONDS = 8 * 60;
 const MAX_TOPIC_SECONDS = 12 * 60;
-const EPSILON = 0.001;
 
 function formatTime(seconds: number): string {
   const value = Math.max(0, Math.floor(seconds));
@@ -58,10 +57,6 @@ function validDuration(source: ExtractedSource): number {
   );
 }
 
-function sameTime(left: number, right: number): boolean {
-  return Math.abs(left - right) <= EPSILON;
-}
-
 function validateTopicHeadings(headings: TopicHeading[], duration: number): TopicHeading[] {
   if (headings.length === 0) return [];
   for (const [index, heading] of headings.entries()) {
@@ -71,24 +66,24 @@ function validateTopicHeadings(headings: TopicHeading[], duration: number): Topi
     if (heading.start >= heading.end) {
       throw new Error(`topic heading ${index + 1} range must satisfy start < end`);
     }
-    if (heading.end > duration + EPSILON) {
+    if (heading.end > duration) {
       throw new Error(`topic heading ${index + 1} range exceeds source duration`);
     }
     if (!heading.title.trim()) throw new Error(`topic heading ${index + 1} title is empty`);
-    if (index === 0 && !sameTime(heading.start, 0)) {
+    if (index === 0 && heading.start !== 0) {
       throw new Error('topic heading ranges must start at zero and be continuous');
     }
     if (index > 0) {
       const previous = headings[index - 1];
-      if (heading.start < previous.end - EPSILON) {
+      if (heading.start < previous.end) {
         throw new Error('topic heading ranges overlap');
       }
-      if (!sameTime(heading.start, previous.end)) {
+      if (heading.start !== previous.end) {
         throw new Error('topic heading ranges must be continuous');
       }
     }
   }
-  if (!sameTime(headings[headings.length - 1].end, duration)) {
+  if (headings[headings.length - 1].end !== duration) {
     throw new Error('topic heading ranges must end at source duration and be continuous');
   }
   return headings.map(heading => ({ ...heading, title: heading.title.trim() }));
@@ -129,7 +124,9 @@ function fallbackTopicHeadings(transcript: TranscriptSegment[], duration: number
 
     if (!chosen) {
       const hardCandidates = boundaries.filter(({ time }) =>
-        time > start && time - start <= MAX_TOPIC_SECONDS);
+        time - start >= MIN_TOPIC_SECONDS
+        && time - start <= MAX_TOPIC_SECONDS
+        && duration - time >= MIN_TOPIC_SECONDS);
       chosen = [...hardCandidates].sort((left, right) =>
         Math.abs((left.time - start) - TARGET_TOPIC_SECONDS)
           - Math.abs((right.time - start) - TARGET_TOPIC_SECONDS)
@@ -137,7 +134,7 @@ function fallbackTopicHeadings(transcript: TranscriptSegment[], duration: number
     }
     const end = chosen?.time
       ?? Math.min(start + TARGET_TOPIC_SECONDS, duration - MIN_TOPIC_SECONDS);
-    if (end <= start + EPSILON) break;
+    if (end <= start) break;
     result.push({ start, end, title: `主题 ${result.length + 1}` });
     start = end;
   }
@@ -152,15 +149,13 @@ function segmentIsValid(segment: TranscriptSegment, duration: number): boolean {
     && Number.isFinite(segment.end)
     && segment.start >= 0
     && segment.start < segment.end
-    && segment.end <= duration + EPSILON
+    && segment.start < duration
+    && segment.end <= duration
     && Boolean(segment.text.trim());
 }
 
 function findSection(sections: Section[], timestamp: number): Section | undefined {
-  return sections.find((section, index) =>
-    timestamp >= section.start
-      && (timestamp < section.end
-        || (index === sections.length - 1 && timestamp === section.end)));
+  return sections.find(section => timestamp >= section.start && timestamp < section.end);
 }
 
 function assignContent(

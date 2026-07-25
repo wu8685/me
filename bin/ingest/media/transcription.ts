@@ -149,16 +149,16 @@ function createMlxWhisperProvider(
     id: 'mlx-whisper',
     available: () => true,
     transcribe(inputPath, outputDir) {
-      fs.mkdirSync(outputDir, { recursive: true });
-      const before = jsonFiles(outputDir);
-      const modelPath = options.mlxWhisperModelPath ?? process.env.ME_MLX_WHISPER_MODEL;
-      const args = [
-        inputPath,
-        '--output-dir', outputDir,
-        '--output-format', 'json',
-        ...(modelPath ? ['--model', modelPath] : []),
-      ];
       try {
+        fs.mkdirSync(outputDir, { recursive: true });
+        const before = jsonFiles(outputDir);
+        const modelPath = options.mlxWhisperModelPath ?? process.env.ME_MLX_WHISPER_MODEL;
+        const args = [
+          inputPath,
+          '--output-dir', outputDir,
+          '--output-format', 'json',
+          ...(modelPath ? ['--model', modelPath] : []),
+        ];
         const result = runner.run(resolvedExecutable, args, { timeoutMs: 1800000 });
         if (result.status !== 0) throw new Error('non-zero status');
         const basename = path.basename(inputPath, path.extname(inputPath));
@@ -179,14 +179,12 @@ function createWhisperCppProvider(
     id: 'whisper-cpp',
     available: () => true,
     transcribe(inputPath, outputDir) {
-      fs.mkdirSync(outputDir, { recursive: true });
-      const modelPath = options.whisperCppModelPath ?? process.env.ME_WHISPER_MODEL;
-      if (!modelPath) {
-        throw new Error('whisper-cpp model is not configured');
-      }
-      const before = jsonFiles(outputDir);
-      const outputBase = path.join(outputDir, 'transcript');
       try {
+        fs.mkdirSync(outputDir, { recursive: true });
+        const modelPath = options.whisperCppModelPath ?? process.env.ME_WHISPER_MODEL;
+        if (!modelPath) throw new Error('model is not configured');
+        const before = jsonFiles(outputDir);
+        const outputBase = path.join(outputDir, 'transcript');
         const result = runner.run(resolvedExecutable, [
           '-m', modelPath,
           '-f', inputPath,

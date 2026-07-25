@@ -110,6 +110,30 @@ describe('resolveIngestConfig', () => {
     });
   });
 
+  test('reads only direct children of the root ingest section', () => {
+    const vault = temporaryDirectory('me-ingest-config-');
+    fs.mkdirSync(path.join(vault, '.me'), { recursive: true });
+    fs.writeFileSync(path.join(vault, '.me', 'config.yaml'), [
+      'other:',
+      '  ingest:',
+      '    default_video_mode: raw',
+      'ingest:',
+      '  default_video_mode: transcribe',
+      '  transcription_preference:',
+      '    - whisper-cpp',
+      '  nested:',
+      '    default_video_mode: summarize',
+      '    transcription_preference:',
+      '      - mlx-whisper',
+      '',
+    ].join('\n'));
+
+    expect(resolveIngestConfig(vault)).toEqual({
+      defaultVideoMode: 'transcribe',
+      transcriptionPreference: ['whisper-cpp'],
+    });
+  });
+
   test('rejects an optional profile path outside the vault', () => {
     expect(() => resolveIngestConfig(vaultWithConfig('handout_profile: ../private.md')))
       .toThrow(/outside vault/);
@@ -244,6 +268,28 @@ describe('discoverTranscriptionProvider', () => {
     const provider = discoverTranscriptionProvider(['mlx-whisper'], runner);
     expect(() => provider?.transcribe('/tmp/audio.wav', outputDir)).toThrow(/transcription failed/);
   });
+
+  test('redacts output paths when filesystem preparation fails', () => {
+    const root = temporaryDirectory('me-provider-secret-');
+    const blocker = path.join(root, 'private-blocker');
+    const outputDir = path.join(blocker, 'secret-output');
+    fs.writeFileSync(blocker, 'not a directory');
+    const provider = discoverTranscriptionProvider(
+      ['mlx-whisper'],
+      providerRunner(['mlx-whisper']),
+    );
+
+    let message = '';
+    try {
+      provider?.transcribe('/private/input-secret.wav', outputDir);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toBe('mlx-whisper transcription failed');
+    expect(message).not.toContain(root);
+    expect(message).not.toContain('secret-output');
+    expect(message).not.toContain('input-secret');
+  });
 });
 
 describe('selectHandoutKind', () => {
@@ -257,12 +303,21 @@ describe('selectHandoutKind', () => {
     [[0, undefined], 'missing timestamp'],
     [[0, 0], 'duplicate timestamp'],
     [[94, 0], 'decreasing timestamp'],
+    [[-1, 50], 'negative timestamp'],
+    [[0, 240], 'timestamp at duration'],
   ] as Array<[Array<number | undefined>, string]>)(
     'does not accept slides with a %s',
     (timestamps) => {
       expect(selectHandoutKind(sourceWithMedia('slide', timestamps))).toBe('topic');
     },
   );
+
+  test('does not use slide-driven without a finite duration bound', () => {
+    const source = sourceWithMedia('slide', [0, 94]);
+    delete source.source.durationSec;
+
+    expect(selectHandoutKind(source)).toBe('topic');
+  });
 });
 
 describe('formatHandout', () => {
@@ -285,6 +340,17 @@ describe('formatHandout', () => {
     expect(result.markdown).not.toContain('Key Points');
     expect(result.usedMediaIds).toEqual(['slide-001', 'slide-002', 'slide-003']);
     expect(result.omittedTranscriptSegments).toEqual([]);
+  });
+
+  test('writes local image paths as valid CommonMark destinations', () => {
+    const source = sourceWithMedia('slide', [0, 94]);
+    source.media[0].path = '/tmp/slide 1 (intro).jpg';
+    source.media[1].path = '/tmp/slide > 2.jpg';
+
+    const markdown = formatHandout(source, { topicHeadings: [] }).markdown;
+
+    expect(markdown).toContain('![slide 1](<slides/slide 1 (intro).jpg>)');
+    expect(markdown).toContain('![slide 2](<slides/slide %3E 2.jpg>)');
   });
 
   test('assigns a boundary-crossing segment once by its start timestamp', () => {
@@ -344,7 +410,10 @@ describe('formatHandout', () => {
   test.each([
     [[{ start: -1, end: 320, title: '负数' }], 'non-negative'],
     [[{ start: 0, end: 321, title: '越界' }], 'duration'],
+    [[{ start: 0, end: 320.0005, title: '微小越界' }], 'duration'],
     [[{ start: 0, end: 100, title: '一' }, { start: 99, end: 320, title: '二' }], 'overlap'],
+    [[{ start: 0, end: 100.0005, title: '一' }, { start: 100, end: 320, title: '二' }], 'overlap'],
+    [[{ start: 0, end: 100, title: '一' }, { start: 100.0005, end: 320, title: '二' }], 'continuous'],
     [[{ start: 0, end: 100, title: '一' }, { start: 101, end: 320, title: '二' }], 'continuous'],
   ] as Array<[Array<{ start: number; end: number; title: string }>, string]>)(
     'rejects invalid topic heading ranges: %s',
@@ -383,6 +452,34 @@ describe('formatHandout', () => {
     expect(markdown).toContain('## §1 · 00:00–07:01 · 主题 1');
     expect(markdown).toContain('## §2 · 07:01–12:01 · 主题 2');
     expect(markdown.match(/一个不可拆分的长片段。/g)).toHaveLength(1);
+  });
+
+  test('ignores a hard pause candidate that would create a sub-five-minute tail', () => {
+    const source = sourceWithMedia('frame', [], [
+      { start: 0, end: 699, text: '长段落。' },
+      { start: 700, end: 721, text: '尾段。' },
+    ], 721);
+    const markdown = formatHandout(source, { topicHeadings: [] }).markdown;
+
+    expect(markdown).toContain('## §1 · 00:00–07:01 · 主题 1');
+    expect(markdown).toContain('## §2 · 07:01–12:01 · 主题 2');
+    expect(markdown).not.toContain('## §1 · 00:00–11:40');
+  });
+
+  test('omits transcript and media exactly at or beyond duration', () => {
+    const source = sourceWithMedia('frame', [320], [
+      { start: 319, end: 320.0005, text: '结束时间越界。' },
+      { start: 320, end: 321, text: '起点位于 duration。' },
+    ], 320);
+
+    const result = formatHandout(source, {
+      topicHeadings: [{ start: 0, end: 320, title: '主题' }],
+    });
+
+    expect(result.markdown).not.toContain('结束时间越界。');
+    expect(result.markdown).not.toContain('起点位于 duration。');
+    expect(result.omittedTranscriptSegments).toEqual([0, 1]);
+    expect(result.usedMediaIds).toEqual([]);
   });
 
   test('reports transcript segments that cannot fit inside the declared duration', () => {

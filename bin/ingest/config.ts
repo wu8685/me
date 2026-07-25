@@ -102,16 +102,21 @@ interface ParsedIngestConfig {
 
 function parseIngestSection(text: string): ParsedIngestConfig {
   const lines = text.split(/\r?\n/);
-  const start = lines.findIndex(line => /^\s*ingest\s*:\s*(?:#.*)?$/.test(line));
+  const start = lines.findIndex(line => /^ingest\s*:\s*(?:#.*)?$/.test(line));
   if (start < 0) return {};
-  const rootIndent = lines[start].match(/^\s*/)?.[0].length ?? 0;
+  const directIndent = lines
+    .slice(start + 1)
+    .find(line => line.trim() && !/^\s*#/.test(line))
+    ?.match(/^\s*/)?.[0].length;
+  if (!directIndent) return {};
   const section: ParsedIngestConfig = {};
 
   for (let index = start + 1; index < lines.length; index += 1) {
     const line = lines[index];
     if (!line.trim() || /^\s*#/.test(line)) continue;
     const indent = line.match(/^\s*/)?.[0].length ?? 0;
-    if (indent <= rootIndent) break;
+    if (indent === 0) break;
+    if (indent !== directIndent) continue;
     const entry = line.match(/^\s*([a-z_]+)\s*:\s*(.*?)\s*$/);
     if (!entry) continue;
     const [, key, rawValue] = entry;
@@ -135,7 +140,7 @@ function parseIngestSection(text: string): ParsedIngestConfig {
         if (!itemLine.trim() || /^\s*#/.test(itemLine)) continue;
         const itemIndent = itemLine.match(/^\s*/)?.[0].length ?? 0;
         const item = itemLine.match(/^\s*-\s*(.*?)\s*$/);
-        if (itemIndent <= indent || !item) {
+        if (itemIndent <= directIndent || !item) {
           index -= 1;
           break;
         }
