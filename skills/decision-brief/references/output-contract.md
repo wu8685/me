@@ -73,4 +73,7 @@ worst acceptable outcome；列出会影响建议的 Assumption 和 Unknown]
 Add or remove option blocks as needed, but every viable option must include
 收益、成本与机会成本、风险、依赖、可逆性、胜出信号和出局信号。When evidence
 is insufficient, use **暂不决策** in the conclusion and identify the smallest
-fact or experiment that could unlock the decision.
+fact or experiment that could unlock the decision. A blocked brief must not
+recommend an option or interim direction: `推荐理由` explains why no direction is
+supportable, and `最小验证实验` gathers the missing fact without prescribing the
+status quo, delay, or “先不要 X.”

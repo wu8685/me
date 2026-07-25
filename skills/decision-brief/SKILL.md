@@ -29,9 +29,12 @@ Success signals | Worst acceptable outcome
 
 Ask at most one question, and only when the missing answer could change the
 direction. If decisive constraints are unavailable, return **暂不决策** and name
-the smallest missing information. For a reversible decision, state a reasonable
-Assumption and continue toward a small experiment. Never record an unconfirmed
-assumption as a user preference.
+the smallest missing information. This gate permits no interim direction: do
+not select the status quo, say “先不要 X,” or re-label delay as a reversible
+experiment. A separate safety rule may still require immediate action. For a
+reversible decision that is not blocked, state a reasonable Assumption and
+continue toward a small experiment. Never record an unconfirmed assumption as
+a user preference.
 
 ## Retrieve evidence
 
@@ -117,9 +120,11 @@ Apply these gates:
 
 Do not manufacture support for a preferred option. A named thinker or framework
 is relevant only when the current vault or valid Profile activates it and it
-materially improves the analysis. Never package an external source's unstated
-conclusion as a quotation or Fact. Confidence follows evidence quality,
-relevance, and recency—not source count.
+materially improves the analysis. With no activation, do not name, emulate, or
+offer a thinker as an “if you insist” fallback; report no framework hit and use
+generic analysis. Never package an external source's unstated conclusion as a
+quotation or Fact. Confidence follows evidence quality, relevance, and
+recency—not source count.
 
 For a complete brief, read
 [`references/output-contract.md`](references/output-contract.md) and preserve

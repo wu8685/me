@@ -3203,7 +3203,8 @@ decision_brief_has_structure_contract() {
 
 decision_brief_public_is_clean() {
   local dir="$1"
-  local forbidden='brain-spark|/Users/|optimuswu8685|小鹅通'
+  local forbidden
+  forbidden="brain""-spark|/""Users/|optimus""wu8685|小鹅""通"
 
   [ -d "$dir" ] &&
     ! grep -RIlE -- "$forbidden" "$dir" >/dev/null 2>&1
@@ -3259,7 +3260,7 @@ test_decision_brief_public_privacy() {
 
   mkdir -p "$safe" "$private"
   printf '%s\n' 'Portable public decision guidance.' > "$safe/SKILL.md"
-  printf '%s\n' 'Private profile: /Users/example/private-profile.md' > "$private/SKILL.md"
+  printf '%s\n' 'Private profile: /''Users/example/private-profile.md' > "$private/SKILL.md"
 
   if ! decision_brief_public_is_clean "$safe"; then
     echo -e "    ${RED}FAIL${NC}: privacy validator rejected a public fixture"
