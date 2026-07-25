@@ -28,6 +28,19 @@ test('loads a valid bundle with normalized asset paths', () => {
   expect(source.media[0].path).toBe(fixture('bundle-valid/assets/slide-001.txt'));
 });
 
+test('accepts http(s) source URLs', () => {
+  expect(validateSourceBundle(bundle({ source: { url: 'https://example.com/source', kind: 'article', title: 'Source' } }), fixture('bundle-valid')).source.url)
+    .toBe('https://example.com/source');
+});
+
+test.each([
+  { source: { url: 'file:///Users/name/private', kind: 'article', title: 'Source' } },
+  { source: { url: 'https://example.com/source', kind: 'article', title: 'Source', localPath: '/Users/name/private' } },
+  { media: [{ id: 'm1', kind: 'image', localPath: '/Users/name/private' }] },
+])('rejects local absolute paths in URL or unknown fields', invalid => {
+  expect(() => validateSourceBundle(bundle(invalid), fixture('bundle-valid'))).toThrow(BundleValidationError);
+});
+
 test.each(['../outside.jpg', '/tmp/secret.jpg'])('rejects unsafe media path %s', unsafe => {
   expect(() => validateSourceBundle(bundle({ media: [{ id: 'm1', kind: 'image', path: unsafe }] }), fixture('bundle-valid')))
     .toThrow(BundleValidationError);
@@ -58,6 +71,12 @@ test('rejects duplicate block or media IDs and unresolved media references', () 
   });
 
   expect(() => validateSourceBundle(invalid, fixture('bundle-valid'))).toThrow(BundleValidationError);
+});
+
+test('rejects an empty block mediaId', () => {
+  expect(() => validateSourceBundle(bundle({
+    blocks: [{ id: 'b1', kind: 'paragraph', markdown: 'Body', mediaId: '' }],
+  }), fixture('bundle-valid'))).toThrow(/mediaId/i);
 });
 
 test('rejects media resources that do not exist within the bundle', () => {

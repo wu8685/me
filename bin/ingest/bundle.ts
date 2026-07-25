@@ -63,6 +63,36 @@ function requireUniqueId(id: string, ids: Set<string>, label: string, issues: st
   ids.add(id);
 }
 
+function rejectUnknownKeys(value: RecordValue, allowed: string[], label: string, issues: string[]): void {
+  const allowedKeys = new Set(allowed);
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.has(key)) issues.push(`${label} contains unknown field: ${key}`);
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function requireHttpUrl(value: unknown, label: string, issues: string[]): value is string {
+  if (!requireString(value, label, issues)) return false;
+  if (!isHttpUrl(value)) {
+    issues.push(`${label} must be an http(s) URL`);
+    return false;
+  }
+  return true;
+}
+
+function optionalString(value: unknown, label: string, issues: string[]): string | undefined {
+  if (value === undefined) return undefined;
+  return requireString(value, label, issues) ? value : undefined;
+}
+
 function rejectForbiddenKeys(value: unknown, issues: string[], seen = new WeakSet<object>()): void {
   if (typeof value !== 'object' || value === null || seen.has(value)) return;
   seen.add(value);
@@ -75,16 +105,26 @@ function rejectForbiddenKeys(value: unknown, issues: string[], seen = new WeakSe
 function validateSource(value: unknown, issues: string[]): ExtractedSource['source'] | undefined {
   const source = requireRecord(value, 'source', issues);
   if (!source) return undefined;
-  const url = requireString(source.url, 'source.url', issues) ? source.url : '';
+  rejectUnknownKeys(source, ['url', 'canonicalUrl', 'kind', 'title', 'author', 'publishedAt', 'language', 'durationSec'], 'source', issues);
+  const url = requireHttpUrl(source.url, 'source.url', issues) ? source.url : '';
   const title = requireString(source.title, 'source.title', issues) ? source.title : '';
   const kind = source.kind;
   if (typeof kind !== 'string' || !SOURCE_KINDS.has(kind)) issues.push('source.kind is invalid');
-  if (source.canonicalUrl !== undefined && typeof source.canonicalUrl !== 'string') issues.push('source.canonicalUrl must be a string');
-  if (source.author !== undefined && typeof source.author !== 'string') issues.push('source.author must be a string');
-  if (source.publishedAt !== undefined && typeof source.publishedAt !== 'string') issues.push('source.publishedAt must be a string');
-  if (source.language !== undefined && typeof source.language !== 'string') issues.push('source.language must be a string');
+  const canonicalUrl = source.canonicalUrl === undefined ? undefined : (requireHttpUrl(source.canonicalUrl, 'source.canonicalUrl', issues) ? source.canonicalUrl : undefined);
+  const author = optionalString(source.author, 'source.author', issues);
+  const publishedAt = optionalString(source.publishedAt, 'source.publishedAt', issues);
+  const language = optionalString(source.language, 'source.language', issues);
   if (source.durationSec !== undefined && (typeof source.durationSec !== 'number' || !Number.isFinite(source.durationSec))) issues.push('source.durationSec must be a finite number');
-  return { ...source, url, title, kind: kind as ExtractedSource['source']['kind'] } as ExtractedSource['source'];
+  return {
+    url,
+    ...(canonicalUrl === undefined ? {} : { canonicalUrl }),
+    kind: kind as ExtractedSource['source']['kind'],
+    title,
+    ...(author === undefined ? {} : { author }),
+    ...(publishedAt === undefined ? {} : { publishedAt }),
+    ...(language === undefined ? {} : { language }),
+    ...(source.durationSec === undefined ? {} : { durationSec: source.durationSec as number }),
+  };
 }
 
 function validateBlocks(value: unknown, issues: string[]): SourceBlock[] {
@@ -95,13 +135,20 @@ function validateBlocks(value: unknown, issues: string[]): SourceBlock[] {
   const ids = new Set<string>();
   return value.map((item, index) => {
     const block = requireRecord(item, `blocks[${index}]`, issues) ?? {};
+    rejectUnknownKeys(block, ['id', 'kind', 'markdown', 'mediaId', 'page'], `blocks[${index}]`, issues);
     const id = requireString(block.id, `blocks[${index}].id`, issues) ? block.id : '';
     requireUniqueId(id, ids, 'block', issues);
     if (typeof block.kind !== 'string' || !BLOCK_KINDS.has(block.kind)) issues.push(`blocks[${index}].kind is invalid`);
     const markdown = requireString(block.markdown, `blocks[${index}].markdown`, issues) ? block.markdown : '';
-    if (block.mediaId !== undefined && typeof block.mediaId !== 'string') issues.push(`blocks[${index}].mediaId must be a string`);
+    const mediaId = optionalString(block.mediaId, `blocks[${index}].mediaId`, issues);
     if (block.page !== undefined && (!Number.isInteger(block.page) || block.page < 1)) issues.push(`blocks[${index}].page must be a positive integer`);
-    return { ...block, id, markdown } as SourceBlock;
+    return {
+      id,
+      kind: block.kind as SourceBlock['kind'],
+      markdown,
+      ...(mediaId === undefined ? {} : { mediaId }),
+      ...(block.page === undefined ? {} : { page: block.page as number }),
+    };
   });
 }
 
@@ -115,11 +162,16 @@ function validateMedia(value: unknown, bundleDir: string, issues: string[]): Med
   const ids = new Set<string>();
   return value.map((item, index) => {
     const media = requireRecord(item, `media[${index}]`, issues) ?? {};
+    rejectUnknownKeys(media, ['id', 'kind', 'path', 'url', 'alt', 'caption', 'timestampSec', 'page'], `media[${index}]`, issues);
     const id = requireString(media.id, `media[${index}].id`, issues) ? media.id : '';
     requireUniqueId(id, ids, 'media', issues);
     if (typeof media.kind !== 'string' || !MEDIA_KINDS.has(media.kind)) issues.push(`media[${index}].kind is invalid`);
-    if (media.url !== undefined && typeof media.url !== 'string') issues.push(`media[${index}].url must be a string`);
-    let assetPath = media.path;
+    const url = media.url === undefined ? undefined : (requireHttpUrl(media.url, `media[${index}].url`, issues) ? media.url : undefined);
+    const alt = optionalString(media.alt, `media[${index}].alt`, issues);
+    const caption = optionalString(media.caption, `media[${index}].caption`, issues);
+    if (media.timestampSec !== undefined && (typeof media.timestampSec !== 'number' || !Number.isFinite(media.timestampSec))) issues.push(`media[${index}].timestampSec must be a finite number`);
+    if (media.page !== undefined && (!Number.isInteger(media.page) || media.page < 1)) issues.push(`media[${index}].page must be a positive integer`);
+    let assetPath: string | undefined = media.path === undefined ? undefined : media.path as string;
     if (assetPath !== undefined) {
       if (typeof assetPath !== 'string' || assetPath.length === 0) {
         issues.push(`media[${index}].path must be a non-empty string`);
@@ -139,7 +191,16 @@ function validateMedia(value: unknown, bundleDir: string, issues: string[]): Med
         }
       }
     }
-    return { ...media, id, path: assetPath } as MediaAsset;
+    return {
+      id,
+      kind: media.kind as MediaAsset['kind'],
+      ...(assetPath === undefined ? {} : { path: assetPath }),
+      ...(url === undefined ? {} : { url }),
+      ...(alt === undefined ? {} : { alt }),
+      ...(caption === undefined ? {} : { caption }),
+      ...(media.timestampSec === undefined ? {} : { timestampSec: media.timestampSec as number }),
+      ...(media.page === undefined ? {} : { page: media.page as number }),
+    };
   });
 }
 
@@ -152,6 +213,7 @@ function validateTranscript(value: unknown, issues: string[]): TranscriptSegment
   let previousEnd = 0;
   return value.map((item, index) => {
     const segment = requireRecord(item, `transcript[${index}]`, issues) ?? {};
+    rejectUnknownKeys(segment, ['start', 'end', 'text', 'speaker'], `transcript[${index}]`, issues);
     const start = segment.start;
     const end = segment.end;
     if (typeof start !== 'number' || !Number.isFinite(start) || typeof end !== 'number' || !Number.isFinite(end) || start < 0 || start >= end) {
@@ -161,18 +223,19 @@ function validateTranscript(value: unknown, issues: string[]): TranscriptSegment
     }
     if (typeof end === 'number' && Number.isFinite(end)) previousEnd = end;
     const text = requireString(segment.text, `transcript[${index}].text`, issues) ? segment.text : '';
-    if (segment.speaker !== undefined && typeof segment.speaker !== 'string') issues.push(`transcript[${index}].speaker must be a string`);
-    return { ...segment, start, end, text } as TranscriptSegment;
+    const speaker = optionalString(segment.speaker, `transcript[${index}].speaker`, issues);
+    return { start: start as number, end: end as number, text, ...(speaker === undefined ? {} : { speaker }) };
   });
 }
 
 function validateProvenance(value: unknown, issues: string[]): ExtractedSource['provenance'] | undefined {
   const provenance = requireRecord(value, 'provenance', issues);
   if (!provenance) return undefined;
+  rejectUnknownKeys(provenance, ['extractor', 'extractedAt', 'methods'], 'provenance', issues);
   const extractor = requireString(provenance.extractor, 'provenance.extractor', issues) ? provenance.extractor : '';
   const extractedAt = requireString(provenance.extractedAt, 'provenance.extractedAt', issues) ? provenance.extractedAt : '';
   if (!Array.isArray(provenance.methods) || provenance.methods.some(method => typeof method !== 'string')) issues.push('provenance.methods must be an array of strings');
-  return { ...provenance, extractor, extractedAt, methods: Array.isArray(provenance.methods) ? provenance.methods as string[] : [] };
+  return { extractor, extractedAt, methods: Array.isArray(provenance.methods) ? provenance.methods as string[] : [] };
 }
 
 function validateWarnings(value: unknown, issues: string[]): SourceBundleV1['warnings'] {
@@ -182,10 +245,11 @@ function validateWarnings(value: unknown, issues: string[]): SourceBundleV1['war
   }
   return value.map((item, index) => {
     const warning = requireRecord(item, `warnings[${index}]`, issues) ?? {};
+    rejectUnknownKeys(warning, ['code', 'message', 'mediaId'], `warnings[${index}]`, issues);
     const code = requireString(warning.code, `warnings[${index}].code`, issues) ? warning.code : '';
     const message = requireString(warning.message, `warnings[${index}].message`, issues) ? warning.message : '';
-    if (warning.mediaId !== undefined && typeof warning.mediaId !== 'string') issues.push(`warnings[${index}].mediaId must be a string`);
-    return { ...warning, code, message } as SourceBundleV1['warnings'][number];
+    const mediaId = optionalString(warning.mediaId, `warnings[${index}].mediaId`, issues);
+    return { code, message, ...(mediaId === undefined ? {} : { mediaId }) };
   });
 }
 
