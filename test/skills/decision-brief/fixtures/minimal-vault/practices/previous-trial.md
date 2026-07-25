@@ -4,7 +4,7 @@ created: 2026-01-05
 tags: [agent-orchestration, experiment, fictional-project]
 type: experiment
 source: "[[source-note]]"
-project: "[[Orchid Relay]]"
+project: "Orchid Relay"
 ---
 
 # Orchid Relay Queue Trial
