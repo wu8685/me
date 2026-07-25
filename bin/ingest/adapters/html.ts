@@ -95,6 +95,7 @@ export function extractHtmlSource(runner: CommandRunner, url: URL, originalUrl =
 export function createHtmlAdapter(runner: CommandRunner): SourceAdapter {
   return {
     id: 'html',
+    fallback: true,
     matches: () => true,
     async probe(): Promise<CapabilityReport> {
       return {

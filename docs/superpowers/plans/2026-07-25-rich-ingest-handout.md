@@ -170,7 +170,9 @@ export interface CapabilityReport {
 export interface ExtractContext { vaultDir: string; mode?: ExtractMode; tempDir?: string }
 export interface SourceAdapter {
   id: string;
+  fallback?: boolean;
   matches(url: URL): boolean;
+  matchesContentType?(contentType: string): boolean;
   probe(context: ExtractContext & { url: URL }): Promise<CapabilityReport>;
   extract(context: ExtractContext & { url: URL }): Promise<ExtractedSource>;
 }
@@ -178,7 +180,7 @@ export interface SourceAdapter {
 
 - [ ] **Step 4: 实现 registry，并统一测试中的签名**
 
-`registry.ts` 必须只选择第一个匹配 adapter；一旦选中，`probe` 或 `extract` 失败就包装成包含 `adapterId` 与原始原因的错误，不继续尝试后续 adapter。
+`registry.ts` 的 `match(url)` 保持同步，选择第一个 URL 匹配 adapter；新增异步 `resolve(url)`。仅当 `match(url)` 的 adapter 标记 `fallback: true` 时，`resolve` 才调用注入的 Content-Type resolver，并用 `matchesContentType(contentType)` 选择更具体 adapter。resolver 失败、为空或未知时必须保留 fallback；非 fallback 的 Bilibili/X/.pdf URL 命中不得探测 Content-Type。`probe` / `extract` 必须使用 `resolve`，并在明确 adapter 的失败时包装成包含 `adapterId` 与原始原因的错误，不继续尝试后续 adapter。
 
 - [ ] **Step 5: 运行新旧单元测试**
 
@@ -704,9 +706,9 @@ interface IngestCliOptions {
 
 拒绝未知 mode、URL+Bundle 同时出现、缺少 flag 值、非法 topic、vault 外 Profile。`--processed-markdown` 只允许与 `--write` 同用，文件必须位于 `<vault>/.me/tmp/`；读取后由 finalizer 校验结构并删除临时文件。这样 Skill 可以先校订讲义，再由统一 finalizer 落盘。
 
-- [ ] **Step 4: 注册 adapter**
+- [ ] **Step 4: 注册 adapter 与 Content-Type resolver**
 
-顺序固定为 `Bilibili → X → PDF → HTML`。URL 先 `probe` 再 `extract`；blocked 直接返回结构化错误。Bundle 跳过 registry，从 `loadSourceBundle` 进入同一 mode/handout/finalizer。
+顺序固定为 `Bilibili → X → PDF → HTML`。构造 registry 时注入由 `defaultCommandRunner` 驱动的 Content-Type resolver（`curl -sS -L --fail --max-time 15 -I -o /dev/null -w %{content_type} <url>`，全部走 argv）；URL 必须通过 `registry.probe` / `registry.extract` 的异步 `resolve` 路径，而不是直接固定 `match(url)`。这保证 suffixless 的 `application/pdf` 选择 PDF，`text/html` 或失败/未知 Content-Type 保留 HTML fallback。blocked 直接返回结构化错误。Bundle 跳过 registry，从 `loadSourceBundle` 进入同一 mode/handout/finalizer。
 
 - [ ] **Step 5: 保持 preview JSON 兼容**
 

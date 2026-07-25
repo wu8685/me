@@ -52,7 +52,10 @@ export interface CapabilityReport {
 export interface ExtractContext { vaultDir: string; mode?: ExtractMode; tempDir?: string }
 export interface SourceAdapter {
   id: string;
+  /** The generic adapter used only when no source-specific URL or Content-Type route matches. */
+  fallback?: boolean;
   matches(url: URL): boolean;
+  matchesContentType?(contentType: string): boolean;
   probe(context: ExtractContext & { url: URL }): Promise<CapabilityReport>;
   extract(context: ExtractContext & { url: URL }): Promise<ExtractedSource>;
 }

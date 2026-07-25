@@ -5,7 +5,7 @@ import * as path from 'path';
 import type { CommandResult, CommandRunner } from '../bin/ingest/command.ts';
 import { createHtmlAdapter } from '../bin/ingest/adapters/html.ts';
 import { createBilibiliAdapter } from '../bin/ingest/adapters/bilibili.ts';
-import { createPdfAdapter, parsePdftohtmlXml } from '../bin/ingest/adapters/pdf.ts';
+import { createPdfAdapter, parsePdftohtmlXml, probePdfContentType } from '../bin/ingest/adapters/pdf.ts';
 import { extractContent, transcribeBilibili } from '../bin/ingest.ts';
 
 const FIXTURES = path.join(import.meta.dir, 'fixtures', 'ingest');
@@ -142,9 +142,21 @@ test('passes untrusted PDF URLs and Poppler arguments through the argv runner', 
     expect(source.blocks.map((block) => block.kind)).toEqual(['paragraph', 'figure', 'paragraph']);
     expect(source.media[0].path).toBeDefined();
     expect(fs.existsSync(source.media[0].path!)).toBe(true);
+    const figureBlock = source.blocks.find((block) => block.mediaId === source.media[0].id);
+    expect(figureBlock?.markdown).toContain(source.media[0].path!);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test('probes PDF Content-Type through the argv runner without downloading a body', async () => {
+  const runner = recordingRunner({ stdout: 'application/pdf\n' });
+
+  await expect(probePdfContentType(runner, new URL('https://example.com/download?id=42'))).resolves.toBe('application/pdf');
+  expect(runner.calls).toEqual([{
+    command: 'curl',
+    args: ['-sS', '-L', '--fail', '--max-time', '15', '-I', '-o', '/dev/null', '-w', '%{content_type}', 'https://example.com/download?id=42'],
+  }]);
 });
 
 test('passes an untrusted URL as one argv item', async () => {

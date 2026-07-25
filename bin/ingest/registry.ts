@@ -18,7 +18,11 @@ export class AdapterExtractionError extends Error {
   }
 }
 
-export function createAdapterRegistry(adapters: SourceAdapter[]) {
+export interface AdapterRegistryOptions {
+  resolveContentType?: (url: URL) => Promise<string | undefined>;
+}
+
+export function createAdapterRegistry(adapters: SourceAdapter[], options: AdapterRegistryOptions = {}) {
   function match(url: URL): SourceAdapter {
     const adapter = adapters.find((candidate) => candidate.matches(url));
     if (!adapter) {
@@ -27,8 +31,20 @@ export function createAdapterRegistry(adapters: SourceAdapter[]) {
     return adapter;
   }
 
-  async function probe(url: URL, context: ExtractContext): Promise<CapabilityReport> {
+  async function resolve(url: URL): Promise<SourceAdapter> {
     const adapter = match(url);
+    if (!adapter.fallback || !options.resolveContentType) return adapter;
+    try {
+      const contentType = await options.resolveContentType(url);
+      if (!contentType) return adapter;
+      return adapters.find((candidate) => candidate.matchesContentType?.(contentType)) ?? adapter;
+    } catch {
+      return adapter;
+    }
+  }
+
+  async function probe(url: URL, context: ExtractContext): Promise<CapabilityReport> {
+    const adapter = await resolve(url);
     try {
       return await adapter.probe({ ...context, url });
     } catch (cause) {
@@ -37,7 +53,7 @@ export function createAdapterRegistry(adapters: SourceAdapter[]) {
   }
 
   async function extract(url: URL, context: ExtractContext): Promise<ExtractedSource> {
-    const adapter = match(url);
+    const adapter = await resolve(url);
     try {
       return await adapter.extract({ ...context, url });
     } catch (cause) {
@@ -45,5 +61,5 @@ export function createAdapterRegistry(adapters: SourceAdapter[]) {
     }
   }
 
-  return { match, probe, extract };
+  return { match, resolve, probe, extract };
 }

@@ -106,11 +106,15 @@ bin/
 ```ts
 interface SourceAdapter {
   id: string
+  fallback?: boolean
   matches(url: URL): boolean
+  matchesContentType?(contentType: string): boolean
   probe(context: ExtractContext): Promise<CapabilityReport>
   extract(context: ExtractContext): Promise<ExtractedSource>
 }
 ```
+
+`matches(url)` 保持同步，用于 Bilibili、X、`.pdf` 等确定 URL 路由。通用 HTML adapter 标记为 `fallback: true`；只有先命中 fallback 时，registry 才可通过注入的、基于 argv `curl -I` 的 resolver 读取最终响应 `Content-Type`，并用 `matchesContentType()` 选择更具体的 adapter。Content-Type 查询失败、为空或未知时，必须保留 fallback，不能把错误页或未知内容猜成 PDF。
 
 `probe()` 不产生正式 vault 文件。它只报告：
 

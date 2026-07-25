@@ -61,6 +61,10 @@ function isAdjacentCaption(figure: XmlItem, candidate: XmlItem): boolean {
   return verticalGap >= 0 && verticalGap <= 72 && horizontalGap <= 48;
 }
 
+function figureMarkdown(asset: Pick<MediaAsset, 'path' | 'caption'>): string {
+  return `![${asset.caption ?? 'Figure'}](${asset.path ?? ''})`;
+}
+
 /** Convert pdftohtml XML into source-order text and figure blocks. */
 export function parsePdftohtmlXml(xml: string): { blocks: SourceBlock[]; media: MediaAsset[] } {
   const items: XmlItem[] = [];
@@ -106,7 +110,7 @@ export function parsePdftohtmlXml(xml: string): { blocks: SourceBlock[]; media: 
     const caption = next && isAdjacentCaption(item, next) ? next.value : undefined;
     if (caption) captionIndexes.add(index + 1);
     media.push({ id, kind: 'figure', path: item.value, ...(caption ? { caption } : {}), page: item.page });
-    blocks.push({ id: blockId(blocks.length + 1), kind: 'figure', markdown: `![${caption ?? 'Figure'}](${item.value})`, mediaId: id, page: item.page });
+    blocks.push({ id: blockId(blocks.length + 1), kind: 'figure', markdown: figureMarkdown({ path: item.value, caption }), mediaId: id, page: item.page });
   }
 
   return { blocks, media };
@@ -134,6 +138,16 @@ function run(runner: CommandRunner, command: string, args: string[], timeoutMs: 
     const failure = new Error(`${command} failed with exit code ${result.status}`) as Error & { stderr?: string };
     failure.stderr = result.stderr;
     throw failure;
+  }
+}
+
+/** Read the final HTTP Content-Type without downloading the response body. */
+export async function probePdfContentType(runner: CommandRunner, url: URL): Promise<string | undefined> {
+  try {
+    const result = runner.run('curl', ['-sS', '-L', '--fail', '--max-time', '15', '-I', '-o', '/dev/null', '-w', '%{content_type}', url.toString()], { timeoutMs: 18000 });
+    return result.status === 0 ? result.stdout.trim() || undefined : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -196,10 +210,19 @@ function persistFigureAssets(
   return { media: persisted, warnings };
 }
 
+function rewriteFigureBlocks(blocks: SourceBlock[], media: MediaAsset[]): SourceBlock[] {
+  const figures = new Map(media.filter((asset) => asset.kind === 'figure' && asset.path).map((asset) => [asset.id, asset]));
+  return blocks.map((block) => {
+    const figure = block.mediaId ? figures.get(block.mediaId) : undefined;
+    return figure ? { ...block, markdown: figureMarkdown(figure) } : block;
+  });
+}
+
 export function createPdfAdapter(runner: CommandRunner): SourceAdapter {
   return {
     id: 'pdf',
     matches: (url) => /\.pdf$/i.test(url.pathname),
+    matchesContentType: (contentType) => /^application\/pdf(?:\s*;|$)/i.test(contentType),
     async probe(context): Promise<CapabilityReport> {
       const missing = missingDependencies(runner);
       if (missing.length > 0) return reportForMissingDependencies(missing);
@@ -254,7 +277,7 @@ export function createPdfAdapter(runner: CommandRunner): SourceAdapter {
         const figures = persistFigureAssets(media, directory, context);
         return {
           source: { url: context.url.toString(), kind: 'paper', title: sourceTitle(context.url) },
-          blocks,
+          blocks: rewriteFigureBlocks(blocks, figures.media),
           media: figures.media,
           provenance: {
             extractor: 'poppler',
