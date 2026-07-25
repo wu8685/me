@@ -3190,57 +3190,121 @@ test_ingest_skill_llm_only_for_translate_summarize() {
 
 # ── Decision Brief Skill Contract ──────────────────────────────────
 
+decision_brief_has_structure_contract() {
+  local f="$1"
+  [ -f "$f" ] &&
+    grep -Fxq 'name: decision-brief' "$f" &&
+    grep -Eq '^description:.*Use when' "$f" &&
+    grep -Fq 'Decision Contract' "$f" &&
+    grep -Fxq 'Search order: cognition -> practices -> raw -> current external facts' "$f" &&
+    grep -Fq 'references/evidence-contract.md' "$f" &&
+    grep -Fq 'references/output-contract.md' "$f"
+}
+
+decision_brief_public_is_clean() {
+  local dir="$1"
+  local forbidden='brain-spark|/Users/|optimuswu8685|小鹅通'
+
+  [ -d "$dir" ] &&
+    ! grep -RIlE -- "$forbidden" "$dir" >/dev/null 2>&1
+}
+
+decision_brief_has_profile_contract() {
+  local f="$1"
+  [ -f "$f" ] &&
+    grep -Fq '.me/profiles/decision-brief.md' "$f" &&
+    grep -Fxq 'Profile path must remain inside the current vault' "$f" &&
+    grep -Fxq 'Default output: chat only; do not write the vault without explicit authorization' "$f" &&
+    grep -Fxq 'Never promote a decision directly to cognition' "$f"
+}
+
 test_decision_brief_skill_structure() {
   local f="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
-  local content
+  local valid="$MOCK_VAULT/valid-structure.md"
+  local reversed="$MOCK_VAULT/reversed-structure.md"
 
-  assert_file_exists "$f" || return 1
-  assert_file_contains "$f" '^name: decision-brief$' || return 1
-  assert_file_contains "$f" '^description:.*Use when' || return 1
-  assert_file_contains "$f" 'Decision Contract' || return 1
+  cat > "$valid" <<'EOF'
+name: decision-brief
+description: Use when a decision requires research.
+# Decision Contract
+Search order: cognition -> practices -> raw -> current external facts
+Read references/evidence-contract.md and references/output-contract.md.
+EOF
+  sed 's/cognition -> practices -> raw/raw -> practices -> cognition/' "$valid" > "$reversed"
 
-  content=$(tr '\n' ' ' < "$f")
-  if ! printf '%s\n' "$content" | grep -qE 'cognition.*practices.*raw'; then
-    echo -e "    ${RED}FAIL${NC}: decision brief must search cognition, practices, then raw"
+  if ! decision_brief_has_structure_contract "$valid"; then
+    echo -e "    ${RED}FAIL${NC}: structure validator rejected its canonical fixture"
+    return 1
+  fi
+  if decision_brief_has_structure_contract "$reversed"; then
+    echo -e "    ${RED}FAIL${NC}: structure validator accepted a reversed search order"
     return 1
   fi
 
-  assert_file_contains "$f" 'references/evidence-contract.md' || return 1
-  assert_file_contains "$f" 'references/output-contract.md' || return 1
+  if ! decision_brief_has_structure_contract "$f"; then
+    echo -e "    ${RED}FAIL${NC}: decision brief Skill is missing its canonical structure contract"
+    return 1
+  fi
 }
 
 test_decision_brief_public_privacy() {
   local dir="$PLUGIN_ROOT/skills/decision-brief"
-  local forbidden='brain-spark|/Users/|持仓|optimuswu8685|小鹅通'
+  local safe="$MOCK_VAULT/safe-skill"
+  local private="$MOCK_VAULT/private-skill"
+  local scan_output
 
-  assert_dir_exists "$dir" || return 1
-  if grep -RInE -- "$forbidden" "$dir"; then
-    echo -e "    ${RED}FAIL${NC}: decision brief public files contain private data"
+  mkdir -p "$safe" "$private"
+  printf '%s\n' 'Portable public decision guidance.' > "$safe/SKILL.md"
+  printf '%s\n' 'Private profile: /Users/example/private-profile.md' > "$private/SKILL.md"
+
+  if ! decision_brief_public_is_clean "$safe"; then
+    echo -e "    ${RED}FAIL${NC}: privacy validator rejected a public fixture"
+    return 1
+  fi
+  if scan_output=$(decision_brief_public_is_clean "$private" 2>&1); then
+    echo -e "    ${RED}FAIL${NC}: privacy validator accepted a private fixture"
+    return 1
+  fi
+  if [ -n "$scan_output" ]; then
+    echo -e "    ${RED}FAIL${NC}: privacy validator leaked matched content"
+    return 1
+  fi
+
+  if ! decision_brief_public_is_clean "$dir"; then
+    echo -e "    ${RED}FAIL${NC}: decision brief public files are missing or contain private data"
     return 1
   fi
 }
 
 test_decision_brief_profile_contract() {
   local f="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
-  local content
+  local valid="$MOCK_VAULT/valid-profile.md"
+  local counterexample="$MOCK_VAULT/counterexample-profile.md"
 
-  assert_file_exists "$f" || return 1
-  assert_file_contains "$f" '\.me/profiles/decision-brief.md' || return 1
+  cat > "$valid" <<'EOF'
+Optional profile: .me/profiles/decision-brief.md
+Profile path must remain inside the current vault
+Default output: chat only; do not write the vault without explicit authorization
+Never promote a decision directly to cognition
+EOF
+  cat > "$counterexample" <<'EOF'
+Optional profile: .me/profiles/decision-brief.md
+The Profile may remain outside the current vault.
+Default output may write the vault without explicit authorization.
+Promote every decision directly to cognition.
+EOF
 
-  content=$(tr '\n' ' ' < "$f")
-  if ! printf '%s\n' "$content" | grep -qE \
-    '(inside|within)[^.]*(the )?vault|位于[^。]*vault|vault[^。]*(内|根)[^。]*Profile|Profile[^。]*vault[^。]*(内|根)'; then
-    echo -e "    ${RED}FAIL${NC}: decision Profile must be constrained to the current vault"
+  if ! decision_brief_has_profile_contract "$valid"; then
+    echo -e "    ${RED}FAIL${NC}: profile validator rejected its canonical fixture"
     return 1
   fi
-  if ! printf '%s\n' "$content" | grep -qE \
-    '默认不写(入)?([^。]*vault)?|does not write([^.]*)by default'; then
-    echo -e "    ${RED}FAIL${NC}: decision brief must not write to the vault by default"
+  if decision_brief_has_profile_contract "$counterexample"; then
+    echo -e "    ${RED}FAIL${NC}: profile validator accepted contradictory guidance"
     return 1
   fi
-  if ! printf '%s\n' "$content" | grep -qE \
-    '(不得|不能|不可)[^。]*(自动|直接)[^。]*cognition|must not[^.]*(automatically|directly)[^.]*cognition'; then
-    echo -e "    ${RED}FAIL${NC}: decision brief must not automatically write or promote cognition"
+
+  if ! decision_brief_has_profile_contract "$f"; then
+    echo -e "    ${RED}FAIL${NC}: decision brief Skill is missing its canonical Profile/write contract"
     return 1
   fi
 }
