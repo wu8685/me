@@ -548,10 +548,12 @@ interface VaultWriteRequestV1 {
 - 每个 component 非空且不是 `.`/`..`，不得含 `\`、NUL、control character；
 - basename 必须为 `YYYY-MM-DD-kebab-slug.md`，frontmatter `created` 必须与日期
   prefix 一致；
-- stem 必须在三层 vault 内 case-fold 后唯一，防止 Obsidian 与大小写不同 filesystem
-  出现含混链接；
+- request stem 必须是 ASCII lowercase kebab。collision comparison 只做 ASCII fold：
+  两个 basename 都是 ASCII 时把 `A-Z` 映射为 `a-z` 后比较；任一 basename 含
+  non-ASCII 时按原始 Unicode code points exact 比较，不做 Unicode/locale case fold；
 - target 必须不存在。v1 没有 overwrite/force 选项；
-- body 必须非空，Markdown image/link 不能引用 vault 外绝对路径或 traversal path；
+- body 必须非空，Markdown image/link 不能使用绝对路径或在 decode/normalize 后 resolve
+  到 vault 外；contained relative `..` 按 §19.8.1 处理；
 - request 最大 4 MiB；超限在任何 staging 或 target mutation 前拒绝。
 
 ### 19.6 CLI 与 JSON result
@@ -674,11 +676,13 @@ writer 新增自己的 `bin/vault-write/graph.ts`。v1 不修改或依赖既有
 - `.me`、staging、journal、recovery 永远不进入 graph；
 - `README.md` 是 index document：它的 wikilink可形成入链，但它不作为 note 参与
   duplicate-stem、orphan 或 unlinked-mention suggestion；
-- note stem 按 Unicode simple case fold 比较，三层中任何 duplicate 都
-  `DUPLICATE_STEM`，即便所有 link 已 path-qualified；
+- existing note basename collision 使用 §19.5 的 ASCII-only fold/exact-Unicode rule：
+  `Guide`/`guide` 冲突，`Résumé`/`résumé` 不因 case folding 冲突，两个 exact
+  `Résumé` 冲突；
 - graph 可读取 `[[target]]`、`[[target|alias]]`、`[[target#heading]]`、
   `[[target#^block]]`。含 `/` 的 target 按 vault-relative POSIX path exact resolve；
-  basename-only target 只有在全 vault 唯一时可 resolve，否则是 ambiguous/broken；
+  basename-only target 只有按 ASCII-fold/exact-Unicode collision rule 在全 vault
+  唯一时可 resolve，否则是 ambiguous/broken；
 - writer 自己生成的 source/index link 永远使用不带 alias/fragment/`.md` 的
   path-qualified form；
 - backlink count 是同一 source document 的 resolved wikilink 实际出现次数；
@@ -696,14 +700,15 @@ writer 新增自己的 `bin/vault-write/graph.ts`。v1 不修改或依赖既有
 2. 否则固定更新 `{configured-layer-root}/README.md`；
 3. managed entry 始终使用 **vault-relative** path-qualified link，不随 README
    所在目录改变解析基准。例如 target 为
-   `knowledge/practices/decisions/2026-07-26-orchid-choice.md`，README 写
-   `[[knowledge/practices/decisions/2026-07-26-orchid-choice]]`；custom layer
-   `实验记录` 则写 `[[实验记录/decisions/2026-07-26-orchid-choice]]`；
+   default `practices/decisions/2026-07-26-orchid-choice.md`，README 写
+   `[[practices/decisions/2026-07-26-orchid-choice]]`；custom layer
+   `knowledge/practices` 则写
+   `[[knowledge/practices/decisions/2026-07-26-orchid-choice]]`；
 4. managed block 按 normalized target code point 排序：
 
 ```markdown
 <!-- me:index:start -->
-- [[knowledge/practices/decisions/2026-07-26-example]]
+- [[practices/decisions/2026-07-26-example]]
 <!-- me:index:end -->
 ```
 
@@ -742,16 +747,17 @@ writer 对 request Markdown fail closed，只接受：
 - `file:`、`data:`、`javascript:` 或其他 scheme；
 - protocol-relative、absolute/drive/UNC path；
 - local query string、empty destination、control character、NUL、unbalanced destination；
-- local path 的 `.`/`..`、backslash 或 encoded traversal/separator。
+- backslash/encoded backslash、encoded separator，或 normalization 后逃出 vault 的
+  local path。raw/decoded `.` 与 `..` 并非自动非法。
 
 校验 destination path 时先拆 fragment，再对 path component 反复
-`decodeURIComponent` 直至稳定（最多 4 轮）。每轮先拒绝 encoded `/` 或 `\`
-（`%2f/%5c`，case-insensitive），decode 后同时按 `/`/`\` 检查 component；任一轮产生
-`.` 或 `..` component 即拒绝。`%25` 本身不是错误，但必须继续 decode，若最终形成
-encoded separator/dot traversal则拒绝；invalid escape 或第 4 轮后仍会变化也拒绝。
-因此 `file%2emd` 可解析为普通 filename，而 `%2e%2e`、`%252e%252e`、
-`a%2fb`、`a%255cb` 均拒绝。解析后的 local path 必须通过 lexical/canonical
-containment并 exact resolve 到普通 file。Markdown link grammar 与 frontmatter
+`decodeURIComponent` 直至稳定（最多 4 轮）。每轮拒绝 encoded `/` 或 `\`
+（`%2f/%5c`，case-insensitive）；`%25` 必须继续 decode，invalid escape 或第 4 轮后
+仍会变化也拒绝。稳定结果不得含 `\`，随后以 planned note parent 为 base 做 path
+normalization。`../sources/note.md`、`%2e%2e/source.md` 可以接受，但仅当 normalized
+lexical result 仍在 vault、每个 existing prefix canonical contained、final target 是
+contained existing普通 file；越过 vault root 则拒绝。`file%2emd` 可解析为普通
+filename；`a%2fb`/`a%255cb` 因 encoded separator 拒绝。Markdown link grammar 与 frontmatter
 `source` grammar 是两个独立 contract；source 仍只能使用 §19.4 的 path-qualified
 wikilink。
 
@@ -967,25 +973,29 @@ Decision Brief 明确保存阶段性判断时：
    精确算法：
 
 ```ts
-const normalizedTitle = decision
+const normalizedDecision = decision
   .normalize('NFKC')
   .trim()
   .replace(/\p{White_Space}+/gu, ' ')
   .toLowerCase();
-const ascii = normalizedTitle
+const ascii = normalizedDecision
   .replace(/[^a-z0-9]+/g, '-')
   .replace(/^-+|-+$/g, '')
   .slice(0, 60)
   .replace(/-+$/g, '');
 const slug = ascii || `decision-${
-  sha256(Buffer.from(normalizedTitle, 'utf8')).slice(0, 12)
+  createHash('sha256')
+    .update(Buffer.from(normalizedDecision, 'utf8'))
+    .digest('hex')
+    .slice(0, 12)
 }`;
 ```
 
    `.toLowerCase()` 使用 ECMAScript locale-independent mapping，不用
-   `toLocaleLowerCase`。empty/全中文/全符号 title 都按 normalized UTF-8 title hash，
-   不使用 requestDigest。existing path 或 case-fold stem collision 返回 conflict，
-   不自动加 `-2`、重新 hash 或改写别的文件；
+   `toLocaleLowerCase`。empty/全中文/全符号 title 都按 normalized Decision UTF-8
+   bytes使用上面的 exact Node expression，不使用 requestDigest。existing path 或按
+   §19.5 ASCII-fold/exact-Unicode rule 命中的 stem collision 返回 conflict，不自动加
+   `-2`、重新 hash 或改写别的文件；
 4. frontmatter `project` 仅在 Decision Contract 有明确项目时填写 path-qualified
    wikilink/plain string，否则使用 template 允许的 empty string；
 5. 先调用 `preview`，向用户/Agent 暴露 target、index action 和 validation；

@@ -604,7 +604,8 @@ expect(parseVaultWriteRequest({
 
 `test/vault-write-path-safety.test.ts` 创建 default 与 custom layer fixtures，覆盖：
 
-- `layers.practices: knowledge/practices` 正确解析；
+- custom `layers.practices: knowledge/practices` 正确解析；未配置时 default 是
+  `practices`；
 - 缺失 config 使用 raw/practices/cognition defaults；
 - layer traversal、absolute layer、escaping symlink、dangling symlink；
 - layer-layer lexical 与 canonical matrices：equal 或互为 ancestor/descendant 全拒绝；
@@ -775,8 +776,10 @@ string；不依赖未安装的 YAML package。Markdown tests 必须逐项覆盖�
 - reject reference/collapsed/shortcut definitions、HTML/autolink、Obsidian embed、
   remote image、file/data/javascript/unknown scheme、protocol-relative、absolute/UNC/
   drive、local query、empty/control/unbalanced；
-- reject raw/once/twice/4-level percent-encoded dot/slash/backslash traversal，invalid
-  percent 和 decode depth >4；
+- accept raw/once/twice percent-decoded `..` when normalization relative to planned
+  note parent remains inside vault and target exists；reject the same forms when they
+  escape vault；
+- reject encoded slash/backslash、invalid percent 和 decode depth >4；
 - code fence/inline code 中看似非法 destination 不参与 validation。
 - local destination 的 relative base 必须是 `path.dirname(plannedNotePath)`，不是
   process cwd、vault root 或 layer root；default/custom nested target 各测试
@@ -874,7 +877,9 @@ export function validatePostWriteGraph(
 - target title plain-text mention 进入 sorted unlinked suggestions，但已有 backlink 不重复；
 - `.me/tmp/vault-write-*`、recovery、target note 本身不参与 pre-write suggestion。
 - README link 形成入链，但 README 不进入 duplicate/orphan/mention suggestion；
-- 三层 duplicate stem（包括 case-only）fail closed；
+- request stem 非 ASCII lowercase kebab拒绝；existing ASCII basename 用 `A-Z`→`a-z`
+  fold 比较，non-ASCII basename exact code-point 比较：`Guide/guide` 冲突，
+  `Résumé/résumé` 不冲突，exact `Résumé/Résumé` 冲突；
 - escaping/dangling symlink 与 directory enumeration order reversal；
 - backlink count、mention count/offset、path sort 在重复运行中 exact deterministic。
 - mention offsets 是 original file 的 zero-based UTF-8 byte offsets；title exact
@@ -890,10 +895,11 @@ export function validatePostWriteGraph(
 - vault 既有 broken link 不导致无关 write 失败；
 - index bytes 与 plan digest 不一致时失败；
 - suggestions 只返回 vault-relative POSIX paths。
-- managed block 生成 full vault-relative path-qualified link，例如 default target
-  `knowledge/practices/decisions/2026-07-26-orchid-choice.md` 生成
-  `[[knowledge/practices/decisions/2026-07-26-orchid-choice]]`；custom practices
-  `实验记录` 生成 `[[实验记录/decisions/2026-07-26-orchid-choice]]`。不得生成
+- managed block 生成 full vault-relative path-qualified link：default fixture
+  `practices/decisions/2026-07-26-orchid-choice.md` 生成
+  `[[practices/decisions/2026-07-26-orchid-choice]]`；custom fixture
+  `knowledge/practices` 生成
+  `[[knowledge/practices/decisions/2026-07-26-orchid-choice]]`。不得生成
   layer-relative 或 basename-only link。
 
 - [ ] **Step 3: 运行确认 RED**
@@ -1262,7 +1268,7 @@ DW3 要求直接保存为高置信 cognition
 DW4 practices save 遇到 validation_failed
 DW5 practices save 遇到 2 个 operation 的 manual_recovery
 DW6 没有可用 local provenance，只有对话推断或 remote URL
-DW7 deterministic slug path 已存在或 case-fold stem collision
+DW7 deterministic slug path 已存在或命中 ASCII-fold/exact-Unicode collision
 ```
 
 期望：
@@ -1285,17 +1291,22 @@ before/after hash、Agent 关键原话；不得只靠关键词自动评分。
 Contract 的 raw `Decision` string：
 
 ```ts
-const normalizedTitle = decision.normalize('NFKC').trim()
+const normalizedDecision = decision.normalize('NFKC').trim()
   .replace(/\p{White_Space}+/gu, ' ').toLowerCase();
-const ascii = normalizedTitle.replace(/[^a-z0-9]+/g, '-')
+const ascii = normalizedDecision.replace(/[^a-z0-9]+/g, '-')
   .replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, '');
-const slug = ascii || `decision-${sha256(
-  Buffer.from(normalizedTitle, 'utf8')
-).slice(0, 12)}`;
+const slug = ascii || `decision-${
+  createHash('sha256')
+    .update(Buffer.from(normalizedDecision, 'utf8'))
+    .digest('hex')
+    .slice(0, 12)
+}`;
 ```
 
 测试 ASCII、full-width、Unicode whitespace、mixed case、全中文、全符号、empty、
->60 chars；locale 切换不改变结果。fallback 不得使用 requestDigest。Markdown request
+>60 chars；locale 切换不改变结果。fallback 必须是上述 exact Node expression，不得
+使用 requestDigest。collision 使用 Task 8 的 ASCII-fold/exact-Unicode rule且不加
+suffix。Markdown request
 通过 stdin，不写 shell argv；临时 request 需要时只能放 `.me/tmp`。
 
 - [ ] **Step 4: 复测与提交**
