@@ -186,6 +186,11 @@ describe('frontmatter and layer contracts', () => {
     ['deprecated key', note('raw', { date_created: '2026-07-26' })],
     ['YAML alias', note('raw', { title: '*shared' })],
     ['YAML tag', note('raw', { title: '!unsafe value' })],
+    ['stray YAML single quote', note('raw', { title: "'bad'quote'" })],
+    ['decoded NUL in title', note('raw', { title: '"bad\\u0000title"' })],
+    ['decoded newline in title', note('raw', { title: '"bad\\nline"' })],
+    ['decoded C1 control in title', note('raw', { title: '"bad\\u0085title"' })],
+    ['decoded Unicode line separator in title', note('raw', { title: '"bad\\u2028title"' })],
     ['multiline object', note('raw', { title: '|\n  text' })],
     ['mapping', note('raw', { title: '{ nested: value }' })],
     ['boolean as string', note('raw', { title: 'true' })],
@@ -194,6 +199,7 @@ describe('frontmatter and layer contracts', () => {
     ['wrong filename date', note('raw', { created: '2026-07-25' })],
     ['tags scalar', note('raw', { tags: 'decision' })],
     ['tags non-string', note('raw', { tags: '[decision, true]' })],
+    ['decoded control in tags', note('raw', { tags: '["decision", "bad\\u0001tag"]' })],
     ['duplicate tags', note('raw', { tags: '[decision, decision]' })],
     ['invalid tag', note('raw', { tags: '[Decision]' })],
     ['wrong layer type', note('raw', { type: 'insight' })],
@@ -212,10 +218,20 @@ describe('frontmatter and layer contracts', () => {
     const vault = makeVault();
     writeSource(vault);
     expect(validate(vault, 'practices', note('practices', {
-      title: "'Quoted title'",
+      title: "'It''s valid'",
       tags: '["one", \'two-tag\']',
-      project: '""',
+      project: "'project''s-name'",
     })).tags).toEqual(['one', 'two-tag']);
+  });
+
+  test.each([
+    ['raw source', 'raw', { source: '"https://example.com/bad\\u0000path"' }],
+    ['practices source', 'practices', { source: '"[[raw/source\\n-note]]"' }],
+    ['optional project', 'practices', { project: '"bad\\u0001project"' }],
+  ] as const)('rejects decoded control in %s', (_name, layer, overrides) => {
+    const vault = makeVault();
+    writeSource(vault);
+    expectCode(() => validate(vault, layer, note(layer, overrides)), 'INVALID_NOTE');
   });
 
   test.each([
@@ -354,6 +370,51 @@ describe('Markdown destination grammar', () => {
       '',
     ].join('\n');
     expect(validate(vault, 'raw', note('raw', {}, body))).toBeTruthy();
+  });
+
+  test.each([
+    ['longer closer', '`[x](file:///tmp/a)``'],
+    ['shorter closer', '``[x](file:///tmp/a)`'],
+    ['closer embedded in a longer run', '`[x](file:///tmp/a)```'],
+  ])('does not mask inline code with a %s', (_name, body) => {
+    const vault = makeVault();
+    expectCode(() => validate(vault, 'raw', note('raw', {}, `# Body\n\n${body}\n`)), 'INVALID_NOTE');
+  });
+
+  test('masks multiple inline code spans only with exact delimiter runs', () => {
+    const vault = makeVault();
+    const body = [
+      '# Body',
+      '',
+      '`[x](file:///tmp/one)` and ``![x](https://example.com/two.png)``',
+      '',
+    ].join('\n');
+    expect(validate(vault, 'raw', note('raw', {}, body))).toBeTruthy();
+  });
+
+  test('accepts nested and escaped inline link labels', () => {
+    const vault = makeVault();
+    fs.mkdirSync(path.join(vault, 'raw/sources'));
+    fs.writeFileSync(path.join(vault, 'raw/sources/image.png'), 'bytes');
+    const body = [
+      '# Body',
+      '',
+      '![a [nested] label](../sources/image.png)',
+      '[an \\[escaped\\] label](https://example.com)',
+      '',
+    ].join('\n');
+    expect(validate(vault, 'raw', note('raw', {}, body))).toBeTruthy();
+  });
+
+  test.each([
+    ['nested local-bypass label', '[a [nested] label](file:///tmp/a)'],
+    ['nested image-bypass label', '![a [nested] label](https://example.com/a.png)'],
+    ['full nested reference', '[a [nested] label][target]'],
+    ['collapsed nested reference', '[a [nested] label][]'],
+    ['shortcut nested reference definition', '[a [nested] label]\n\n[a [nested] label]: https://example.com'],
+  ])('rejects %s', (_name, body) => {
+    const vault = makeVault();
+    expectCode(() => validate(vault, 'raw', note('raw', {}, `# Body\n\n${body}\n`)), 'INVALID_NOTE');
   });
 
   test('keeps code masking aligned after non-BMP Unicode', () => {

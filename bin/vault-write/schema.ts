@@ -172,6 +172,10 @@ function validateProfile(value: unknown): JsonRecord {
   return value;
 }
 
+function hasForbiddenScalarCharacter(value: string): boolean {
+  return /[\p{Cc}\u2028\u2029]/u.test(value);
+}
+
 function sha256(file: string): string {
   try {
     return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -256,6 +260,7 @@ function parseQuotedString(raw: string): string | undefined {
     try {
       const value = JSON.parse(raw);
       if (typeof value !== 'string') invalidNote();
+      if (hasForbiddenScalarCharacter(value)) invalidNote();
       return value;
     } catch {
       invalidNote();
@@ -263,7 +268,19 @@ function parseQuotedString(raw: string): string | undefined {
   }
   if (raw.startsWith("'")) {
     if (!raw.endsWith("'")) invalidNote();
-    return raw.slice(1, -1).replace(/''/g, "'");
+    const inner = raw.slice(1, -1);
+    let value = '';
+    for (let index = 0; index < inner.length; index += 1) {
+      if (inner[index] !== "'") {
+        value += inner[index];
+        continue;
+      }
+      if (inner[index + 1] !== "'") invalidNote();
+      value += "'";
+      index += 1;
+    }
+    if (hasForbiddenScalarCharacter(value)) invalidNote();
+    return value;
   }
   return undefined;
 }
@@ -274,7 +291,7 @@ function rejectYamlConstruct(raw: string): void {
     || /^(?:null|~|true|false|[-+]?(?:\d+\.?\d*|\.\d+))$/i.test(raw)
     || /^[&*!|>{}]/.test(raw)
     || /:\s/.test(raw)
-    || /[\u0000-\u001f\u007f]/.test(raw)
+    || hasForbiddenScalarCharacter(raw)
   ) invalidNote();
 }
 
@@ -466,9 +483,21 @@ function maskCode(markdown: string): string {
     }
     let run = 1;
     while (fencedMasked[index + run] === '`') run += 1;
-    const delimiter = '`'.repeat(run);
-    const close = fencedMasked.indexOf(delimiter, index + run);
-    if (close < 0) {
+    let close = -1;
+    for (let candidate = index + run; candidate < fencedMasked.length;) {
+      if (fencedMasked[candidate] !== '`') {
+        candidate += 1;
+        continue;
+      }
+      let candidateRun = 1;
+      while (fencedMasked[candidate + candidateRun] === '`') candidateRun += 1;
+      if (candidateRun === run) {
+        close = candidate;
+        break;
+      }
+      candidate += candidateRun;
+    }
+    if (close === -1) {
       index += run;
       continue;
     }
@@ -551,11 +580,15 @@ function validateDestination(
 }
 
 function findClosingBracket(markdown: string, start: number): number {
+  let depth = 1;
   for (let index = start; index < markdown.length; index += 1) {
     if (markdown[index] === '\\') {
       index += 1;
+    } else if (markdown[index] === '[') {
+      depth += 1;
     } else if (markdown[index] === ']') {
-      return index;
+      depth -= 1;
+      if (depth === 0) return index;
     } else if (markdown[index] === '\n' || markdown[index] === '\r') {
       return -1;
     }
@@ -606,8 +639,6 @@ function validateMarkdownDestinations(
   const markdown = maskCode(body);
   if (
     /!\[\[[^\]]*\]\]/.test(markdown)
-    || /^[ ]{0,3}\[[^\]\n]+\]:/m.test(markdown)
-    || /\[[^\]\n]+\]\[[^\]\n]*\]/.test(markdown)
   ) invalidNote();
 
   const mutable = markdown.split('');
@@ -616,7 +647,9 @@ function validateMarkdownDestinations(
     const labelStart = image ? index + 1 : index;
     if (markdown[labelStart] !== '[' || markdown[labelStart + 1] === '[') continue;
     const labelEnd = findClosingBracket(markdown, labelStart + 1);
-    if (labelEnd < 0 || markdown[labelEnd + 1] !== '(') continue;
+    if (labelEnd < 0) continue;
+    if (markdown[labelEnd + 1] === '[' || markdown[labelEnd + 1] === ':') invalidNote();
+    if (markdown[labelEnd + 1] !== '(') continue;
     const parsed = parseLinkDestination(markdown, labelEnd + 1);
     validateDestination(layout, plannedNotePath, parsed.destination, image);
     for (let position = index; position < parsed.end; position += 1) {
