@@ -2605,13 +2605,11 @@ test_ingest_skill_topic_confirmation() {
   assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "kebab-case" || return 1
 }
 
-test_ingest_skill_frontmatter_template() {
+test_ingest_skill_processed_markdown_body_only() {
   assert_file_exists "$PLUGIN_ROOT/skills/ingest/SKILL.md" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "title:" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "created:" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "tags:" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "type: article" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "source:" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "UTF-8 body-only Markdown" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "Do not include frontmatter" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "finalizer generates" || return 1
 }
 
 test_ingest_skill_no_forbidden_fields() {
@@ -2626,10 +2624,11 @@ test_ingest_skill_filename_convention() {
   assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "YYYY-MM-DD" || return 1
 }
 
-test_ingest_skill_image_download() {
+test_ingest_skill_image_localization_reporting() {
   assert_file_exists "$PLUGIN_ROOT/skills/ingest/SKILL.md" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "download\|Download" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "retry\|retries\|fallback" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "localizes available assets" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "warnings" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "not written" || return 1
 }
 
 test_ingest_skill_under_500_lines() {
@@ -2644,11 +2643,21 @@ test_ingest_skill_under_500_lines() {
 
 test_ingest_skill_rich_contract() {
   local f="$PLUGIN_ROOT/skills/ingest/SKILL.md"
+  local handout="$PLUGIN_ROOT/skills/ingest/references/handout-contract.md"
   assert_file_contains "$f" "Source Bundle" || return 1
   assert_file_contains "$f" "handout" || return 1
   assert_file_contains "$f" "Slide-driven" || return 1
   assert_file_contains "$f" "Topic-driven" || return 1
   assert_file_contains "$f" "不得报告完成" || return 1
+  assert_file_contains "$f" "UTF-8 body-only Markdown" || return 1
+  assert_file_contains "$f" 'Translation (`translate-cn`)' || return 1
+  assert_file_contains "$f" 'Summary (`summarize`)' || return 1
+  assert_file_contains "$f" "writeResult" || return 1
+  assert_file_not_contains "$f" "retry/fallback behavior" || return 1
+  assert_file_not_contains "$f" "downloaded versus failed" || return 1
+  assert_file_not_contains "$f" "transcript coverage" || return 1
+  assert_file_not_contains "$handout" "transcript coverage" || return 1
+  assert_file_not_contains "$f" "^title:" || return 1
 }
 
 # ── Quick 260517-fs2: Bilibili source adapter ──
@@ -4404,10 +4413,10 @@ main() {
     run_test test_ingest_skill_three_modes
     run_test test_ingest_skill_auto_detect_mode
     run_test test_ingest_skill_topic_confirmation
-    run_test test_ingest_skill_frontmatter_template
+    run_test test_ingest_skill_processed_markdown_body_only
     run_test test_ingest_skill_no_forbidden_fields
     run_test test_ingest_skill_filename_convention
-    run_test test_ingest_skill_image_download
+    run_test test_ingest_skill_image_localization_reporting
     run_test test_ingest_skill_under_500_lines
     run_test test_ingest_skill_rich_contract
 

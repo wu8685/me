@@ -59,18 +59,17 @@ For bundles, replace `"$URL"` with `--bundle "$BUNDLE_DIR"`.
 
 ### 3. Apply only the necessary LLM edit
 
-For `translate-cn` or `summarize`, edit the preview body and write the processed
-Markdown to a unique file under `"$VAULT_DIR/.me/tmp/"`. Preserve Markdown,
-wikilinks, code, image references, source order, and all substantive content.
-Use the CLI-generated frontmatter contract:
+Write any processed input as **UTF-8 body-only Markdown** in a unique file under
+`"$VAULT_DIR/.me/tmp/"`. Do not include frontmatter; the finalizer generates and
+validates it.
 
-```yaml
-title: "Source title"
-created: YYYY-MM-DD
-tags: ["english-kebab-tag"]
-type: article
-source: "https://original.example/source"
-```
+**Translation (`translate-cn`):** translate narrative prose while preserving
+Markdown structure, source order, wikilinks, code, image references, and all
+substantive content.
+
+**Summary (`summarize`):** compression is expected. Preserve source fidelity:
+do not invent claims or omit key conclusions and the evidence needed to support
+them. Keep relevant image references and provenance intact.
 
 For `raw`, `transcribe`, and `handout`, use the deterministic CLI output.
 `handout` is not a ten-point summary: it must retain the complete timestamped
@@ -93,8 +92,7 @@ bun run "$PLUGIN_ROOT/bin/ingest.ts" "$URL" \
 Without an edited body, omit `--processed-markdown`. For bundles, use
 `--bundle "$BUNDLE_DIR"`. The finalizer creates the
 `{raw_dir}/{topic}/YYYY-MM-DD-slug/` artifact, validates frontmatter and every
-resource, downloads/copies assets with retry/fallback behavior, and updates
-reachability atomically.
+resource, localizes available assets, and updates reachability atomically.
 
 The Agent's browser may produce a Source Bundle only when the public CLI cannot
 read the source and the user already has lawful access. Never put browser login
@@ -105,14 +103,14 @@ material in a bundle.
 
 Report:
 
-- saved note path and selected mode;
-- adapter and handout kind;
-- transcript coverage for video/course;
-- downloaded versus failed image/figure/slide counts;
-- every warning and degraded/blocked capability;
-- related-note and backlink suggestions returned by the CLI.
+- selected `mode`, `adapterId`, `capabilities`, `warnings`, and `handoutKind`
+  exactly as returned by the preview;
+- on success, only the paths, warnings, and link suggestions present in
+  `writeResult`;
+- on command failure or absent `writeResult`, that the source was not written
+  and the exact reported error or warning.
 
-Metadata-only video/course output may be labeled and saved as an incomplete
-pointer when the user explicitly requests it, but **不得报告完成**. A failed
-resource remains a reported failure even when the rest of the note is useful.
-Do not call a handout complete when transcript segments are missing.
+Do not invent download counts, percentages, transcript indices, or files that
+the CLI did not report. Metadata-only video/course output **不得报告完成**.
+When `warnings` reports a failed or missing resource, surface it and label the
+result incomplete; if finalization fails, report that nothing was written.
