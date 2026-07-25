@@ -336,8 +336,9 @@ Finalizer 必须：
 1. 由 orchestration 显式传入至少一个窄范围 `trustedResourceRoots`；不得信任 `/`、
    home、vault root 或能包含 home/vault 的祖先目录，也不把该能力暴露成用户可传的
    CLI 参数；
-2. 在创建 lock/reservation 前验证 `.me` 的 lexical path 与 realpath 均位于 vault；
-   `.me` symlink 指向外部时 fail closed，不得在外部创建 lock；
+2. 在创建/open lock 前验证 `.me`、`ingest-reservations` 与具体 lock path 的 lexical
+   path/realpath 均位于 vault；任一祖先 symlink 指向外部时 fail closed，不得在外部
+   创建 lock；
 3. 在 topic 目录取得 exclusive lock，并在 vault 内取得 stem reservation；二者覆盖
    uniqueness/destination check、artifact publish 与 README compare-and-swap。同 topic
    协作 finalizer 必须串行，不同 topic 的同 stem 也不能并发发布；
@@ -395,9 +396,11 @@ topic exclusive lock、vault-wide stem reservation 与二次 destination check �
 - source media 的 lexical path 与 realpath 都必须落在同一个 trusted root 内；
 - 不支持的 media embed syntax 必须拒绝，不能因 parser 未识别而漏过 traversal/absolute 引用；
 - media 与 backlink scanner 必须忽略 inline/fenced code；fence closing marker 必须与
-  opening marker 同字符且长度不短于 opening；
+  opening marker 同字符且长度不短于 opening；backtick fence 的 info string 含
+  backtick 时不是合法 opening，不能借此隐藏真实 media；
 - custom frontmatter 的 tags 只接受显式 quoted YAML strings；boolean、number、mapping
-  即使字面符合 kebab regex 也必须拒绝；
+  即使字面符合 kebab regex 也必须拒绝；closing `]` 后除已 trim 的 EOF 外不得有任何
+  token；
 - 浏览器登录态只存在于 Agent 会话，不写入 ME 产物；
 - 公开 fixture 不包含真实付费内容。
 

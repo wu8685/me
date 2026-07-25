@@ -658,10 +658,12 @@ manual-recovery error，不能递归删除并发用户内容。任何错误都�
 已有目标不得覆盖，同 topic 第二篇图文使用独立 artifact `images/`。
 
 adversarial tests 必须覆盖：check→rename 并发目标、README snapshot→replace 并发编辑、
-artifact publish→README CAS 间的并发用户写入、协作 finalizer 串行、`.me` symlink
-escape、unsupported Obsidian/HTML/reference-style media、code span/fence 排除、空或
-coverage 不完整的 handout、非法 stem/tag、stale staging/code-block false backlink、
-跨 topic duplicate stem、过宽 trusted root 与 media kind/extension 不匹配。
+artifact publish→README CAS 间的并发用户写入、协作 finalizer 串行、`.me` 或
+`ingest-reservations` symlink escape、unsupported Obsidian/HTML/reference-style
+media、code span/fence 排除、含 backtick info 的非法 backtick fence、空或 coverage
+不完整的 handout、非法 stem/tag 与 tags-array 尾随 token、stale staging/code-block
+false backlink、跨 topic duplicate stem、过宽 trusted root 与 media kind/extension
+不匹配。
 
 - [ ] **Step 4: 实现 backlinks 建议**
 

@@ -281,7 +281,10 @@ function parseTagList(value: string): string[] {
     while (index < clean.length && /\s/.test(clean[index])) index += 1;
   };
   skipWhitespace();
-  if (clean[index] === ']') return tags;
+  if (clean[index] === ']') {
+    if (index !== clean.length - 1) throw new Error('frontmatter schema: malformed tags list');
+    return tags;
+  }
 
   while (index < clean.length - 1) {
     const quote = clean[index];
@@ -326,7 +329,10 @@ function parseTagList(value: string): string[] {
     tags.push(validateTag(parsed));
 
     skipWhitespace();
-    if (clean[index] === ']') return tags;
+    if (clean[index] === ']') {
+      if (index !== clean.length - 1) throw new Error('frontmatter schema: malformed tags list');
+      return tags;
+    }
     if (clean[index] !== ',') throw new Error('frontmatter schema: malformed tags list');
     index += 1;
     skipWhitespace();
@@ -593,7 +599,7 @@ function markdownOutsideCode(markdown: string): string {
       continue;
     }
     const opening = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (opening) {
+    if (opening && !(opening[1][0] === '`' && opening[2].includes('`'))) {
       fence = {
         marker: opening[1][0] as '`' | '~',
         length: opening[1].length,
@@ -858,11 +864,13 @@ export function finalizeIngest(
   const createdDirectories: string[] = [];
   createDirectoryTracked(finalParent, createdDirectories);
   const reservationDirectory = path.join(vaultDir, '.me', 'ingest-reservations');
+  assertSafeVaultPath(vaultDir, reservationDirectory, 'ingest reservation path');
   createDirectoryTracked(reservationDirectory, createdDirectories);
   const lockPaths = [
     path.join(reservationDirectory, `${stem}.lock`),
     path.join(finalParent, '.me-ingest-finalize.lock'),
   ];
+  lockPaths.forEach(lockPath => assertSafeVaultPath(vaultDir, lockPath, 'ingest lock path'));
   const locks: Array<{ path: string; handle: number }> = [];
   try {
     for (const lockPath of lockPaths) {

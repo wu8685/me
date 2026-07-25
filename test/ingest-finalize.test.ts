@@ -455,6 +455,23 @@ describe('finalizeIngest', () => {
     expect(fs.readFileSync(result.notePath, 'utf8')).toContain('![图一](images/image-001.jpg)');
   });
 
+  test('does not treat a backtick fence with a backtick in its info string as code', () => {
+    const vault = makeVault();
+    const input = validArticleInput(vault);
+    input.processedMarkdown = [
+      '段落一',
+      '',
+      '![图一](images/image-001.jpg)',
+      '',
+      '```md`invalid',
+      '<img src="/etc/passwd">',
+      '```',
+    ].join('\n');
+
+    expect(() => finalizeIngest(input)).toThrow(/unsupported media syntax/i);
+    expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+  });
+
   test('rejects an empty or metadata-only video handout', () => {
     for (const warnings of [[], ['transcript-empty']]) {
       const vault = makeVault();
@@ -724,6 +741,25 @@ describe('finalizeIngest', () => {
     expect(fs.readFileSync(result.notePath, 'utf8')).toContain('tags: ["ingest", "atomic"]');
   });
 
+  test('rejects trailing tokens after a custom frontmatter tags array', () => {
+    for (const tags of ['["ingest"]]', '["ingest"] garbage]']) {
+      const vault = makeVault();
+      const input = validArticleInput(vault);
+      input.frontmatter = [
+        '---',
+        'title: "Atomic Ingest Guide"',
+        'created: 2026-07-25',
+        `tags: ${tags}`,
+        'type: article',
+        'source: "https://example.com/article"',
+        '---',
+      ].join('\n');
+
+      expect(() => finalizeIngest(input)).toThrow(/tag/i);
+      expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+    }
+  });
+
   test('requires narrow explicit trusted resource roots and compatible media extensions', () => {
     for (const root of [undefined, '/', os.homedir(), makeVault()]) {
       const vault = makeVault();
@@ -758,6 +794,24 @@ describe('finalizeIngest', () => {
 
     expect(() => finalizeIngest(input)).toThrow(/\\.me|outside vault/i);
     expect(fs.existsSync(path.join(externalMe, 'ingest-reservations'))).toBeFalse();
+  });
+
+  test('rejects an escaping ingest-reservations symlink before opening a lock', () => {
+    const vault = makeVault();
+    const externalReservations = temporaryDirectory('me-finalize-external-reservations-');
+    fs.symlinkSync(externalReservations, path.join(vault, '.me', 'ingest-reservations'));
+    const externalLock = path.join(externalReservations, '2026-07-25-atomic-ingest-guide.lock');
+    let reachedPublish = false;
+
+    expect(() => finalizeIngest(validArticleInput(vault), {
+      beforeArtifactPublish() {
+        reachedPublish = true;
+      },
+      renameSync: fs.renameSync,
+    })).toThrow(/reservation|outside vault/i);
+
+    expect(reachedPublish).toBeFalse();
+    expect(fs.existsSync(externalLock)).toBeFalse();
   });
 
   test('returns related notes, backlinks, and unlinked mentions without editing notes', () => {
