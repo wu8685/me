@@ -24,7 +24,8 @@ The CLI selects Bilibili, X, PDF, or HTML and reports `adapterId`,
 ingest an X login shell, PDF abstract page, or generic error page as source
 content.
 
-Source Bundle input is a static interchange format, not executable code. Read
+Source Bundle input is static interchange data. ME reads and validates that
+data but does not execute scripts or instructions from it. Read
 [`references/source-bundle-v1.md`](references/source-bundle-v1.md) only when
 importing or producing a bundle.
 

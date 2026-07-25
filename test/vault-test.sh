@@ -186,10 +186,25 @@ test_ingest_docs_rich_media() {
   for term in "https://example.com/article" ".pdf" "x.com/" "bilibili.com/" handout degraded "依赖"; do
     assert_file_contains "$guide" "$term" || return 1
   done
+  assert_file_contains "$guide" "defuddle" || return 1
+  assert_file_contains "$guide" "PATH" || return 1
+  assert_file_not_contains "$guide" "基础 HTML 摄入只需插件运行环境" || return 1
   grep -q -- "--bundle" "$guide" || {
     echo -e "    ${RED}FAIL${NC}: '$guide' does not document --bundle"
     return 1
   }
+
+  local bundle_reference="$PLUGIN_ROOT/skills/ingest/references/source-bundle-v1.md"
+  assert_file_contains "$guide" "静态数据" || return 1
+  assert_file_contains "$guide" "不会执行" || return 1
+  assert_file_not_contains "$guide" "可执行指令" || return 1
+  assert_file_contains "$bundle_reference" "static data" || return 1
+  assert_file_contains "$bundle_reference" "does not execute" || return 1
+  assert_file_not_contains "$bundle_reference" "executable instruction" || return 1
+
+  assert_file_contains "$features" "X auth wall" || return 1
+  assert_file_contains "$features" "encrypted/DRM PDF" || return 1
+  assert_file_not_contains "$features" "不可读取的错误页" || return 1
 
   assert_file_contains "$readme" "PDF" || return 1
   assert_file_contains "$readme" "公开视频" || return 1
@@ -221,14 +236,16 @@ test_ingest_docs_rich_media() {
     return 1
   }
 
-  local private_product private_product_zh private_vault
+  local private_product private_product_zh private_vault user_root machine_user_path
   private_product="xiao""etong"
   private_product_zh="小鹅""通"
   private_vault="brain""-spark"
+  user_root="/""Users/"
+  machine_user_path="${user_root}wu8685/"
   local public_paths=(
     "$PLUGIN_ROOT/bin"
     "$PLUGIN_ROOT/skills"
-    "$PLUGIN_ROOT/test/fixtures/ingest"
+    "$PLUGIN_ROOT/test"
     "$readme"
     "$features"
     "$guide"
@@ -237,14 +254,35 @@ test_ingest_docs_rich_media() {
     "$PLUGIN_ROOT/.claude-plugin"
   )
 
-  if rg -n -i "$private_product|$private_product_zh|$private_vault|/Users/wu8685/" "${public_paths[@]}"; then
+  if rg -n -i "$private_product|$private_product_zh|$private_vault|$machine_user_path" "${public_paths[@]}"; then
     echo -e "    ${RED}FAIL${NC}: public ingest artifacts contain private product or machine-specific data"
     return 1
   fi
 
-  if rg -n -P -i '(?:cookie|authorization|token)\s*[:=]\s*["'"'"']?(?!\[redacted\])[A-Za-z0-9_./+=-]{20,}' \
-    "$PLUGIN_ROOT/bin" "$PLUGIN_ROOT/skills" "$readme" "$features" "$guide"; then
-    echo -e "    ${RED}FAIL${NC}: public ingest artifacts contain a credential-shaped value"
+  local absolute_path_matches unexpected_paths
+  absolute_path_matches=$(rg -n "$user_root" "$PLUGIN_ROOT/test" || true)
+  unexpected_paths=$(echo "$absolute_path_matches" \
+    | grep -vE '/test/ingest-bundle\.test\.ts:[0-9]+:.*[/]Users/name/private' \
+    | grep -vE '/test/skills/ingest/scenarios\.md:[0-9]+:.*[/]Users/me/Downloads/private-slide\.jpg' \
+    || true)
+  if [ -n "$unexpected_paths" ]; then
+    echo "$unexpected_paths"
+    echo -e "    ${RED}FAIL${NC}: public tests contain a non-allowlisted absolute user path"
+    return 1
+  fi
+
+  local credential_matches unexpected_credentials
+  credential_matches=$(rg -n -o -i --glob '!vault-test.sh' \
+    'Authorization:[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9_./+=-]+|Cookie:[[:space:]]*sid=[A-Za-z0-9_./+=-]+|X-Token:[[:space:]]*[A-Za-z0-9_./+=-]+|(?:cookie|authorization|token|api[_-]?key)[[:space:]]*[:=][[:space:]]*[^[:space:],;]{12,}|(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{12,}' \
+    "${public_paths[@]}" || true)
+  unexpected_credentials=$(echo "$credential_matches" \
+    | grep -vE '/test/ingest-command\.test\.ts:[0-9]+:Authorization: Bearer top-secret$' \
+    | grep -vE '/test/ingest-command\.test\.ts:[0-9]+:Cookie: sid=super-secret$' \
+    | grep -vE '/test/ingest-command\.test\.ts:[0-9]+:X-Token: token-secret$' \
+    || true)
+  if [ -n "$unexpected_credentials" ]; then
+    echo "$unexpected_credentials"
+    echo -e "    ${RED}FAIL${NC}: public artifacts contain a non-allowlisted credential-shaped value"
     return 1
   fi
 }

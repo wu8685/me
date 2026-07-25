@@ -97,17 +97,18 @@ my-bundle/
 /me:ingest --bundle ./my-bundle
 ```
 
-Bundle 中的路径必须留在目录内部，不能包含登录状态、凭据、本机绝对路径或可执行指令。ME 会在写入前校验完整 Bundle；非法 Bundle 不会留下部分文件。
+Bundle 内容是静态数据。路径必须留在目录内部，不能包含登录状态、凭据或本机绝对路径；ME 只读取并校验数据，不会执行 Bundle 中的脚本或指令。非法 Bundle 不会留下部分文件。
 
 ### 依赖探测与 degraded 结果
 
-基础 HTML 摄入只需插件运行环境。富媒体来源会在预览阶段探测所需能力：
+不同来源依赖 PATH 中可用的外部命令。CLI 会按来源调用或探测这些命令，缺少必要命令时会报告失败或 warning：
 
+- HTML 与 X Article 正文提取：需要 PATH 中可用的 `defuddle`（CLI 调用 `defuddle parse --md`）。
 - PDF：需要 `curl`、`pdftotext`、`pdftohtml`。
 - X 视频：需要 `yt-dlp`。
 - 缺少现成字幕而需要本地转写时：使用配置中可用的 `mlx-whisper` 或 `whisper.cpp` provider。
 
-预览 JSON 中的 `capabilities` 表示实际可用内容，`warnings` 表示缺失或失败的资源。`warnings` 非空时应把结果视为 degraded/partial，并明确说明缺了什么；登录阻断、加密/DRM 或不可读来源会直接失败。只有输出包含 `writeResult` 才表示 artifact 已写入，失败时不会留下半篇笔记。
+预览 JSON 中的 `capabilities` 表示实际可用内容，`warnings` 表示缺失或失败的资源。`warnings` 非空时应把结果视为 degraded/partial，并明确说明缺了什么。CLI 已实现的 blocked cases 包括 X auth wall 和 encrypted/DRM PDF；普通 HTML 错误页没有统一的自动识别，Agent 仍需检查正文是否真实、完整，不能把只有标题或错误提示的页面写成成功结果。只有输出包含 `writeResult` 才表示 artifact 已写入，失败时不会留下半篇笔记。
 
 成功写入后，一篇材料位于独立目录中：
 

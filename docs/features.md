@@ -103,7 +103,8 @@ Map these directories? (Press Enter for defaults)
 
 - 预览结果会报告 `adapterId`、`capabilities`、`warnings`，视频讲义另有 `handoutKind`。
 - `warnings` 非空表示结果处于 degraded/partial 状态。调用者必须说明缺少的字幕、图片或媒体，不得把部分结果描述为完整。
-- `blocked` 来源（例如登录页、加密 PDF 或不可读取的错误页）不会写入笔记。
+- CLI 已实现的 `blocked` cases（X auth wall、encrypted/DRM PDF）不会写入笔记。
+- 普通 HTML 错误页没有统一的 CLI auto-block；Agent 必须做 body completeness check，标题或错误提示不能当作可读正文。
 - 只有返回 `writeResult` 才表示写入成功；校验或最终写入失败时不会保留部分 artifact。
 
 **输出布局：**
