@@ -1,0 +1,27 @@
+{
+  "_type": "playlist",
+  "id": "tweet-456",
+  "title": "Two public X clips",
+  "uploader": "fixture_author",
+  "timestamp": 1784968200,
+  "entries": [
+    {
+      "id": "clip-1",
+      "title": "First public clip",
+      "webpage_url": "https://x.com/example/status/456/video/1",
+      "duration": 10,
+      "ext": "mp4",
+      "vcodec": "avc1.640028",
+      "acodec": "mp4a.40.2"
+    },
+    {
+      "id": "clip-2",
+      "title": "Second public clip",
+      "webpage_url": "https://x.com/example/status/456/video/2",
+      "duration": 12,
+      "ext": "mp4",
+      "vcodec": "avc1.640028",
+      "acodec": "mp4a.40.2"
+    }
+  ]
+}

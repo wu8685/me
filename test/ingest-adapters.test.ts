@@ -210,6 +210,8 @@ test('extracts an X Article body and ordered images', async () => {
 
   expect(source.source.kind).toBe('article');
   expect(source.source.title).toBe('A public X Article');
+  expect(source.source.author).toBe('@fixture_author');
+  expect(source.source.publishedAt).toBe('2026-07-25T08:30:00Z');
   expect(source.media.map((media) => media.url)).toEqual([
     'https://pbs.twimg.com/a.jpg',
     'https://pbs.twimg.com/b.jpg',
@@ -233,8 +235,99 @@ test('classifies public X media as video and persists its media path', async () 
   }
 });
 
+test('extracts every public X playlist entry in source order using final media extensions', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-playlist-vault-'));
+  try {
+    const source = await createXAdapter(xPlaylistRunner()).extract({
+      url: new URL(X_VIDEO_URL), vaultDir, mode: 'handout',
+    });
+
+    expect(source.source).toMatchObject({ kind: 'video', title: 'Two public X clips', author: 'fixture_author' });
+    expect(source.media.map((media) => [media.kind, media.caption, path.extname(media.path!)]))
+      .toEqual([
+        ['video', 'First public clip', '.webm'],
+        ['video', 'Second public clip', '.mp4'],
+      ]);
+    expect(source.media.every((media) => fs.existsSync(media.path!))).toBe(true);
+  } finally {
+    fs.rmSync(vaultDir, { recursive: true, force: true });
+  }
+});
+
+test('persists concurrent X downloads under distinct paths', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-concurrent-vault-'));
+  try {
+    const adapter = createXAdapter(xVideoRunner());
+    const context = { url: new URL(X_VIDEO_URL), vaultDir };
+    const [first, second] = await Promise.all([adapter.extract(context), adapter.extract(context)]);
+    const paths = [...first.media, ...second.media].map((media) => media.path!);
+
+    expect(new Set(paths).size).toBe(paths.length);
+    expect(paths.every((mediaPath) => fs.existsSync(mediaPath))).toBe(true);
+  } finally {
+    fs.rmSync(vaultDir, { recursive: true, force: true });
+  }
+});
+
+test('treats malformed or unknown successful X video metadata as extraction failures', async () => {
+  await expect(createXAdapter(xMalformedProbeRunner('{broken')).extract({
+    url: new URL(X_VIDEO_URL), vaultDir: '/tmp/v',
+  })).rejects.toThrow(/extraction-failed/);
+  await expect(createXAdapter(xMalformedProbeRunner(JSON.stringify({ id: 'unknown' }))).extract({
+    url: new URL(X_VIDEO_URL), vaultDir: '/tmp/v',
+  })).rejects.toThrow(/extraction-failed/);
+  await expect(createXAdapter(xMalformedProbeRunner(JSON.stringify({ id: 'unknown', title: 'Unknown schema' }))).extract({
+    url: new URL(X_VIDEO_URL), vaultDir: '/tmp/v',
+  })).rejects.toThrow(/extraction-failed/);
+});
+
+test('falls back to X Article for yt-dlp’s explicit no-video tweet result', async () => {
+  const source = await createXAdapter(xExplicitNoVideoRunner()).extract({
+    url: new URL(X_ARTICLE_URL), vaultDir: '/tmp/v',
+  });
+
+  expect(source.source.kind).toBe('article');
+});
+
+test('cleans partial X video downloads before returning a failure', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-download-failure-vault-'));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-download-failure-temp-'));
+  try {
+    await expect(createXAdapter(xPartialDownloadRunner()).extract({
+      url: new URL(X_VIDEO_URL), vaultDir, tempDir,
+    })).rejects.toThrow(/yt-dlp failed/);
+    const assetDirectory = path.join(vaultDir, '.me', 'ingest-media');
+    expect(fs.existsSync(assetDirectory) ? fs.readdirSync(assetDirectory) : []).toEqual([]);
+    expect(fs.readdirSync(tempDir)).toEqual([]);
+  } finally {
+    fs.rmSync(vaultDir, { recursive: true, force: true });
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('reports X audio-only media without claiming video capability', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-audio-vault-'));
+  try {
+    const adapter = createXAdapter(xAudioOnlyRunner());
+    const context = { url: new URL(X_VIDEO_URL), vaultDir };
+    const [report, source] = await Promise.all([adapter.probe(context), adapter.extract(context)]);
+
+    expect(report.capabilities).toEqual(['audio']);
+    expect(source.media).toMatchObject([{ kind: 'audio' }]);
+    expect(source.warnings).toContain('video-unavailable:audio-only');
+  } finally {
+    fs.rmSync(vaultDir, { recursive: true, force: true });
+  }
+});
+
 test('returns auth-required instead of ingesting an X login page', async () => {
   await expect(createXAdapter(loginPageRunner()).extract({
+    url: new URL(X_ARTICLE_URL), vaultDir: '/tmp/v',
+  })).rejects.toThrow(/auth-required/);
+});
+
+test('returns auth-required for a long X login flow without article structure', async () => {
+  await expect(createXAdapter(longLoginPageRunner()).extract({
     url: new URL(X_ARTICLE_URL), vaultDir: '/tmp/v',
   })).rejects.toThrow(/auth-required/);
 });
@@ -400,9 +493,83 @@ function xVideoRunner(): CommandRunner {
           stderr: '', status: 0,
         };
       }
-      expect(args).toEqual(['-o', expect.any(String), X_VIDEO_URL]);
-      fs.writeFileSync(args[1], 'video-fixture');
-      return { stdout: '', stderr: '', status: 0 };
+      const template = args[args.indexOf('-o') + 1];
+      expect(template).toContain('%(ext)s');
+      expect(args).toContain('after_move:filepath');
+      const actualPath = template.replace('%(id)s', '456').replace('%(ext)s', 'mp4');
+      fs.writeFileSync(actualPath, 'video-fixture');
+      return { stdout: `${actualPath}\n`, stderr: '', status: 0 };
+    },
+  };
+}
+
+function xPlaylistRunner(): CommandRunner {
+  return {
+    run(command, args) {
+      if (command !== 'yt-dlp') throw new Error(`Unexpected command: ${command}`);
+      if (args[0] === '--dump-single-json') {
+        return { stdout: fixtureText('x-video-playlist.json'), stderr: '', status: 0 };
+      }
+      const outputIndex = args.indexOf('-o');
+      const printIndex = args.indexOf('--print');
+      expect(outputIndex).toBeGreaterThanOrEqual(0);
+      expect(args[outputIndex + 1]).toContain('%(ext)s');
+      expect(args[printIndex + 1]).toBe('after_move:filepath');
+      const url = args.at(-1)!;
+      const isFirst = url.endsWith('/video/1');
+      const actualPath = args[outputIndex + 1]
+        .replace('%(id)s', isFirst ? 'clip-1' : 'clip-2')
+        .replace('%(ext)s', isFirst ? 'webm' : 'mp4');
+      fs.writeFileSync(actualPath, isFirst ? 'first-video' : 'second-video');
+      return { stdout: `${actualPath}\n`, stderr: '', status: 0 };
+    },
+  };
+}
+
+function xMalformedProbeRunner(stdout: string): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'yt-dlp') return { stdout, stderr: '', status: 0 };
+      throw new Error(`Article fallback must not run after malformed video metadata: ${command}`);
+    },
+  };
+}
+
+function xExplicitNoVideoRunner(): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'yt-dlp') return { stdout: '', stderr: 'ERROR: No video could be found in this tweet', status: 1 };
+      if (command === 'defuddle') return { stdout: fixtureText('x-article.md'), stderr: '', status: 0 };
+      throw new Error(`Unexpected command: ${command}`);
+    },
+  };
+}
+
+function xPartialDownloadRunner(): CommandRunner {
+  return {
+    run(command, args) {
+      if (command !== 'yt-dlp') throw new Error(`Unexpected command: ${command}`);
+      if (args[0] === '--dump-single-json') {
+        return { stdout: JSON.stringify({ id: 'partial', title: 'Partial download', webpage_url: X_VIDEO_URL, ext: 'mp4', vcodec: 'avc1' }), stderr: '', status: 0 };
+      }
+      const template = args[args.indexOf('-o') + 1];
+      fs.writeFileSync(path.join(path.dirname(template), 'download.part'), 'partial');
+      return { stdout: '', stderr: 'network interrupted', status: 1 };
+    },
+  };
+}
+
+function xAudioOnlyRunner(): CommandRunner {
+  return {
+    run(command, args) {
+      if (command !== 'yt-dlp') throw new Error(`Unexpected command: ${command}`);
+      if (args[0] === '--dump-single-json') {
+        return { stdout: JSON.stringify({ id: 'audio-only', title: 'Public audio', webpage_url: X_VIDEO_URL, ext: 'm4a', vcodec: 'none', acodec: 'mp4a.40.2' }), stderr: '', status: 0 };
+      }
+      const template = args[args.indexOf('-o') + 1];
+      const actualPath = template.replace('%(id)s', 'audio-only').replace('%(ext)s', 'm4a');
+      fs.writeFileSync(actualPath, 'audio');
+      return { stdout: `${actualPath}\n`, stderr: '', status: 0 };
     },
   };
 }
@@ -412,6 +579,16 @@ function loginPageRunner(): CommandRunner {
     run(command) {
       if (command === 'yt-dlp') return { stdout: '', stderr: 'not a video', status: 1 };
       if (command === 'defuddle') return { stdout: '# Log in to X\n\nSign in to see what is happening.', stderr: '', status: 0 };
+      throw new Error(`Unexpected command: ${command}`);
+    },
+  };
+}
+
+function longLoginPageRunner(): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'yt-dlp') return { stdout: '', stderr: 'not a video', status: 1 };
+      if (command === 'defuddle') return { stdout: `Sign in to X\n\n${'Login wall content. '.repeat(20)}\n/i/flow/login`, stderr: '', status: 0 };
       throw new Error(`Unexpected command: ${command}`);
     },
   };
