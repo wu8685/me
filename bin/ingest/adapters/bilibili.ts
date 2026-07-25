@@ -133,6 +133,10 @@ export function extractBilibiliSource(
     ? meta.pages
     : [{ cid: 0, page: 1, part: meta.title, duration: meta.duration ?? 0 }];
   let missingTranscript = false;
+  let transcriptionFailure: 'transcription-unavailable' | 'transcription-empty' | undefined;
+  let pageOffset = 0;
+  const transcriptionAvailable = Boolean(options.transcribe)
+    && (options.transcriptionAvailable?.() ?? true);
 
   for (const page of pages) {
     if (pages.length > 1) lines.push(`## P${page.page}: ${page.part}`, '');
@@ -142,22 +146,29 @@ export function extractBilibiliSource(
       lines.push(`### 字幕转录（${chosen?.lan ?? 'unknown'}）`, '', ...subtitleLines.map((line) => line.content), '');
       transcript.push(...subtitleLines
         .filter((line) => Number.isFinite(line.from) && Number.isFinite(line.to) && line.from < line.to)
-        .map((line) => ({ start: line.from, end: line.to, text: line.content })));
-    } else if (mode === 'transcribe' && options.transcribe) {
+        .map((line) => ({ start: pageOffset + line.from, end: pageOffset + line.to, text: line.content })));
+    } else if (mode === 'transcribe' && transcriptionAvailable && options.transcribe) {
       const text = options.transcribe(url, page.cid);
-      lines.push('### 字幕转录（whisper-auto）', '', text, '');
       if (text.trim() && (page.duration ?? meta.duration) > 0) {
-        transcript.push({ start: 0, end: page.duration ?? meta.duration, text });
+        lines.push('### 字幕转录（whisper-auto）', '', text, '');
+        transcript.push({ start: pageOffset, end: pageOffset + (page.duration ?? meta.duration), text });
+      } else {
+        lines.push('<!-- 无转写结果 -->', '');
+        missingTranscript = true;
+        transcriptionFailure = 'transcription-empty';
       }
     } else {
       lines.push('<!-- 无 CC 字幕 -->', '');
       missingTranscript = true;
+      if (mode === 'transcribe') transcriptionFailure = 'transcription-unavailable';
     }
+    pageOffset += page.duration ?? 0;
   }
 
   const content = lines.join('\n');
   const parts = markdownToSourceParts(content);
-  const warnings = missingTranscript && mode !== 'transcribe' ? ['needs-transcription'] : [];
+  const warnings = missingTranscript ? ['needs-transcription', ...(transcriptionFailure ? [transcriptionFailure] : [])] : [];
+  transcript.sort((a, b) => a.start - b.start || a.end - b.end);
   return {
     source: {
       url,
@@ -183,10 +194,12 @@ export function createBilibiliAdapter(runner: CommandRunner, options: BilibiliAd
     async probe(context): Promise<CapabilityReport> {
       const source = extractBilibiliSource(runner, context.url.toString(), context.mode === 'transcribe' ? 'transcribe' : 'metadata', options);
       const hasTranscript = Boolean(source.transcript?.length);
+      const providerAvailable = options.transcriptionAvailable?.() ?? Boolean(options.transcribe);
       return {
         adapterId: 'bilibili',
         readable: hasTranscript,
-        capabilities: hasTranscript ? ['body', 'captions', 'transcript', 'video'] : ['video'],
+        capabilities: hasTranscript ? ['body', 'captions', 'transcript', 'video'] : providerAvailable ? ['audio', 'video'] : ['video'],
+        missingDependencies: !hasTranscript && !providerAvailable ? ['transcription-provider'] : undefined,
         degradation: hasTranscript ? 'none' : 'partial',
         warnings: source.warnings,
       };

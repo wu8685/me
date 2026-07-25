@@ -19,9 +19,16 @@ function blockId(index: number): string {
 /** Convert the Markdown emitted by defuddle into ordered source blocks and media. */
 export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]; media: MediaAsset[] } {
   const blocks: SourceBlock[] = [];
-  const media: MediaAsset[] = [];
+  const imagePattern = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+)(?:\s+"[^"]*")?\)/g;
+  const media = Array.from(markdown.matchAll(imagePattern), (match, index) => ({
+    id: `image-${String(index + 1).padStart(3, '0')}`,
+    kind: 'image' as const,
+    url: match[2],
+    alt: match[1] || undefined,
+  }));
   const lines = markdown.replace(/\r\n/g, '\n').split('\n');
   let paragraph: string[] = [];
+  let nextWholeLineImage = 0;
 
   const addBlock = (kind: SourceBlock['kind'], value: string, mediaId?: string) => {
     blocks.push({ id: blockId(blocks.length + 1), kind, markdown: value, ...(mediaId ? { mediaId } : {}) });
@@ -42,9 +49,9 @@ export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]
     }
     if (image) {
       flushParagraph();
-      const mediaId = `image-${String(media.length + 1).padStart(3, '0')}`;
-      media.push({ id: mediaId, kind: 'image', url: image[2], alt: image[1] || undefined });
-      addBlock('image', line, mediaId);
+      const imageMedia = media.slice(nextWholeLineImage).find((asset) => asset.url === image[2] && asset.alt === (image[1] || undefined));
+      if (imageMedia) nextWholeLineImage = media.indexOf(imageMedia) + 1;
+      addBlock('image', line, imageMedia?.id);
       continue;
     }
     if (line.trim() === '') {

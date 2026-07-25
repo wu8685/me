@@ -12,7 +12,9 @@ export interface CommandRunner {
 
 function sanitizeStderr(stderr: string): string {
   return stderr
+    .replace(/(^|[\r\n])\s*((?:proxy-)?authorization|cookie|set-cookie|x-(?:api-)?token|x-api-key)\s*:[^\r\n]*/gim, '$1$2: [redacted]')
     .replace(/https?:\/\/\S+/g, '[redacted-url]')
+    .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [redacted]')
     .replace(/\b(authorization|cookie|token|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=[redacted]')
     .replace(/[\r\n\t]+/g, ' ')
     .replace(/\s+/g, ' ')

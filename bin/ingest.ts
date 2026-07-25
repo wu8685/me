@@ -14,7 +14,7 @@ import * as os from 'os';
 import * as https from 'https';
 import * as http from 'http';
 import { execSync } from 'child_process';
-import { defaultCommandRunner } from './ingest/command.ts';
+import { defaultCommandRunner, type CommandRunner } from './ingest/command.ts';
 import { extractHtmlSource } from './ingest/adapters/html.ts';
 import {
   extractBilibiliSource,
@@ -515,9 +515,9 @@ export function fetchBilibiliSubtitleBody(subtitleUrl: string): string {
  * (Defined here so extractBilibili can compute transcriptionAvailable; the
  * actual transcribe pipeline lives further down.)
  */
-export function whichYtDlp(): string | null {
+export function whichYtDlp(runner: CommandRunner = defaultCommandRunner): string | null {
   try {
-    const out = execSync('which yt-dlp', { encoding: 'utf8', timeout: 5000 }).trim();
+    const out = runner.run('which', ['yt-dlp'], { timeoutMs: 5000 }).stdout.trim();
     return out || null;
   } catch {
     return null;
@@ -528,9 +528,9 @@ export function whichYtDlp(): string | null {
  * Check if whisper-cli is available. Tries `which`, then the homebrew
  * whisper-cpp keg location. Returns the resolved path or null.
  */
-export function whichWhisperCli(): string | null {
+export function whichWhisperCli(runner: CommandRunner = defaultCommandRunner): string | null {
   try {
-    const out = execSync('which whisper-cli', { encoding: 'utf8', timeout: 5000 }).trim();
+    const out = runner.run('which', ['whisper-cli'], { timeoutMs: 5000 }).stdout.trim();
     if (out) return out;
   } catch {
     // fall through to keg check
@@ -554,23 +554,25 @@ export function whichWhisperCli(): string | null {
  */
 export function extractBilibili(
   url: string,
-  opts?: { mode?: 'metadata' | 'transcribe' },
+  opts?: { mode?: 'metadata' | 'transcribe'; runner?: CommandRunner },
 ): ExtractedContent & { needsTranscription?: boolean; transcriptionAvailable?: boolean } {
   const mode = opts?.mode ?? 'metadata';
-  const source = extractBilibiliSource(defaultCommandRunner, url, mode, {
+  const runner = opts?.runner ?? defaultCommandRunner;
+  const source = extractBilibiliSource(runner, url, mode, {
     transcribe: (sourceUrl, cid) => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bili-whisper-'));
       try {
-        return transcribeBilibili(sourceUrl, cid, tmpDir);
+        return transcribeBilibili(sourceUrl, cid, tmpDir, runner);
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     },
+    transcriptionAvailable: () => whichYtDlp(runner) !== null && whichWhisperCli(runner) !== null,
   });
   const result = projectExtractedSource(source);
-  if (source.warnings.includes('needs-transcription') && mode !== 'transcribe') {
+  if (source.warnings.includes('needs-transcription')) {
     result.needsTranscription = true;
-    result.transcriptionAvailable = whichYtDlp() !== null && whichWhisperCli() !== null;
+    result.transcriptionAvailable = whichYtDlp(runner) !== null && whichWhisperCli(runner) !== null;
   }
   return result;
 }
@@ -584,12 +586,13 @@ export function extractBilibili(
  */
 export function extractContent(
   url: string,
-  opts?: { mode?: 'metadata' | 'transcribe' },
+  opts?: { mode?: 'metadata' | 'transcribe'; runner?: CommandRunner },
+  runner: CommandRunner = opts?.runner ?? defaultCommandRunner,
 ): ExtractedContent & { needsTranscription?: boolean; transcriptionAvailable?: boolean } {
   if (isBilibiliUrl(url)) {
-    return extractBilibili(url, opts);
+    return extractBilibili(url, { ...opts, runner });
   }
-  return projectExtractedSource(extractHtmlSource(defaultCommandRunner, new URL(url), url));
+  return projectExtractedSource(extractHtmlSource(runner, new URL(url), url));
 }
 
 function projectExtractedSource(
@@ -611,7 +614,7 @@ function projectExtractedSource(
  * mirror (large file — caller pays the network cost only when transcribe mode
  * is actually used). Creates parent directory as needed.
  */
-export function getWhisperModelPath(): string {
+export function getWhisperModelPath(runner: CommandRunner = defaultCommandRunner): string {
   const envPath = process.env.ME_WHISPER_MODEL;
   const modelPath =
     envPath || path.join(os.homedir(), '.cache/me/whisper-models/ggml-large-v3-turbo.bin');
@@ -626,10 +629,7 @@ export function getWhisperModelPath(): string {
   const modelUrl =
     'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin';
   try {
-    execSync(`curl -L --max-time 600 -o "${modelPath}" "${modelUrl}"`, {
-      stdio: 'inherit',
-      timeout: 620000,
-    });
+    runner.run('curl', ['-L', '--max-time', '600', '-o', modelPath, modelUrl], { timeoutMs: 620000 });
   } catch {
     throw new Error(
       `Failed to download whisper model — manually place at ${modelPath} (source: ${modelUrl})`,
@@ -655,22 +655,24 @@ export function getWhisperModelPath(): string {
  *
  * Throws with a `brew install ...` hint if either binary is missing.
  */
-export function transcribeBilibili(url: string, cid: number, tmpDir: string): string {
-  const ytdlp = whichYtDlp();
+export function transcribeBilibili(
+  url: string,
+  cid: number,
+  tmpDir: string,
+  runner: CommandRunner = defaultCommandRunner,
+): string {
+  const ytdlp = whichYtDlp(runner);
   if (!ytdlp) {
     throw new Error('yt-dlp not installed. brew install yt-dlp');
   }
-  const wcli = whichWhisperCli();
+  const wcli = whichWhisperCli(runner);
   if (!wcli) {
     throw new Error('whisper-cli not installed. brew install whisper-cpp');
   }
 
   // Step 1: extract audio with yt-dlp → tmpDir/audio-<cid>.<ext>
   const audioOutTpl = path.join(tmpDir, `audio-${cid}.%(ext)s`);
-  execSync(`${ytdlp} -x --audio-format wav -o "${audioOutTpl}" "${url}"`, {
-    stdio: 'inherit',
-    timeout: 600000,
-  });
+  runner.run(ytdlp, ['-x', '--audio-format', 'wav', '-o', audioOutTpl, url], { timeoutMs: 600000 });
 
   const wavName = fs
     .readdirSync(tmpDir)
@@ -682,18 +684,12 @@ export function transcribeBilibili(url: string, cid: number, tmpDir: string): st
   const wav16k = path.join(tmpDir, `audio-${cid}-16k.wav`);
 
   // Step 2: ffmpeg resample to 16kHz mono PCM
-  execSync(`ffmpeg -y -i "${wavIn}" -ar 16000 -ac 1 -c:a pcm_s16le "${wav16k}"`, {
-    stdio: 'inherit',
-    timeout: 300000,
-  });
+  runner.run('ffmpeg', ['-y', '-i', wavIn, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wav16k], { timeoutMs: 300000 });
 
   // Step 3: whisper-cli → transcript-<cid>.txt
-  const model = getWhisperModelPath();
+  const model = getWhisperModelPath(runner);
   const transcriptBase = path.join(tmpDir, `transcript-${cid}`);
-  execSync(
-    `${wcli} -m "${model}" -f "${wav16k}" -l auto -otxt -of "${transcriptBase}"`,
-    { stdio: 'inherit', timeout: 1800000 },
-  );
+  runner.run(wcli, ['-m', model, '-f', wav16k, '-l', 'auto', '-otxt', '-of', transcriptBase], { timeoutMs: 1800000 });
 
   const transcriptFile = `${transcriptBase}.txt`;
   const transcript = fs.existsSync(transcriptFile)
