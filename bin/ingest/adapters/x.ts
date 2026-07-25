@@ -15,7 +15,8 @@ import { markdownToSourceParts } from './html.ts';
 
 const MINIMUM_ARTICLE_VISIBLE_CHARACTERS = 200;
 const LOGIN_TITLE = /^(?:log\s*in|sign\s*in)(?:\s+to\s+(?:x|twitter))?$|^(?:登录|登入)(?:\s*(?:x|twitter))?$/i;
-const LOGIN_PAGE_MARKER = /(?:\/i\/flow\/login|(?:^|\n)\s*(?:log\s*in|sign\s*in)\s+to\s+(?:x|twitter)\s*(?:\n|$))/i;
+const FLOW_LOGIN_MARKER = /\/i\/flow\/login/i;
+const LOGIN_PAGE_COPY_MARKER = /(?:^|\n)\s*(?:log\s*in|sign\s*in)\s+to\s+(?:x|twitter)\s*(?:\n|$)/i;
 const VIDEO_PROBE_NOT_VIDEO = /(?:unsupported\s+url|not\s+a\s+video|no\s+video\s+formats?|no\s+video\s+could\s+be\s+found\s+in\s+this\s+tweet)/i;
 const VIDEO_PROBE_AUTH_REQUIRED = /(?:log\s*in|sign\s*in|authentication|cookies?|private\s+video|not\s+available\s+to\s+you)/i;
 
@@ -29,6 +30,7 @@ interface XMediaMetadata {
   description?: string;
   kind: 'video' | 'audio';
   hasAudio: boolean;
+  playlistItem?: number;
 }
 
 interface XVideoProbe {
@@ -109,7 +111,7 @@ function mediaKind(entry: Record<string, unknown>): { kind: 'video' | 'audio'; h
     : { kind: 'audio', hasAudio: true };
 }
 
-function parseMedia(value: unknown, fallbackUrl?: string): XMediaMetadata {
+function parseMedia(value: unknown, fallbackUrl?: string, playlistItem?: number): XMediaMetadata {
   const entry = record(value);
   if (!entry) throw new Error('extraction-failed: yt-dlp media entry is invalid');
   const id = stringField(entry, 'id');
@@ -137,6 +139,7 @@ function parseMedia(value: unknown, fallbackUrl?: string): XMediaMetadata {
     ...(typeof entry.duration === 'number' && Number.isFinite(entry.duration) ? { durationSec: entry.duration } : {}),
     ...(stringField(entry, 'description') ? { description: stringField(entry, 'description') } : {}),
     ...type,
+    ...(playlistItem === undefined ? {} : { playlistItem }),
   };
 }
 
@@ -155,7 +158,7 @@ function parseVideoProbe(stdout: string, sourceUrl: URL): XProbe {
       if (!Array.isArray(metadata.entries) || metadata.entries.length === 0) {
         throw new Error('extraction-failed: yt-dlp playlist has no usable entries');
       }
-      return metadata.entries.map((entry) => parseMedia(entry));
+      return metadata.entries.map((entry, index) => parseMedia(entry, undefined, index + 1));
     })()
     : [parseMedia(metadata, sourceUrl.toString())];
   return {
@@ -197,7 +200,7 @@ function articleMetadata(markdown: string): { author?: string; publishedAt?: str
 function requirePublicArticle(markdown: string): void {
   const title = titleFromMarkdown(markdown);
   const hasArticleHeading = /^#{1,6}\s+\S+/m.test(markdown);
-  if (LOGIN_TITLE.test(title) || !hasVisibleArticleBody(markdown) || (LOGIN_PAGE_MARKER.test(markdown) && !hasArticleHeading)) {
+  if (LOGIN_TITLE.test(title) || !hasVisibleArticleBody(markdown) || FLOW_LOGIN_MARKER.test(markdown) || (LOGIN_PAGE_COPY_MARKER.test(markdown) && !hasArticleHeading)) {
     throw new Error('auth-required: X Article is not publicly readable');
   }
 }
@@ -259,7 +262,10 @@ function downloadMedia(runner: CommandRunner, context: ExtractContext, media: XM
   const directory = temporaryDirectory(context);
   try {
     const template = path.join(directory, `media-${randomUUID()}-%(id)s.%(ext)s`);
-    const result = runner.run('yt-dlp', ['--no-playlist', '-o', template, '--print', 'after_move:filepath', media.url], { timeoutMs: 600000 });
+    const selection = media.playlistItem === undefined
+      ? ['--no-playlist']
+      : ['--playlist-items', String(media.playlistItem)];
+    const result = runner.run('yt-dlp', [...selection, '-o', template, '--print', 'after_move:filepath', media.url], { timeoutMs: 600000 });
     if (result.status !== 0) throw new Error(`yt-dlp failed with exit code ${result.status}`);
     return persistMedia(outputPathFromPrint(result.stdout, directory), context);
   } finally {
@@ -285,14 +291,30 @@ function capabilities(probe: XVideoProbe): CapabilityReport['capabilities'] {
   return [...(hasVideo ? ['video' as const] : []), ...(hasAudio ? ['audio' as const] : [])];
 }
 
+function audioOnlyWarnings(probe: XVideoProbe): string[] {
+  return probe.media.flatMap((media, index) => media.kind === 'audio'
+    ? [`video-unavailable:audio-only:audio-${String(index + 1).padStart(3, '0')}`]
+    : []);
+}
+
 function extractVideo(runner: CommandRunner, context: ExtractContext, probe: XVideoProbe): ExtractedSource {
-  const media: MediaAsset[] = probe.media.map((entry, index) => ({
-    id: `${entry.kind}-${String(index + 1).padStart(3, '0')}`,
-    kind: entry.kind,
-    path: downloadMedia(runner, context, entry),
-    url: entry.url,
-    caption: entry.title,
-  }));
+  const media: MediaAsset[] = [];
+  try {
+    for (const [index, entry] of probe.media.entries()) {
+      media.push({
+        id: `${entry.kind}-${String(index + 1).padStart(3, '0')}`,
+        kind: entry.kind,
+        path: downloadMedia(runner, context, entry),
+        url: entry.url,
+        caption: entry.title,
+      });
+    }
+  } catch (cause) {
+    for (const asset of media) {
+      if (asset.path) fs.rmSync(asset.path, { force: true });
+    }
+    throw cause;
+  }
   const audioOnly = media.every((asset) => asset.kind === 'audio');
   return {
     source: {
@@ -305,9 +327,9 @@ function extractVideo(runner: CommandRunner, context: ExtractContext, probe: XVi
     media,
     provenance: {
       extractor: 'yt-dlp', extractedAt: new Date().toISOString(),
-      methods: ['yt-dlp --dump-single-json', 'yt-dlp --no-playlist -o %(id)s.%(ext)s --print after_move:filepath'],
+      methods: ['yt-dlp --dump-single-json', 'yt-dlp --playlist-items N|- --no-playlist -o %(id)s.%(ext)s --print after_move:filepath'],
     },
-    warnings: audioOnly ? ['video-unavailable:audio-only'] : [],
+    warnings: [...(audioOnly ? ['video-unavailable:audio-only'] : []), ...audioOnlyWarnings(probe)],
   };
 }
 
@@ -322,7 +344,7 @@ export function createXAdapter(runner: CommandRunner): SourceAdapter {
         const audioOnly = mediaCapabilities.length === 1 && mediaCapabilities[0] === 'audio';
         return {
           adapterId: 'x', readable: true, capabilities: mediaCapabilities, degradation: audioOnly ? 'partial' : 'none',
-          warnings: audioOnly ? ['video-unavailable:audio-only'] : [],
+          warnings: [...(audioOnly ? ['video-unavailable:audio-only'] : []), ...audioOnlyWarnings(result)],
         };
       }
       try {

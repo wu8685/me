@@ -1,0 +1,23 @@
+{
+  "_type": "playlist",
+  "id": "tweet-mixed",
+  "title": "Mixed public X media",
+  "entries": [
+    {
+      "id": "mixed-video",
+      "title": "Visible clip",
+      "webpage_url": "https://x.com/example/status/456",
+      "ext": "mp4",
+      "vcodec": "avc1.640028",
+      "acodec": "mp4a.40.2"
+    },
+    {
+      "id": "mixed-audio",
+      "title": "Audio only clip",
+      "webpage_url": "https://x.com/example/status/456",
+      "ext": "m4a",
+      "vcodec": "none",
+      "acodec": "mp4a.40.2"
+    }
+  ]
+}

@@ -248,7 +248,37 @@ test('extracts every public X playlist entry in source order using final media e
         ['video', 'First public clip', '.webm'],
         ['video', 'Second public clip', '.mp4'],
       ]);
+    expect(source.media.map((media) => fs.readFileSync(media.path!, 'utf8'))).toEqual(['FIRST', 'SECOND']);
     expect(source.media.every((media) => fs.existsSync(media.path!))).toBe(true);
+  } finally {
+    fs.rmSync(vaultDir, { recursive: true, force: true });
+  }
+});
+
+test('rolls back every published X playlist asset when a later entry fails', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-playlist-rollback-vault-'));
+  try {
+    await expect(createXAdapter(xPlaylistSecondFailureRunner()).extract({
+      url: new URL(X_VIDEO_URL), vaultDir,
+    })).rejects.toThrow(/yt-dlp failed/);
+    const assetDirectory = path.join(vaultDir, '.me', 'ingest-media');
+    expect(fs.existsSync(assetDirectory) ? fs.readdirSync(assetDirectory) : []).toEqual([]);
+  } finally {
+    fs.rmSync(vaultDir, { recursive: true, force: true });
+  }
+});
+
+test('reports mixed X audio-only playlist entries as degraded media', async () => {
+  const vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-x-mixed-vault-'));
+  try {
+    const adapter = createXAdapter(xMixedPlaylistRunner());
+    const context = { url: new URL(X_VIDEO_URL), vaultDir };
+    const [report, source] = await Promise.all([adapter.probe(context), adapter.extract(context)]);
+
+    expect(report.capabilities).toEqual(['video', 'audio']);
+    expect(source.media.map((media) => media.kind)).toEqual(['video', 'audio']);
+    expect(source.warnings).toContain('video-unavailable:audio-only:audio-002');
+    expect(report.warnings).toContain('video-unavailable:audio-only:audio-002');
   } finally {
     fs.rmSync(vaultDir, { recursive: true, force: true });
   }
@@ -328,6 +358,12 @@ test('returns auth-required instead of ingesting an X login page', async () => {
 
 test('returns auth-required for a long X login flow without article structure', async () => {
   await expect(createXAdapter(longLoginPageRunner()).extract({
+    url: new URL(X_ARTICLE_URL), vaultDir: '/tmp/v',
+  })).rejects.toThrow(/auth-required/);
+});
+
+test('returns auth-required for an X flow login marker even with an article heading', async () => {
+  await expect(createXAdapter(flowLoginWithHeadingRunner()).extract({
     url: new URL(X_ARTICLE_URL), vaultDir: '/tmp/v',
   })).rejects.toThrow(/auth-required/);
 });
@@ -515,12 +551,57 @@ function xPlaylistRunner(): CommandRunner {
       expect(outputIndex).toBeGreaterThanOrEqual(0);
       expect(args[outputIndex + 1]).toContain('%(ext)s');
       expect(args[printIndex + 1]).toBe('after_move:filepath');
-      const url = args.at(-1)!;
-      const isFirst = url.endsWith('/video/1');
-      const actualPath = args[outputIndex + 1]
-        .replace('%(id)s', isFirst ? 'clip-1' : 'clip-2')
-        .replace('%(ext)s', isFirst ? 'webm' : 'mp4');
-      fs.writeFileSync(actualPath, isFirst ? 'first-video' : 'second-video');
+      expect(args.at(-1)).toBe(X_VIDEO_URL);
+      const selected = args[args.indexOf('--playlist-items') + 1];
+      const template = args[outputIndex + 1];
+      const first = template.replace('%(id)s', 'clip-1').replace('%(ext)s', 'webm');
+      const second = template.replace('%(id)s', 'clip-2').replace('%(ext)s', 'mp4');
+      if (selected === '1') {
+        expect(args).not.toContain('--no-playlist');
+        fs.writeFileSync(first, 'FIRST');
+        return { stdout: `${first}\n`, stderr: '', status: 0 };
+      }
+      if (selected === '2') {
+        expect(args).not.toContain('--no-playlist');
+        fs.writeFileSync(second, 'SECOND');
+        return { stdout: `${second}\n`, stderr: '', status: 0 };
+      }
+      fs.writeFileSync(first, 'FIRST');
+      fs.writeFileSync(second, 'SECOND');
+      return { stdout: `${first}\n${second}\n`, stderr: '', status: 0 };
+    },
+  };
+}
+
+function xPlaylistSecondFailureRunner(): CommandRunner {
+  return {
+    run(command, args) {
+      if (command !== 'yt-dlp') throw new Error(`Unexpected command: ${command}`);
+      if (args[0] === '--dump-single-json') return { stdout: fixtureText('x-video-playlist.json'), stderr: '', status: 0 };
+      const template = args[args.indexOf('-o') + 1];
+      const selected = args[args.indexOf('--playlist-items') + 1];
+      if (selected === '2') {
+        fs.writeFileSync(path.join(path.dirname(template), 'second.part'), 'partial');
+        return { stdout: '', stderr: 'second clip unavailable', status: 1 };
+      }
+      const first = template.replace('%(id)s', 'clip-1').replace('%(ext)s', 'webm');
+      fs.writeFileSync(first, 'FIRST');
+      return { stdout: `${first}\n`, stderr: '', status: 0 };
+    },
+  };
+}
+
+function xMixedPlaylistRunner(): CommandRunner {
+  return {
+    run(command, args) {
+      if (command !== 'yt-dlp') throw new Error(`Unexpected command: ${command}`);
+      if (args[0] === '--dump-single-json') return { stdout: fixtureText('x-video-mixed.json'), stderr: '', status: 0 };
+      const template = args[args.indexOf('-o') + 1];
+      const selected = args[args.indexOf('--playlist-items') + 1];
+      const video = template.replace('%(id)s', 'mixed-video').replace('%(ext)s', 'mp4');
+      const audio = template.replace('%(id)s', 'mixed-audio').replace('%(ext)s', 'm4a');
+      const actualPath = selected === '2' ? audio : video;
+      fs.writeFileSync(actualPath, selected === '2' ? 'AUDIO' : 'VIDEO');
       return { stdout: `${actualPath}\n`, stderr: '', status: 0 };
     },
   };
@@ -589,6 +670,16 @@ function longLoginPageRunner(): CommandRunner {
     run(command) {
       if (command === 'yt-dlp') return { stdout: '', stderr: 'not a video', status: 1 };
       if (command === 'defuddle') return { stdout: `Sign in to X\n\n${'Login wall content. '.repeat(20)}\n/i/flow/login`, stderr: '', status: 0 };
+      throw new Error(`Unexpected command: ${command}`);
+    },
+  };
+}
+
+function flowLoginWithHeadingRunner(): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'yt-dlp') return { stdout: '', stderr: 'not a video', status: 1 };
+      if (command === 'defuddle') return { stdout: `# Welcome to X\n\n${'Login flow content. '.repeat(20)}\n/i/flow/login`, stderr: '', status: 0 };
       throw new Error(`Unexpected command: ${command}`);
     },
   };

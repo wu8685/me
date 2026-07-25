@@ -8,7 +8,7 @@
     {
       "id": "clip-1",
       "title": "First public clip",
-      "webpage_url": "https://x.com/example/status/456/video/1",
+      "webpage_url": "https://x.com/example/status/456",
       "duration": 10,
       "ext": "mp4",
       "vcodec": "avc1.640028",
@@ -17,7 +17,7 @@
     {
       "id": "clip-2",
       "title": "Second public clip",
-      "webpage_url": "https://x.com/example/status/456/video/2",
+      "webpage_url": "https://x.com/example/status/456",
       "duration": 12,
       "ext": "mp4",
       "vcodec": "avc1.640028",
