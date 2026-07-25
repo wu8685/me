@@ -603,6 +603,11 @@ git commit -m "feat: format video sources as handouts"
 **Interfaces:**
 - Produces: `finalizeIngest(input: FinalizeInput): FinalizeResult`。
 - Consumes: `ExtractedSource`、可选 `HandoutResult`、`resolveConfig`、既有 wikilink/related-note 能力。
+- `FinalizeInput.trustedResourceRoots: string[]` 由 Task 8 orchestration 从 adapter
+  per-run workspace 或已验证 bundle root 建立；至少一个，且不接受 root/home/vault
+  root 及能包含 home/vault 的祖先目录。
+- 所有 source kind 统一输出
+  `<raw>/<topic>/<stem>/<stem>.md`，资源位于同一 artifact 的 `images/` 或 `slides/`。
 
 - [ ] **Step 1: 写原子性、资源和 README 测试**
 
@@ -621,7 +626,7 @@ test('copies assets and rewrites markdown in source order', () => {
 
 test('adds an unreachable note to the nearest README', () => {
   const result = finalizeIngest(validArticleInput(makeVault()));
-  expect(read(path.join(path.dirname(result.notePath), 'README.md'))).toContain(`[[${result.stem}]]`);
+  expect(read(path.join(path.dirname(path.dirname(result.notePath)), 'README.md'))).toContain(`[[${result.stem}]]`);
 });
 ```
 
@@ -633,7 +638,18 @@ Expected: FAIL，缺少 `finalize.ts`。
 
 - [ ] **Step 3: 实现 staging 与验证**
 
-顺序必须是：在目标 vault 内 `mkdtemp` → 复制/生成全部资源 → 验证 frontmatter、相对引用、图片数量、transcript 完整性 → 同文件系统 `renameSync` 到最终目录 → 通过同目录临时文件原子替换最近一级 README。若 README 替换失败，删除本次刚创建的最终产物并恢复原 README；任何错误都清理 staging。
+顺序必须是：topic exclusive lock + vault-wide stem reservation → vault-wide stem
+唯一性与 destination check → 在目标 topic 内 `mkdtemp` → 复制/生成全部资源 → 验证 frontmatter、tags、
+相对引用、图片数量/顺序、media syntax 与 transcript 完整性 → destination 二次检查 →
+将整个 `<stem>/` staging 目录一次同文件系统 `renameSync` 发布 → 校验 README
+snapshot 内容/metadata 未变 → 通过同目录临时文件原子替换最近一级 README。
+README CAS/替换失败时删除本次 artifact 并保留或恢复原 README；任何错误都清理
+staging/lock。已有目标不得覆盖，同 topic 第二篇图文使用独立 artifact `images/`。
+
+adversarial tests 必须覆盖：check→rename 并发目标、README snapshot→replace 并发编辑、
+协作 finalizer 串行、unsupported Obsidian/HTML/reference-style media、空/metadata-only
+handout、非法 stem/tag、stale staging/code-block false backlink、跨 topic duplicate stem、
+过宽 trusted root 与 media kind/extension 不匹配。
 
 - [ ] **Step 4: 实现 backlinks 建议**
 
@@ -705,6 +721,12 @@ interface IngestCliOptions {
 ```
 
 拒绝未知 mode、URL+Bundle 同时出现、缺少 flag 值、非法 topic、vault 外 Profile。`--processed-markdown` 只允许与 `--write` 同用，文件必须位于 `<vault>/.me/tmp/`；读取后由 finalizer 校验结构并删除临时文件。这样 Skill 可以先校订讲义，再由统一 finalizer 落盘。
+
+CLI 不提供 `--trusted-resource-root`。Orchestration 必须按来源建立
+`FinalizeInput.trustedResourceRoots`：URL adapter 使用本次 extraction 的窄范围 media
+workspace；Bundle 使用经 `loadSourceBundle` 验证的 bundle directory。不得从用户参数、
+`MediaAsset.path` 的任意祖先或整个 vault 推断宽根。生成的 stem 必须是
+`YYYY-MM-DD-<ascii-kebab-slug>`，并让 finalizer 做 vault-wide uniqueness gate。
 
 - [ ] **Step 4: 注册 adapter 与 Content-Type resolver**
 

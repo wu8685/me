@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { randomUUID } from 'crypto';
 import {
   buildVaultIndex,
@@ -21,8 +22,11 @@ export interface FinalizeInput {
   stem?: string;
   created?: string;
   tags?: string[];
-  /** Additional trusted roots for local media, for example an imported bundle directory. */
-  allowedResourceRoots?: string[];
+  /**
+   * Narrow roots established by orchestration from adapter/bundle context.
+   * Never accept these roots directly from an end-user CLI flag.
+   */
+  trustedResourceRoots: string[];
 }
 
 export interface BacklinkSuggestion {
@@ -43,6 +47,8 @@ export interface FinalizeResult {
 
 export interface FinalizeFileOperations {
   renameSync(source: fs.PathLike, destination: fs.PathLike): void;
+  beforeArtifactPublish?(destination: string): void;
+  beforeReadmeCompare?(readmePath: string): void;
 }
 
 interface PlannedAsset {
@@ -56,10 +62,21 @@ interface PlannedAsset {
 interface ReadmeState {
   kind: 'absent' | 'file' | 'directory';
   content?: string;
+  metadata?: string;
+}
+
+interface TrustedRoot {
+  lexical: string;
+  real: string;
 }
 
 const FRONTMATTER_FIELDS = new Set(['title', 'created', 'tags', 'type', 'source']);
 const VISUAL_KINDS = new Set<MediaAsset['kind']>(['image', 'figure', 'slide', 'frame']);
+const VISUAL_EXTENSIONS = new Set([
+  '.avif', '.bmp', '.gif', '.jpeg', '.jpg', '.png', '.tif', '.tiff', '.webp',
+]);
+const TAG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const STEM_PATTERN = /^(\d{4}-\d{2}-\d{2})-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 function isInside(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
@@ -85,16 +102,9 @@ function validateDate(value: string): void {
   }
 }
 
-function safeStem(value: string): string {
-  if (
-    !value
-    || value === '.'
-    || value === '..'
-    || value.endsWith('.md')
-    || /[\/\\\u0000-\u001f\u007f]/.test(value)
-  ) {
-    throw new Error('target path is outside vault');
-  }
+function safeStem(value: string, created: string): string {
+  const match = value.match(STEM_PATTERN);
+  if (!match || match[1] !== created) throw new Error('stem must be YYYY-MM-DD-kebab-slug and match created');
   return value;
 }
 
@@ -169,18 +179,40 @@ function cleanupCreatedDirectories(created: string[]): void {
   }
 }
 
-function resolveResourcePath(sourcePath: string | undefined, roots: string[]): string {
+function trustedRoots(input: FinalizeInput, vaultDir: string): TrustedRoot[] {
+  const configured = input.trustedResourceRoots;
+  if (!Array.isArray(configured) || configured.length === 0) {
+    throw new Error('at least one trusted resource root is required');
+  }
+  const realVault = fs.realpathSync(vaultDir);
+  const realHome = fs.realpathSync(os.homedir());
+  const filesystemRoot = path.parse(realVault).root;
+  const roots = configured.map(root => {
+    if (typeof root !== 'string' || !path.isAbsolute(root) || !fs.existsSync(root)) {
+      throw new Error('trusted resource root must be an existing absolute directory');
+    }
+    const real = fs.realpathSync(root);
+    if (
+      !fs.statSync(real).isDirectory()
+      || real === filesystemRoot
+      || isInside(real, realHome)
+      || isInside(real, realVault)
+    ) {
+      throw new Error('trusted resource root is too broad');
+    }
+    return { lexical: path.resolve(root), real };
+  });
+  return roots.filter((root, index) =>
+    roots.findIndex(candidate => candidate.lexical === root.lexical && candidate.real === root.real) === index);
+}
+
+function resolveResourcePath(sourcePath: string | undefined, roots: TrustedRoot[]): string {
   if (!sourcePath || !path.isAbsolute(sourcePath)) {
     throw new Error('missing asset');
   }
   const lexicalSource = path.resolve(sourcePath);
-  const matchingRoots = roots.flatMap(root => {
-    const lexicalRoot = path.resolve(root);
-    if (!isInside(lexicalRoot, lexicalSource)) return [];
-    if (!fs.existsSync(lexicalRoot) || !fs.statSync(lexicalRoot).isDirectory()) return [];
-    return [{ lexicalRoot, realRoot: fs.realpathSync(lexicalRoot) }];
-  });
-  if (matchingRoots.length === 0) throw new Error('asset is outside allowed resource roots');
+  const matchingRoots = roots.filter(root => isInside(root.lexical, lexicalSource));
+  if (matchingRoots.length === 0) throw new Error('asset is outside trusted resource roots');
   if (!fs.existsSync(sourcePath)) throw new Error('missing asset');
 
   let realSource: string;
@@ -191,9 +223,16 @@ function resolveResourcePath(sourcePath: string | undefined, roots: string[]): s
     throw new Error('missing asset');
   }
 
-  const allowed = matchingRoots.some(root => isInside(root.realRoot, realSource));
-  if (!allowed) throw new Error('asset is outside allowed resource roots');
+  const allowed = matchingRoots.some(root => isInside(root.real, realSource));
+  if (!allowed) throw new Error('asset is outside trusted resource roots');
   return realSource;
+}
+
+function validateMediaExtension(asset: MediaAsset, sourcePath: string): void {
+  const extension = path.extname(asset.path ?? sourcePath).toLowerCase();
+  if (VISUAL_KINDS.has(asset.kind) && !VISUAL_EXTENSIONS.has(extension)) {
+    throw new Error(`media kind ${asset.kind} is incompatible with extension ${extension || '(none)'}`);
+  }
 }
 
 function parseFrontmatter(markdown: string): { frontmatter?: string; body: string } {
@@ -219,6 +258,43 @@ function scalar(value: string): string {
   return clean;
 }
 
+function validateTag(value: unknown): string {
+  if (typeof value !== 'string' || !TAG_PATTERN.test(value)) {
+    throw new Error('frontmatter schema: tags must contain English kebab-case strings');
+  }
+  return value;
+}
+
+function parseTagList(value: string): string[] {
+  const clean = value.trim();
+  if (!clean.startsWith('[') || !clean.endsWith(']')) {
+    throw new Error('frontmatter schema: tags must be an inline list');
+  }
+  const inner = clean.slice(1, -1).trim();
+  if (!inner) return [];
+  return inner.split(',').map(item => {
+    const token = item.trim();
+    if (!token) throw new Error('frontmatter schema: malformed tags list');
+    if (token.startsWith('"')) {
+      if (!token.endsWith('"')) throw new Error('frontmatter schema: malformed tags list');
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(token);
+      } catch {
+        throw new Error('frontmatter schema: malformed tags list');
+      }
+      return validateTag(parsed);
+    }
+    if (token.startsWith("'")) {
+      if (!token.endsWith("'") || token.slice(1, -1).includes("'")) {
+        throw new Error('frontmatter schema: malformed tags list');
+      }
+      return validateTag(token.slice(1, -1));
+    }
+    return validateTag(token);
+  });
+}
+
 function validateFrontmatter(frontmatter: string, source: ExtractedSource): void {
   const match = frontmatter.match(/^---\r?\n([\s\S]*?)\r?\n---$/);
   if (!match) throw new Error('frontmatter schema: invalid delimiters');
@@ -236,9 +312,7 @@ function validateFrontmatter(frontmatter: string, source: ExtractedSource): void
   }
   if (!scalar(values.get('title') ?? '')) throw new Error('frontmatter schema: title is empty');
   validateDate(scalar(values.get('created') ?? ''));
-  if (!/^\[[^\]\r\n]*\]$/.test(values.get('tags')?.trim() ?? '')) {
-    throw new Error('frontmatter schema: tags must be an inline list');
-  }
+  parseTagList(values.get('tags') ?? '');
   if (scalar(values.get('type') ?? '') !== 'article') {
     throw new Error('frontmatter schema: raw ingest type must be article');
   }
@@ -255,15 +329,13 @@ function validateFrontmatter(frontmatter: string, source: ExtractedSource): void
 }
 
 function generatedFrontmatter(input: FinalizeInput, created: string): string {
-  const tags = input.tags ?? [];
-  if (tags.some(tag => /[\],\r\n]/.test(tag) || !tag.trim())) {
-    throw new Error('frontmatter schema: invalid tag');
-  }
+  if (input.tags !== undefined && !Array.isArray(input.tags)) throw new Error('frontmatter schema: tags must be a list');
+  const tags = (input.tags ?? []).map(validateTag);
   return [
     '---',
     `title: ${yamlString(input.source.source.title)}`,
     `created: ${created}`,
-    `tags: [${tags.map(tag => tag.trim()).join(', ')}]`,
+    `tags: [${tags.map(yamlString).join(', ')}]`,
     'type: article',
     `source: ${yamlString(input.source.source.url)}`,
     '---',
@@ -306,6 +378,12 @@ function validateSource(source: ExtractedSource, handout?: HandoutResult): void 
   if (handout?.omittedTranscriptSegments.length) {
     throw new Error('handout has omitted transcript segments');
   }
+  if (handout && (source.source.kind === 'video' || source.source.kind === 'course')) {
+    const warnings = [...source.warnings, ...handout.warnings];
+    if (transcript.length === 0 || warnings.includes('transcript-empty')) {
+      throw new Error('video/course handout requires a non-empty transcript');
+    }
+  }
 }
 
 function extensionFor(asset: MediaAsset, sourcePath: string): string {
@@ -322,7 +400,7 @@ function imageEmbed(asset: MediaAsset, relativePath: string): string {
 function articleBodyAndAssets(
   input: FinalizeInput,
   staging: string,
-  finalParent: string,
+  artifactPath: string,
   resourceRoots: string[],
 ): { body: string; assets: PlannedAsset[] } {
   const mediaById = new Map(input.source.media.map(asset => [asset.id, asset]));
@@ -339,6 +417,7 @@ function articleBodyAndAssets(
     }
     referenced.add(asset.id);
     const sourcePath = resolveResourcePath(asset.path, resourceRoots);
+    validateMediaExtension(asset, sourcePath);
     const relativePath = path.posix.join(
       'images',
       `image-${String(assets.length + 1).padStart(3, '0')}${extensionFor(asset, sourcePath)}`,
@@ -349,7 +428,7 @@ function articleBodyAndAssets(
       relativePath,
       sourcePath,
       stagedPath: path.join(staging, ...relativePath.split('/')),
-      finalPath: path.join(finalParent, ...relativePath.split('/')),
+      finalPath: path.join(artifactPath, ...relativePath.split('/')),
     });
   }
 
@@ -389,7 +468,8 @@ function handoutBodyAndAssets(
     const asset = mediaById.get(id);
     if (!asset || !VISUAL_KINDS.has(asset.kind)) throw new Error('missing asset reference');
     const sourcePath = resolveResourcePath(asset.path, resourceRoots);
-    const filename = path.basename(sourcePath);
+    validateMediaExtension(asset, sourcePath);
+    const filename = path.basename(asset.path as string);
     const relativePath = path.posix.join('slides', filename);
     return {
       asset,
@@ -433,8 +513,32 @@ function imageReferences(markdown: string): string[] {
   return references;
 }
 
+function rejectUnsupportedMediaSyntax(markdown: string): void {
+  if (
+    /!\[\[/m.test(markdown)
+    || /<img\b[^>]*>/im.test(markdown)
+    || /!\[[^\]\r\n]*\]\s*\[[^\]\r\n]*\]/m.test(markdown)
+    || /!\[[^\]\r\n]+\](?!\s*\()/m.test(markdown)
+  ) {
+    throw new Error('unsupported media syntax; use inline Markdown images with local relative paths');
+  }
+}
+
+function hasSubstantiveHandoutBody(markdown: string): boolean {
+  return markdown.split(/\r?\n/).some(line => {
+    const clean = line.trim();
+    return Boolean(clean)
+      && !clean.startsWith('#')
+      && !clean.startsWith('>')
+      && !clean.startsWith('---')
+      && !clean.startsWith('![')
+      && !clean.startsWith('<!--');
+  });
+}
+
 function validateStagedArtifact(markdown: string, assets: PlannedAsset[], frontmatter: string, source: ExtractedSource): void {
   validateFrontmatter(frontmatter, source);
+  rejectUnsupportedMediaSyntax(markdown);
   const references = imageReferences(markdown);
   const expected = assets.map(asset => asset.relativePath);
   if (references.length !== expected.length || references.some((reference, index) => reference !== expected[index])) {
@@ -454,6 +558,7 @@ function noteFiles(vaultDir: string, layerDirectories: string[]): string[] {
     if (!fs.existsSync(directory)) return;
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory() && entry.name.startsWith('.me-ingest-staging-')) continue;
       if (entry.isSymbolicLink()) {
         const real = fs.realpathSync(candidate);
         if (!isInside(realVault, real)) throw new Error('vault note path is outside vault');
@@ -469,6 +574,24 @@ function noteFiles(vaultDir: string, layerDirectories: string[]): string[] {
   return files;
 }
 
+function searchableMarkdown(content: string): string {
+  const withoutFrontmatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
+  const lines = withoutFrontmatter.split(/\r?\n/);
+  const visible: string[] = [];
+  let fence: '`' | '~' | undefined;
+  for (const line of lines) {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/);
+    if (marker) {
+      const kind = marker[1][0] as '`' | '~';
+      if (!fence) fence = kind;
+      else if (fence === kind) fence = undefined;
+      continue;
+    }
+    if (!fence) visible.push(line);
+  }
+  return visible.join('\n');
+}
+
 function discoverSuggestions(
   vaultDir: string,
   files: string[],
@@ -480,7 +603,7 @@ function discoverSuggestions(
   const linkPattern = new RegExp(`\\[\\[${escapeRegex(stem)}(?:\\]|[|#])`, 'gi');
   const mentionPattern = new RegExp(`${escapeRegex(title)}|${escapeRegex(stem)}`, 'i');
   for (const file of files) {
-    const content = fs.readFileSync(file, 'utf8');
+    const content = searchableMarkdown(fs.readFileSync(file, 'utf8'));
     const links = content.match(linkPattern) ?? [];
     const relative = path.relative(vaultDir, file);
     if (links.length > 0) {
@@ -497,11 +620,20 @@ function discoverSuggestions(
 
 function readReadmeState(readmePath: string): ReadmeState {
   if (!fs.existsSync(readmePath)) return { kind: 'absent' };
-  const stat = fs.lstatSync(readmePath);
+  const stat = fs.lstatSync(readmePath, { bigint: true });
   if (stat.isSymbolicLink()) throw new Error('README path is outside vault');
-  if (stat.isFile()) return { kind: 'file', content: fs.readFileSync(readmePath, 'utf8') };
-  if (stat.isDirectory()) return { kind: 'directory' };
+  const metadata = [
+    stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs,
+  ].join(':');
+  if (stat.isFile()) return { kind: 'file', content: fs.readFileSync(readmePath, 'utf8'), metadata };
+  if (stat.isDirectory()) return { kind: 'directory', metadata };
   throw new Error('README path is invalid');
+}
+
+function sameReadmeState(left: ReadmeState, right: ReadmeState): boolean {
+  return left.kind === right.kind
+    && left.content === right.content
+    && left.metadata === right.metadata;
 }
 
 function readmeContent(state: ReadmeState, parent: string, stem: string): string {
@@ -566,15 +698,39 @@ export function finalizeIngest(
   const created = input.created ?? new Date().toISOString().slice(0, 10);
   validateDate(created);
   const derived = deriveSlug(input.source.source.title) || 'ingest';
-  const stem = safeStem(input.stem ?? `${created}-${derived}`);
-  const isDirectoryArtifact = Boolean(input.handout);
-  const artifactPath = isDirectoryArtifact ? path.join(finalParent, stem) : path.join(finalParent, `${stem}.md`);
-  const notePath = isDirectoryArtifact ? path.join(artifactPath, `${stem}.md`) : artifactPath;
+  const stem = safeStem(input.stem ?? `${created}-${derived}`, created);
+  const artifactPath = path.join(finalParent, stem);
+  const notePath = path.join(artifactPath, `${stem}.md`);
   assertSafeVaultPath(vaultDir, artifactPath, 'target path');
+  if (input.tags !== undefined && !Array.isArray(input.tags)) {
+    throw new Error('frontmatter schema: tags must be a list');
+  }
+  const tags = (input.tags ?? []).map(validateTag);
+  const resourceRoots = trustedRoots(input, vaultDir);
 
   const createdDirectories: string[] = [];
   createDirectoryTracked(finalParent, createdDirectories);
-  const staging = fs.mkdtempSync(path.join(finalParent, '.me-ingest-staging-'));
+  const reservationDirectory = path.join(vaultDir, '.me', 'ingest-reservations');
+  createDirectoryTracked(reservationDirectory, createdDirectories);
+  const lockPaths = [
+    path.join(reservationDirectory, `${stem}.lock`),
+    path.join(finalParent, '.me-ingest-finalize.lock'),
+  ];
+  const locks: Array<{ path: string; handle: number }> = [];
+  try {
+    for (const lockPath of lockPaths) {
+      locks.push({ path: lockPath, handle: fs.openSync(lockPath, 'wx', 0o600) });
+    }
+  } catch {
+    for (const acquired of locks.reverse()) {
+      fs.closeSync(acquired.handle);
+      fs.rmSync(acquired.path, { force: true });
+    }
+    cleanupCreatedDirectories(createdDirectories);
+    throw new Error('ingest finalizer is locked or stem is reserved by another operation');
+  }
+
+  let staging: string | undefined;
   let readmeTemp: string | undefined;
   const published: string[] = [];
   let readmePath: string | undefined;
@@ -582,24 +738,31 @@ export function finalizeIngest(
   let readmeAttempted = false;
 
   try {
-    // Snapshot suggestions before the staged note is written. Staging lives
-    // inside a configured layer for same-filesystem publication and must never
-    // appear as a related note, backlink, or unlinked mention.
-    const vaultIndex = buildVaultIndex(vaultDir);
-    const relatedNotes = scoreRelatedNotes(input.tags ?? [], input.source.source.title, vaultIndex, vaultDir);
     const files = noteFiles(vaultDir, configuredLayers);
+    if (files.some(file => path.basename(file, '.md').toLowerCase() === stem.toLowerCase())) {
+      throw new Error(`duplicate stem already exists in vault: ${stem}`);
+    }
+    const vaultIndex = buildVaultIndex(vaultDir);
+    const relatedNotes = scoreRelatedNotes(tags, input.source.source.title, vaultIndex, vaultDir);
     const suggestions = discoverSuggestions(vaultDir, files, stem, input.source.source.title);
 
-    const resourceRoots = [vaultDir, ...(input.allowedResourceRoots ?? [])];
+    staging = fs.mkdtempSync(path.join(finalParent, '.me-ingest-staging-'));
     const preparedParts = input.handout
       ? handoutBodyAndAssets(input, staging, artifactPath, resourceRoots)
-      : articleBodyAndAssets(input, staging, finalParent, resourceRoots);
+      : articleBodyAndAssets(input, staging, artifactPath, resourceRoots);
     const processed = parseFrontmatter(preparedParts.body);
     if (processed.frontmatter && input.frontmatter) {
       throw new Error('frontmatter schema: frontmatter was supplied twice');
     }
     const frontmatter = input.frontmatter ?? processed.frontmatter ?? generatedFrontmatter(input, created);
     const body = processed.body.trim();
+    if (
+      input.handout
+      && (input.source.source.kind === 'video' || input.source.source.kind === 'course')
+      && !hasSubstantiveHandoutBody(body)
+    ) {
+      throw new Error('video/course handout has no substantive transcript body');
+    }
     const markdown = `${frontmatter}\n\n${body}\n`;
     const stagedNote = path.join(staging, `${stem}.md`);
 
@@ -611,9 +774,6 @@ export function finalizeIngest(
     validateStagedArtifact(markdown, preparedParts.assets, frontmatter, input.source);
 
     if (fs.existsSync(artifactPath)) throw new Error(`destination already exists: ${artifactPath}`);
-    for (const asset of preparedParts.assets) {
-      if (fs.existsSync(asset.finalPath)) throw new Error(`destination already exists: ${asset.finalPath}`);
-    }
 
     const shouldUpdateReadme = suggestions.backlinks.length === 0;
     if (shouldUpdateReadme) {
@@ -624,25 +784,18 @@ export function finalizeIngest(
       fs.writeFileSync(readmeTemp, readmeContent(readmeState, finalParent, stem), { flag: 'wx' });
     }
 
-    if (isDirectoryArtifact) {
-      fileOperations.renameSync(staging, artifactPath);
-      published.push(artifactPath);
-    } else {
-      for (const asset of preparedParts.assets) {
-        const assetParent = path.dirname(asset.finalPath);
-        if (!fs.existsSync(assetParent)) {
-          fs.mkdirSync(assetParent);
-          createdDirectories.push(assetParent);
-        }
-        fileOperations.renameSync(asset.stagedPath, asset.finalPath);
-        published.push(asset.finalPath);
-      }
-      fileOperations.renameSync(stagedNote, notePath);
-      published.push(notePath);
-    }
+    fileOperations.beforeArtifactPublish?.(artifactPath);
+    if (fs.existsSync(artifactPath)) throw new Error(`destination already exists before publish: ${artifactPath}`);
+    fileOperations.renameSync(staging, artifactPath);
+    staging = undefined;
+    published.push(artifactPath);
 
     if (readmeTemp && readmePath) {
       try {
+        fileOperations.beforeReadmeCompare?.(readmePath);
+        if (!readmeState || !sameReadmeState(readmeState, readReadmeState(readmePath))) {
+          throw new Error('README changed during compare-and-swap');
+        }
         readmeAttempted = true;
         fileOperations.renameSync(readmeTemp, readmePath);
         readmeTemp = undefined;
@@ -673,7 +826,11 @@ export function finalizeIngest(
     throw cause;
   } finally {
     if (readmeTemp) fs.rmSync(readmeTemp, { force: true });
-    fs.rmSync(staging, { recursive: true, force: true });
+    if (staging) fs.rmSync(staging, { recursive: true, force: true });
+    for (const acquired of locks.reverse()) {
+      fs.closeSync(acquired.handle);
+      fs.rmSync(acquired.path, { force: true });
+    }
     cleanupCreatedDirectories(createdDirectories);
   }
 }

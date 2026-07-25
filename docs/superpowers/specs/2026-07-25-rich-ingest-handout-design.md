@@ -318,32 +318,43 @@ ingest:
 
 ## 11. 落盘
 
-图文：
-
-```text
-<raw>/<topic>/YYYY-MM-DD-<slug>.md
-<raw>/<topic>/images/...
-```
-
-讲义：
+所有 ingest 产物使用相同的 note-specific artifact directory。图文与讲义只在资源子目录名称上不同：
 
 ```text
 <raw>/<topic>/YYYY-MM-DD-<slug>/
 ├── YYYY-MM-DD-<slug>.md
-└── slides/
+├── images/                         # 图文
+└── slides/                         # 讲义
 ```
 
 主 Markdown 保持唯一文件名，避免多个 `handout.md` 造成 Obsidian wikilink 歧义。
+`stem` 必须严格符合 `YYYY-MM-DD-<ascii-kebab-slug>`；在配置的三层目录中
+全局唯一，禁止依赖目录路径消除 Obsidian wikilink 歧义。
 
 Finalizer 必须：
 
-1. 在 vault 内创建 staging 目录；
-2. 生成 Markdown 与资源；
-3. 验证 frontmatter、资源、引用和时间范围；
-4. 原子移动到目标路径；
-5. 检查索引可达性；
-6. 若没有入链，则更新最近一级 README 索引；
-7. 运行 backlinks，结果只作为建议，不自动修改其他笔记正文。
+1. 由 orchestration 显式传入至少一个窄范围 `trustedResourceRoots`；不得信任 `/`、
+   home、vault root 或能包含 home/vault 的祖先目录，也不把该能力暴露成用户可传的
+   CLI 参数；
+2. 在 topic 目录取得 exclusive lock，并在 vault 内取得 stem reservation；二者覆盖
+   uniqueness/destination check、artifact publish 与 README compare-and-swap。同 topic
+   协作 finalizer 必须串行，不同 topic 的同 stem 也不能并发发布；
+3. 在目标 vault/topic 内创建 staging 目录，生成 Markdown 与全部资源；
+4. 验证 frontmatter、English kebab-case tags、资源类型/扩展、相对引用、图片数量与
+   顺序、transcript 完整性；不支持的 Obsidian/HTML/reference-style media syntax
+   必须显式拒绝；
+5. 将整个 `<stem>/` staging 目录以一次同文件系统 `rename` 发布；已有同名目标
+   或 vault 其他位置的同 stem 均 fail closed；
+6. 检查索引可达性；扫描排除 staging，并忽略 frontmatter/fenced code 中的 wikilink；
+7. 若没有有效入链，则以 snapshot 内容和 metadata 做 README compare-and-swap，
+   再通过同目录 temp rename 替换；
+8. README 变化或替换失败时撤销本次 artifact；并发用户内容不得被恢复逻辑覆盖；
+9. 返回 related notes/backlinks/unlinked mentions 建议，不修改其他笔记正文。
+
+topic exclusive lock、vault-wide stem reservation 与二次 destination check 保证所有
+遵守 contract 的 finalizer 不会互相覆盖。外部 hostile writer 若绕过 lock，portable Node/Bun 文件 API 无
+`renameat2(RENAME_NOREPLACE)` 等价物，仍存在最后一次检查到 rename 之间的不可消除
+竞态；实现必须在检测到已出现的目标时保留对方数据并失败。
 
 ## 12. 失败与降级
 
@@ -354,6 +365,7 @@ Finalizer 必须：
 - PDF 只得到摘要页却被当作全文；
 - bundle path 越界或包含禁止字段；
 - transcript 时间范围无效；
+- 视频/课程 transcript 为空、含 `transcript-empty`、或正式讲义只有 metadata/header；
 - 图片数量不一致且未报告；
 - 正式讲义缺少主体正文。
 
@@ -371,6 +383,9 @@ Finalizer 必须：
 - temporary directory 必须在结束时清理；
 - 日志不输出 cookie、token、header、key 或敏感 query；
 - bundle import 不执行任何 bundle 内脚本；
+- resource root 只由 adapter/bundle orchestration 建立，且必须窄于 vault/home/root；
+- source media 的 lexical path 与 realpath 都必须落在同一个 trusted root 内；
+- 不支持的 media embed syntax 必须拒绝，不能因 parser 未识别而漏过 traversal/absolute 引用；
 - 浏览器登录态只存在于 Agent 会话，不写入 ME 产物；
 - 公开 fixture 不包含真实付费内容。
 
@@ -391,6 +406,9 @@ Finalizer 必须：
 - transcription provider 选择；
 - Slide-driven 与 Topic-driven formatter；
 - atomic write 与失败清理；
+- destination check→rename 与 README snapshot→replace 并发注入；
+- 同 topic 多篇图文资源隔离、vault-wide stem 唯一性；
+- trusted resource root、media extension 与 unsupported media syntax；
 - README 可达性；
 - secret redaction。
 

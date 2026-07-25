@@ -78,6 +78,7 @@ function validArticleInput(vault: string): FinalizeInput {
     stem: '2026-07-25-atomic-ingest-guide',
     created: '2026-07-25',
     tags: ['ingest', 'atomic'],
+    trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
   };
 }
 
@@ -96,7 +97,10 @@ function stagingEntries(vault: string): string[] {
 }
 
 function expectedNote(vault: string): string {
-  return path.join(vault, 'knowledge/raw/atomic-ingest/2026-07-25-atomic-ingest-guide.md');
+  return path.join(
+    vault,
+    'knowledge/raw/atomic-ingest/2026-07-25-atomic-ingest-guide/2026-07-25-atomic-ingest-guide.md',
+  );
 }
 
 describe('finalizeIngest', () => {
@@ -115,6 +119,7 @@ describe('finalizeIngest', () => {
     const result = finalizeIngest(validArticleInput(vault));
     const note = fs.readFileSync(result.notePath, 'utf8');
 
+    expect(result.notePath).toBe(expectedNote(vault));
     expect(note).toContain('段落一\n\n![图一](images/image-001.jpg)\n\n段落二');
     expect(fs.readFileSync(path.join(path.dirname(result.notePath), 'images', 'image-001.jpg'), 'utf8'))
       .toBe('image bytes');
@@ -126,13 +131,13 @@ describe('finalizeIngest', () => {
   test('adds an unreachable note to the nearest README', () => {
     const vault = makeVault();
     const result = finalizeIngest(validArticleInput(vault));
-    const readmePath = path.join(path.dirname(result.notePath), 'README.md');
+    const readmePath = path.join(path.dirname(path.dirname(result.notePath)), 'README.md');
 
     expect(result.readmePath).toBe(readmePath);
     expect(fs.readFileSync(readmePath, 'utf8')).toContain(`[[${result.stem}]]`);
   });
 
-  test('rejects an asset outside the allowed roots and an escaping asset symlink', () => {
+  test('rejects an asset outside trusted roots and an escaping asset symlink', () => {
     const vault = makeVault();
     const outside = temporaryDirectory('me-finalize-private-');
     const privatePath = path.join(outside, 'private.jpg');
@@ -140,17 +145,17 @@ describe('finalizeIngest', () => {
     const direct = validArticleInput(vault);
     direct.source.media[0].path = privatePath;
 
-    expect(() => finalizeIngest(direct)).toThrow(/outside allowed resource roots/);
+    expect(() => finalizeIngest(direct)).toThrow(/outside trusted resource roots/);
 
     const nonexistentOutside = validArticleInput(vault);
     nonexistentOutside.source.media[0].path = path.join(outside, 'does-not-exist.jpg');
-    expect(() => finalizeIngest(nonexistentOutside)).toThrow(/outside allowed resource roots/);
+    expect(() => finalizeIngest(nonexistentOutside)).toThrow(/outside trusted resource roots/);
 
     const symlink = path.join(vault, '.me', 'tmp', 'linked.jpg');
     fs.symlinkSync(privatePath, symlink);
     const linked = validArticleInput(vault);
     linked.source.media[0].path = symlink;
-    expect(() => finalizeIngest(linked)).toThrow(/outside allowed resource roots/);
+    expect(() => finalizeIngest(linked)).toThrow(/outside trusted resource roots/);
     expect(stagingEntries(vault)).toEqual([]);
     expect(fs.existsSync(expectedNote(vault))).toBeFalse();
   });
@@ -162,7 +167,7 @@ describe('finalizeIngest', () => {
     fs.writeFileSync(assetPath, 'bundle image');
     const input = validArticleInput(vault);
     input.source = articleSource(vault, assetPath);
-    input.allowedResourceRoots = [bundle];
+    input.trustedResourceRoots = [bundle];
 
     const result = finalizeIngest(input);
     expect(fs.readFileSync(result.assetPaths[0], 'utf8')).toBe('bundle image');
@@ -188,7 +193,7 @@ describe('finalizeIngest', () => {
     fs.mkdirSync(path.dirname(notePath), { recursive: true });
     fs.writeFileSync(notePath, 'keep existing note');
 
-    expect(() => finalizeIngest(validArticleInput(vault))).toThrow(/destination already exists/);
+    expect(() => finalizeIngest(validArticleInput(vault))).toThrow(/duplicate stem|destination already exists/);
     expect(fs.readFileSync(notePath, 'utf8')).toBe('keep existing note');
 
     fs.rmSync(notePath);
@@ -240,6 +245,7 @@ describe('finalizeIngest', () => {
       topic: 'courses',
       stem: '2026-07-25-complete-course',
       created: '2026-07-25',
+      trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
     })).toThrow(/omitted transcript/);
 
     expect(stagingEntries(vault)).toEqual([]);
@@ -249,12 +255,12 @@ describe('finalizeIngest', () => {
   test('rolls back the artifact when the README replacement fails', () => {
     const vault = makeVault();
     const input = validArticleInput(vault);
-    const parent = path.dirname(expectedNote(vault));
+    const parent = path.dirname(path.dirname(expectedNote(vault)));
     fs.mkdirSync(path.join(parent, 'README.md', 'not-a-file'), { recursive: true });
 
     expect(() => finalizeIngest(input)).toThrow(/README/);
     expect(fs.existsSync(expectedNote(vault))).toBeFalse();
-    expect(fs.existsSync(path.join(parent, 'images', 'image-001.jpg'))).toBeFalse();
+    expect(fs.existsSync(path.dirname(expectedNote(vault)))).toBeFalse();
     expect(fs.statSync(path.join(parent, 'README.md')).isDirectory()).toBeTrue();
     expect(stagingEntries(vault)).toEqual([]);
   });
@@ -262,7 +268,7 @@ describe('finalizeIngest', () => {
   test('preserves an existing README byte-for-byte when its temp rename fails after artifact publish', () => {
     const vault = makeVault();
     const input = validArticleInput(vault);
-    const parent = path.dirname(expectedNote(vault));
+    const parent = path.dirname(path.dirname(expectedNote(vault)));
     const readmePath = path.join(parent, 'README.md');
     fs.mkdirSync(parent, { recursive: true });
     fs.writeFileSync(readmePath, '# Existing index\n\nKeep this text.\n');
@@ -281,42 +287,311 @@ describe('finalizeIngest', () => {
 
     expect(fs.readFileSync(readmePath, 'utf8')).toBe('# Existing index\n\nKeep this text.\n');
     expect(fs.existsSync(expectedNote(vault))).toBeFalse();
-    expect(fs.existsSync(path.join(parent, 'images', 'image-001.jpg'))).toBeFalse();
+    expect(fs.existsSync(path.dirname(expectedNote(vault)))).toBeFalse();
     expect(stagingEntries(vault)).toEqual([]);
   });
 
-  test('rolls back only transaction-owned files when an asset rename fails', () => {
+  test('publishes a second illustrated article in the same topic without resource collisions', () => {
+    const vault = makeVault();
+    const first = finalizeIngest(validArticleInput(vault));
+    const second = validArticleInput(vault);
+    second.stem = '2026-07-25-second-atomic-guide';
+    second.source.source.title = 'Second Atomic Guide';
+    second.source.media[0].path = writeAsset(vault, 'second.jpg', 'second image');
+
+    const result = finalizeIngest(second);
+
+    expect(fs.readFileSync(first.assetPaths[0], 'utf8')).toBe('image bytes');
+    expect(fs.readFileSync(result.assetPaths[0], 'utf8')).toBe('second image');
+    expect(path.dirname(first.notePath)).not.toBe(path.dirname(result.notePath));
+  });
+
+  test('does not overwrite a destination created in the check-to-rename window', () => {
+    const vault = makeVault();
+    const artifact = path.dirname(expectedNote(vault));
+    const userFile = path.join(artifact, 'user-created.txt');
+
+    expect(() => finalizeIngest(validArticleInput(vault), {
+      beforeArtifactPublish(destination) {
+        expect(destination).toBe(artifact);
+        fs.mkdirSync(artifact);
+        fs.writeFileSync(userFile, 'user data');
+      },
+      renameSync: fs.renameSync,
+    })).toThrow(/destination.*exists|publish/i);
+
+    expect(fs.readFileSync(userFile, 'utf8')).toBe('user data');
+    expect(stagingEntries(vault)).toEqual([]);
+  });
+
+  test('serializes cooperating finalizers with an exclusive topic lock', () => {
+    const vault = makeVault();
+    let nestedAttempted = false;
+    const second = validArticleInput(vault);
+    second.stem = '2026-07-25-second-atomic-guide';
+    second.source.source.title = 'Second Atomic Guide';
+    second.source.media[0].path = writeAsset(vault, 'second.jpg', 'second');
+
+    const first = finalizeIngest(validArticleInput(vault), {
+      beforeArtifactPublish() {
+        nestedAttempted = true;
+        expect(() => finalizeIngest(second)).toThrow(/locked|in progress/i);
+      },
+      renameSync: fs.renameSync,
+    });
+
+    expect(nestedAttempted).toBeTrue();
+    expect(fs.existsSync(first.notePath)).toBeTrue();
+    expect(fs.existsSync(path.dirname(first.notePath))).toBeTrue();
+  });
+
+  test('reserves a stem vault-wide across concurrent topics', () => {
+    const vault = makeVault();
+    const otherTopic = validArticleInput(vault);
+    otherTopic.topic = 'other-topic';
+    let nestedAttempted = false;
+
+    finalizeIngest(validArticleInput(vault), {
+      beforeArtifactPublish() {
+        nestedAttempted = true;
+        expect(() => finalizeIngest(otherTopic)).toThrow(/locked|reserved|in progress/i);
+      },
+      renameSync: fs.renameSync,
+    });
+
+    expect(nestedAttempted).toBeTrue();
+    expect(fs.existsSync(path.join(
+      vault,
+      'knowledge/raw/other-topic/2026-07-25-atomic-ingest-guide',
+    ))).toBeFalse();
+  });
+
+  test('detects a concurrent README edit with compare-and-swap and preserves it', () => {
+    const vault = makeVault();
+    const parent = path.dirname(path.dirname(expectedNote(vault)));
+    const readmePath = path.join(parent, 'README.md');
+    fs.mkdirSync(parent, { recursive: true });
+    fs.writeFileSync(readmePath, '# Existing index\n');
+
+    expect(() => finalizeIngest(validArticleInput(vault), {
+      beforeReadmeCompare() {
+        fs.writeFileSync(readmePath, '# Concurrent user edit\n');
+      },
+      renameSync: fs.renameSync,
+    })).toThrow(/README.*changed|compare-and-swap/i);
+
+    expect(fs.readFileSync(readmePath, 'utf8')).toBe('# Concurrent user edit\n');
+    expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+    expect(stagingEntries(vault)).toEqual([]);
+  });
+
+  test('rejects unsupported media syntax instead of omitting it from validation', () => {
+    const fixtures = [
+      '段落一\n\n![图一](images/image-001.jpg)\n\n![[../../private.png]]',
+      '段落一\n\n![图一](images/image-001.jpg)\n\n<img src="/etc/passwd">',
+      '段落一\n\n![图一](images/image-001.jpg)\n\n![private][asset]\n\n[asset]: ../../private.png',
+    ];
+    for (const processedMarkdown of fixtures) {
+      const vault = makeVault();
+      const input = validArticleInput(vault);
+      input.processedMarkdown = processedMarkdown;
+
+      expect(() => finalizeIngest(input)).toThrow(/unsupported media syntax/);
+      expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+    }
+  });
+
+  test('rejects an empty or metadata-only video handout', () => {
+    for (const warnings of [[], ['transcript-empty']]) {
+      const vault = makeVault();
+      const source: ExtractedSource = {
+        source: {
+          url: 'https://example.com/empty-course',
+          kind: 'course',
+          title: 'Empty Course',
+          durationSec: 60,
+        },
+        blocks: [],
+        transcript: [],
+        media: [],
+        provenance: {
+          extractor: 'fixture',
+          extractedAt: '2026-07-25T00:00:00Z',
+          methods: ['fixture'],
+        },
+        warnings,
+      };
+      const handout: HandoutResult = {
+        kind: 'topic',
+        markdown: '# Empty Course（讲义）\n\n> 作者：未知｜总时长：01:00\n',
+        usedMediaIds: [],
+        omittedTranscriptSegments: [],
+        warnings,
+      };
+
+      expect(() => finalizeIngest({
+        vaultDir: vault,
+        source,
+        handout,
+        topic: 'courses',
+        stem: '2026-07-25-empty-course',
+        created: '2026-07-25',
+        trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+      })).toThrow(/transcript|substantive/i);
+    }
+
+    const vault = makeVault();
+    const source: ExtractedSource = {
+      source: {
+        url: 'https://example.com/metadata-only',
+        kind: 'video',
+        title: 'Metadata Only',
+        durationSec: 60,
+      },
+      blocks: [],
+      transcript: [{ start: 0, end: 60, text: '必须保留的完整论证' }],
+      media: [],
+      provenance: {
+        extractor: 'fixture',
+        extractedAt: '2026-07-25T00:00:00Z',
+        methods: ['fixture'],
+      },
+      warnings: [],
+    };
+    expect(() => finalizeIngest({
+      vaultDir: vault,
+      source,
+      handout: {
+        kind: 'topic',
+        markdown: '# Metadata Only（讲义）\n\n必须保留的完整论证\n',
+        usedMediaIds: [],
+        omittedTranscriptSegments: [],
+        warnings: [],
+      },
+      processedMarkdown: '# Metadata Only（讲义）\n\n> 作者：未知｜总时长：01:00\n',
+      topic: 'courses',
+      stem: '2026-07-25-metadata-only',
+      created: '2026-07-25',
+      trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+    })).toThrow(/substantive/i);
+  });
+
+  test('rejects unsafe or noncanonical stems before creating an artifact', () => {
+    for (const stem of [
+      '2026-07-25-Escape',
+      'atomic-ingest',
+      '2026-07-25-safe]]|# ![[private',
+      '2026-07-25-double--hyphen',
+    ]) {
+      const vault = makeVault();
+      const input = validArticleInput(vault);
+      input.stem = stem;
+      expect(() => finalizeIngest(input)).toThrow(/stem|target path/);
+      expect(stagingEntries(vault)).toEqual([]);
+    }
+  });
+
+  test('ignores stale staging, frontmatter, and fenced-code wikilinks for reachability', () => {
+    const vault = makeVault();
+    const raw = path.join(vault, 'knowledge/raw');
+    const stem = '2026-07-25-atomic-ingest-guide';
+    const stale = path.join(raw, '.me-ingest-staging-stale');
+    fs.mkdirSync(stale);
+    fs.writeFileSync(path.join(stale, 'stale.md'), `[[${stem}]]\n`);
+    fs.writeFileSync(path.join(raw, 'code-only.md'), [
+      '---',
+      `title: "[[${stem}]]"`,
+      'created: 2026-07-20',
+      'tags: []',
+      'type: article',
+      'source: "https://example.com/code"',
+      '---',
+      '',
+      '```md',
+      `[[${stem}]]`,
+      '```',
+      '',
+    ].join('\n'));
+
+    const result = finalizeIngest(validArticleInput(vault));
+    const readmePath = path.join(path.dirname(path.dirname(result.notePath)), 'README.md');
+
+    expect(result.readmePath).toBe(readmePath);
+    expect(fs.readFileSync(readmePath, 'utf8')).toContain(`[[${stem}]]`);
+    expect(result.backlinks).toEqual([]);
+  });
+
+  test('rejects a duplicate stem anywhere in configured vault layers', () => {
+    const vault = makeVault();
+    const duplicate = path.join(
+      vault,
+      'knowledge/raw/another-topic/2026-07-25-atomic-ingest-guide.md',
+    );
+    fs.mkdirSync(path.dirname(duplicate), { recursive: true });
+    fs.writeFileSync(duplicate, [
+      '---',
+      'title: "Older Atomic Ingest Guide"',
+      'created: 2026-07-20',
+      'tags: []',
+      'type: article',
+      'source: "https://example.com/older"',
+      '---',
+      '',
+      'Older note.',
+      '',
+    ].join('\n'));
+
+    expect(() => finalizeIngest(validArticleInput(vault))).toThrow(/duplicate stem|already exists/i);
+    expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+  });
+
+  test('validates tags as English kebab-case strings and emits quoted YAML strings', () => {
+    for (const tags of [['bad:tag'], ['Uppercase'], [{ secret: 'value' }]]) {
+      const vault = makeVault();
+      const input = validArticleInput(vault);
+      input.tags = tags as unknown as string[];
+      expect(() => finalizeIngest(input)).toThrow(/tag/i);
+    }
+
+    const malformedVault = makeVault();
+    const malformed = validArticleInput(malformedVault);
+    malformed.frontmatter = [
+      '---',
+      'title: "Atomic Ingest Guide"',
+      'created: 2026-07-25',
+      'tags: [{secret: value}]',
+      'type: article',
+      'source: "https://example.com/article"',
+      '---',
+    ].join('\n');
+    expect(() => finalizeIngest(malformed)).toThrow(/tag/i);
+
+    const vault = makeVault();
+    const result = finalizeIngest(validArticleInput(vault));
+    expect(fs.readFileSync(result.notePath, 'utf8')).toContain('tags: ["ingest", "atomic"]');
+  });
+
+  test('requires narrow explicit trusted resource roots and compatible media extensions', () => {
+    for (const root of [undefined, '/', os.homedir(), makeVault()]) {
+      const vault = makeVault();
+      const input = validArticleInput(vault);
+      if (root === undefined) {
+        delete (input as Partial<FinalizeInput>).trustedResourceRoots;
+      } else {
+        input.trustedResourceRoots = [root === '/' || root === os.homedir() ? root : vault];
+      }
+      expect(() => finalizeIngest(input)).toThrow(/trusted resource root/i);
+    }
+
+    const ancestorVault = makeVault();
+    const ancestorInput = validArticleInput(ancestorVault);
+    ancestorInput.trustedResourceRoots = [path.dirname(ancestorVault)];
+    expect(() => finalizeIngest(ancestorInput)).toThrow(/trusted resource root/i);
+
     const vault = makeVault();
     const input = validArticleInput(vault);
-    const secondSource = writeAsset(vault, 'second.png', 'second image');
-    input.source.blocks.push({
-      id: 'block-004',
-      kind: 'figure',
-      markdown: '![第二张](/tmp/second.png)',
-      mediaId: 'figure-002',
-    });
-    input.source.media.push({
-      id: 'figure-002',
-      kind: 'figure',
-      path: secondSource,
-      alt: '第二张',
-    });
-    const images = path.join(path.dirname(expectedNote(vault)), 'images');
-    const sentinel = path.join(images, 'not-created-by-finalizer.txt');
-
-    expect(() => finalizeIngest(input, {
-      renameSync(source, destination) {
-        if (destination.toString().endsWith('image-002.png')) {
-          fs.writeFileSync(sentinel, 'keep me');
-          throw new Error('injected second asset failure');
-        }
-        fs.renameSync(source, destination);
-      },
-    })).toThrow(/injected second asset failure/);
-
-    expect(fs.readFileSync(sentinel, 'utf8')).toBe('keep me');
-    expect(fs.existsSync(path.join(images, 'image-001.jpg'))).toBeFalse();
-    expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+    input.source.media[0].path = writeAsset(vault, 'not-an-image.txt', 'text');
+    expect(() => finalizeIngest(input)).toThrow(/extension|media kind/i);
   });
 
   test('returns related notes, backlinks, and unlinked mentions without editing notes', () => {
@@ -401,6 +676,7 @@ describe('finalizeIngest', () => {
       topic: 'courses',
       stem: '2026-07-25-complete-course',
       created: '2026-07-25',
+      trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
     });
 
     expect(result.notePath).toBe(path.join(
