@@ -2642,6 +2642,15 @@ test_ingest_skill_under_500_lines() {
   fi
 }
 
+test_ingest_skill_rich_contract() {
+  local f="$PLUGIN_ROOT/skills/ingest/SKILL.md"
+  assert_file_contains "$f" "Source Bundle" || return 1
+  assert_file_contains "$f" "handout" || return 1
+  assert_file_contains "$f" "Slide-driven" || return 1
+  assert_file_contains "$f" "Topic-driven" || return 1
+  assert_file_contains "$f" "不得报告完成" || return 1
+}
+
 # ── Quick 260517-fs2: Bilibili source adapter ──
 
 test_ingest_skill_bilibili_source_adapter() {
@@ -4400,6 +4409,7 @@ main() {
     run_test test_ingest_skill_filename_convention
     run_test test_ingest_skill_image_download
     run_test test_ingest_skill_under_500_lines
+    run_test test_ingest_skill_rich_contract
 
     # ── Quick 260517-fs2: Bilibili source adapter ──
     run_test test_ingest_skill_bilibili_source_adapter

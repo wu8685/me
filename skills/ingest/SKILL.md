@@ -1,190 +1,118 @@
 ---
 name: ingest
-description: "Ingest a URL into the knowledge base. Claude Code: /me:ingest <URL>; Codex skill: me:ingest."
+description: Use when a URL, PDF, X article or video, Bilibili video, video handout, or Source Bundle needs ingest into an ME raw knowledge layer.
 ---
 
 # /me:ingest
 
-Fetches a URL and saves it as a structured research document in the raw layer.
-Supports three modes: translate to Chinese, summarize, or save raw content.
+Ingest a source through the public adapter pipeline and its atomic finalizer.
+Claude Code: `/me:ingest <source>`; Codex skill: me:ingest.
+`bin/ingest.ts` owns detection, extraction, downloads, transcription, handout
+formatting, schema checks, asset localization, indexing, and writes. Do not
+reimplement those deterministic steps in the skill.
 
-All deterministic steps (config resolution, language detection, slug derivation,
-vault indexing, auto-linking, related note scoring) run via `bin/ingest.ts`.
-LLM reasoning is only used for translate-cn and summarize content transformation.
-
-Layer directories resolve from `.me/config.yaml` (with raw/practices/cognition as defaults).
+Layer directories come from `.me/config.yaml`. English articles default to
+`translate-cn`, Chinese/中文 articles to `summarize`, and video/course sources to
+`handout`. An explicit `raw`, `translate-cn`, `summarize`, `transcribe`, or
+`handout` request overrides the default.
 
 ## Source Adapters
 
-`extractContent(url)` in `bin/ingest.ts` dispatches to a source-specific adapter
-based on URL shape. Downstream contract (frontmatter, auto-link, related-notes,
-JSON output) is identical regardless of source.
+The CLI selects Bilibili, X, PDF, or HTML and reports `adapterId`,
+`capabilities`, and `warnings`. Bilibili prefers CC and can fall back to local
+`whisper` transcription. An explicit adapter failure must stay failed: never
+ingest an X login shell, PDF abstract page, or generic error page as source
+content.
 
-- **HTML (default)** — `defuddle parse` pipeline. Handles articles, blogs, papers.
-- **Bilibili** — API + CC subtitle pipeline. Auto-detected on URLs matching
-  `bilibili.com/video/BV...` or `b23.tv/...`. When the video has no CC subtitle,
-  falls back to `whisper` transcription via the `--mode transcribe` opt-in
-  (see Step 2.5). yt-dlp + whisper-cpp must be installed for the fallback path.
+Source Bundle input is a static interchange format, not executable code. Read
+[`references/source-bundle-v1.md`](references/source-bundle-v1.md) only when
+importing or producing a bundle.
 
-## Step 1: Run scriptable pipeline
+## Workflow
 
-Parse `$ARGUMENTS` to get the URL (first token) and optional `--mode` flag.
+### 1. Run a read-only probe/preview
+
+Resolve `PLUGIN_ROOT` to this installed plugin/repository and `VAULT_DIR` to the
+vault root. Run without `--write`:
 
 ```bash
-PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT}"
-VAULT_DIR="$(pwd)"
-URL="<first token from $ARGUMENTS>"
-MODE_FLAG=""  # add "--mode raw" or "--mode translate-cn" etc. if --mode was specified
-
-RESULT=$(bun run "$PLUGIN_ROOT/bin/ingest.ts" "$URL" $MODE_FLAG --vault-dir "$VAULT_DIR" 2>/dev/null)
+bun run "$PLUGIN_ROOT/bin/ingest.ts" "$URL" --vault-dir "$VAULT_DIR"
+# or
+bun run "$PLUGIN_ROOT/bin/ingest.ts" --bundle "$BUNDLE_DIR" --vault-dir "$VAULT_DIR"
 ```
 
-If `bun run "$PLUGIN_ROOT/bin/ingest.ts"` fails, report the error to the user and stop.
+Inspect `mode`, `sourceKind`, `adapterId`, `capabilities`, `warnings`, and
+`handoutKind`. Stop on a blocked source. A title without a real body is not
+readable content.
 
-Parse the JSON output. It contains:
-- `title`: article title
-- `slug`: kebab-case English slug (max 60 chars)
-- `language`: "en" or "zh"
-- `mode`: auto-detected mode ("translate-cn" for English, "summarize" for Chinese)
-- `frontmatter`: YAML block with title, created, tags, type, source
-- `content`: full extracted content
-- `images`: array of image URLs found in the article
-- `autoLinks`: array of wikilink stems inserted into body text
-- `relatedNotes`: top 5 related vault notes by tag+keyword score
+### 2. Confirm mode and topic
 
-## Step 2: Confirm mode with user
+Show the detected mode and suggest an ASCII kebab-case topic. Ask the user to
+accept or override them, then rerun the preview with the exact choices:
 
-Present the detected mode from the JSON output:
-
-```
-Detected: [English/Chinese] article.
-Mode: [translate-cn/summarize/raw]
-Override? (press Enter to accept, or type: translate-cn | summarize | raw)
+```bash
+bun run "$PLUGIN_ROOT/bin/ingest.ts" "$URL" \
+  --vault-dir "$VAULT_DIR" --mode "$MODE" --topic "$TOPIC"
 ```
 
-Wait for user input. If user types a valid mode, update MODE_FLAG and re-run Step 1 with `--mode <new-mode>`.
-If Enter (empty), proceed with the JSON output already obtained.
+For bundles, replace `"$URL"` with `--bundle "$BUNDLE_DIR"`.
 
-**If mode is "raw"**: write file directly from script output. Skip to Step 5.
+### 3. Apply only the necessary LLM edit
 
-## Step 2.5: Transcription opt-in (Bilibili only)
+For `translate-cn` or `summarize`, edit the preview body and write the processed
+Markdown to a unique file under `"$VAULT_DIR/.me/tmp/"`. Preserve Markdown,
+wikilinks, code, image references, source order, and all substantive content.
+Use the CLI-generated frontmatter contract:
 
-This step only fires when the JSON output from Step 1 contains
-`"needsTranscription": true` (Bilibili video missing CC subtitles).
-
-Check the `transcriptionAvailable` field:
-
-- If `transcriptionAvailable: false`, surface the install hint and proceed with
-  metadata-only content:
-
-  ```
-  视频无 CC 字幕。whisper 转录需要 yt-dlp + whisper-cpp：
-    brew install yt-dlp
-    brew install whisper-cpp
-  继续以仅元数据模式入库（无字幕正文）。
-  ```
-
-- If `transcriptionAvailable: true`, prompt the user:
-
-  ```
-  视频无 CC，是否启动 whisper 转录？(y / n)
-  ```
-
-  - On `y`: append `--mode transcribe` to `MODE_FLAG` and re-run Step 1.
-    Replace the JSON output with the new result (which now embeds the whisper
-    transcript and omits `needsTranscription`).
-  - On `n`: continue with metadata-only content from the original JSON.
-
-## Step 3: LLM Processing (translate-cn or summarize only)
-
-Apply the selected mode to `content` from the JSON output:
-
-### Mode: translate-cn
-
-Translate English content to Chinese. Rules:
-- **Keep in English**: technical terms ("Prompt Engineering", "Chain-of-Thought"), product names ("OpenAI", "React"), framework names, function names, APIs, CLI commands, code block contents
-- **Translate to Chinese**: narrative text, section titles (may keep key terms in parentheses), general descriptions and examples
-- **Preserve exactly**: all code blocks, inline code, markdown formatting, image references, wikilinks already inserted by auto-linking
-
-### Mode: summarize
-
-Extract key points in the article's original language:
-- 2-3 sentence overview of what the source says
-- Bulleted key points (5-10 most important)
-- Notable quotes or data points
-
-### Output structure for ALL modes
-
-The final file content MUST match `templates/raw-template.md` exactly. Use the `frontmatter` from the JSON output as-is — do NOT add status, lifecycle, or date_created fields:
-
-```markdown
----
-title: "Article Title Here"
+```yaml
+title: "Source title"
 created: YYYY-MM-DD
-tags: [tag-one, tag-two]
+tags: ["english-kebab-tag"]
 type: article
-source: "https://original-url.com"
----
-
-<!-- Summary: 2-3 sentence overview of what this source says -->
-
-## Key Points
-
-- Key point one
-- Key point two
-
-## Raw Notes
-
-[Processed content here]
+source: "https://original.example/source"
 ```
 
-See `skills/ingest/references/translation-guidelines.md` for extended translation examples.
+For `raw`, `transcribe`, and `handout`, use the deterministic CLI output.
+`handout` is not a ten-point summary: it must retain the complete timestamped
+transcript in sections. Read
+[`references/handout-contract.md`](references/handout-contract.md) when handling
+video/course output. Slide-driven requires real stable timestamped pages;
+Topic-driven is required when those pages do not exist.
 
-## Step 4: Confirm topic folder with user
+### 4. Finalize through the CLI
 
-Analyze the slug from JSON output to suggest a topic folder:
+Never create the vault note or asset directories directly. For an LLM-edited
+body:
 
-```
-Detected topic: ai-agents
-Save to {raw_dir}/ai-agents/? (press Enter to accept, or type a different folder name)
-```
-
-Wait for user input. Validate that any override matches `^[a-z0-9-]+$`. Ask again if invalid.
-
-## Step 5: Write file and post-process
-
-Construct filename: `YYYY-MM-DD-{slug}.md` using date from frontmatter and slug from JSON.
-
-Full path: `{raw_dir}/{topic}/{filename}`
-
-Steps:
-1. `mkdir -p {raw_dir}/{topic}`
-2. Write the processed content with frontmatter from JSON output
-3. Download images (with automatic retries on failure): `bun run "$PLUGIN_ROOT/bin/ingest.ts" --download-images --vault-dir "$VAULT_DIR" --target-dir "{raw_dir}/{topic}/images/" --urls "<comma-separated image URLs>"`
-4. Update any downloaded image references from remote URLs to local `images/{filename}`
-5. Report results from JSON output
-
-```
-Ingested: {title}
-Mode: {mode}
-Saved to: {raw_dir}/{topic}/{filename}
-Auto-linked: {autoLinks joined with ", "}
-Related notes: top results from relatedNotes array
-Images: {N} downloaded locally, {M} preserved as remote
+```bash
+bun run "$PLUGIN_ROOT/bin/ingest.ts" "$URL" \
+  --vault-dir "$VAULT_DIR" --mode "$MODE" --topic "$TOPIC" \
+  --processed-markdown "$VAULT_DIR/.me/tmp/$TEMP_FILE" --write
 ```
 
-## Reference: Frontmatter Schema
+Without an edited body, omit `--processed-markdown`. For bundles, use
+`--bundle "$BUNDLE_DIR"`. The finalizer creates the
+`{raw_dir}/{topic}/YYYY-MM-DD-slug/` artifact, validates frontmatter and every
+resource, downloads/copies assets with retry/fallback behavior, and updates
+reachability atomically.
 
-Per `templates/SCHEMA.md` — raw layer fields:
+The Agent's browser may produce a Source Bundle only when the public CLI cannot
+read the source and the user already has lawful access. Never put browser login
+state, cookies, Authorization headers, tokens, absolute paths, or DRM bypass
+material in a bundle.
 
-| Field | Type | Required | Notes |
-|-------|------|----------|-------|
-| `title` | string | yes | Human-readable article title |
-| `created` | YYYY-MM-DD | yes | Script output uses `date +%Y-%m-%d` |
-| `tags` | list | yes | 3-5 tags, English, kebab-case |
-| `type` | string | yes | Always `article` for raw layer |
-| `source` | URL string | yes | Original source URL |
+## Completion contract
 
-**Forbidden fields**: status, lifecycle, the deprecated date_created field — directory is the lifecycle indicator (D-06)
+Report:
 
-Layer directories resolve from `.me/config.yaml`. Defaults: raw, practices, cognition.
+- saved note path and selected mode;
+- adapter and handout kind;
+- transcript coverage for video/course;
+- downloaded versus failed image/figure/slide counts;
+- every warning and degraded/blocked capability;
+- related-note and backlink suggestions returned by the CLI.
+
+Metadata-only video/course output may be labeled and saved as an incomplete
+pointer when the user explicitly requests it, but **不得报告完成**. A failed
+resource remains a reported failure even when the rest of the note is useful.
+Do not call a handout complete when transcript segments are missing.
