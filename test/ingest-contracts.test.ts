@@ -345,6 +345,7 @@ describe('rich ingest CLI orchestration', () => {
   ])('writes %s inline and duplicate images in source order with stable localized associations', async (_label, url) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-inline-images-'));
     const vault = path.join(root, 'vault');
+    const downloadedUrls: string[] = [];
     fs.mkdirSync(vault);
     try {
       const result = await runRichIngest(parseIngestCliOptions([
@@ -352,7 +353,7 @@ describe('rich ingest CLI orchestration', () => {
         '--vault-dir', vault,
         '--mode', 'raw',
         '--write',
-      ]), inlineDuplicateArticleRunner(url));
+      ]), inlineDuplicateArticleRunner(url, downloadedUrls));
       const note = fs.readFileSync(result.writeResult!.notePath, 'utf8');
 
       expect(note).toContain([
@@ -374,19 +375,49 @@ describe('rich ingest CLI orchestration', () => {
         'download-1',
         'download-2',
       ]);
+      expect(downloadedUrls).toEqual([
+        'https://cdn.example.com/same.png',
+        'https://cdn.example.com/same.png',
+      ]);
+      expect(note).toContain('`![inline-code](https://cdn.example.com/inline-code.png)`');
+      expect(note).toContain([
+        '```md',
+        '![fenced-code](https://cdn.example.com/fenced-code.png)',
+        '```',
+      ].join('\n'));
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   test('rejects sensitive Bundle values before --write and leaves the vault empty without echoing secrets', async () => {
-    const secret = ['runtime', 'private', 'value'].join('-');
-    const tokenKey = ['access', 'token'].join('_');
+    const secret = ['sk', '-', 'C'.repeat(32)].join('');
     const headerName = ['Authoriza', 'tion'].join('');
     const invalidCases = [
       { source: { url: `https://reader:${secret}@example.com/source`, kind: 'article', title: 'Source' } },
-      { source: { url: `https://example.com/source?${tokenKey}=${secret}`, kind: 'article', title: 'Source' } },
+      {
+        source: {
+          url: `https://example.com/source?${['au', 'th'].join('')}=${secret}`,
+          kind: 'article',
+          title: 'Source',
+        },
+      },
+      {
+        source: {
+          url: `https://example.com/source?${['X', '-Amz-', 'Credential'].join('')}=${secret}`,
+          kind: 'article',
+          title: 'Source',
+        },
+      },
+      { source: { url: 'https://example.com/source', kind: 'article', title: secret } },
       { provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: [`${headerName}: Bearer ${secret}`] } },
+      {
+        provenance: {
+          extractor: 'fixture',
+          extractedAt: '2026-07-25T00:00:00Z',
+          methods: [`${['client', '_', 'secret'].join('')}=${secret}`],
+        },
+      },
     ];
 
     for (const invalid of invalidCases) {
@@ -419,6 +450,93 @@ describe('rich ingest CLI orchestration', () => {
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
+    }
+  });
+
+  test('does not echo an untrusted media ID from a full Bundle write failure payload', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-hostile-media-id-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    const hostileId = ['media-', '<script>', 'alert-1'].join('');
+    fs.mkdirSync(vault);
+    fs.mkdirSync(bundle);
+    fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+      version: 1,
+      source: { url: 'https://example.com/source', kind: 'article', title: 'Source' },
+      blocks: [{
+        id: 'b1',
+        kind: 'image',
+        markdown: '![Remote](https://cdn.example.com/image.png)',
+        mediaId: hostileId,
+      }],
+      media: [{
+        id: hostileId,
+        kind: 'image',
+        url: 'https://cdn.example.com/image.png',
+      }],
+      provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: [] },
+      warnings: [],
+    }));
+    try {
+      let payload = '';
+      try {
+        await runRichIngest(parseIngestCliOptions([
+          '--bundle', bundle, '--vault-dir', vault, '--mode', 'raw', '--write',
+        ]), {
+          run() {
+            return { stdout: '', stderr: '', status: 1 };
+          },
+        });
+      } catch (error) {
+        payload = JSON.stringify(ingestErrorPayload(error));
+      }
+      expect(payload).toMatch(/stage media|failed/i);
+      expect(payload).not.toContain(hostileId);
+      expect(fs.readdirSync(vault)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('does not echo an untrusted media ID from a finalizer media validation failure payload', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-hostile-finalizer-id-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    const hostileId = ['media-', '<img-onerror>', 'alert-2'].join('');
+    fs.mkdirSync(vault);
+    fs.mkdirSync(bundle);
+    fs.writeFileSync(path.join(bundle, 'asset-without-extension'), 'image');
+    fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+      version: 1,
+      source: { url: 'https://example.com/source', kind: 'article', title: 'Source' },
+      blocks: [{
+        id: 'b1',
+        kind: 'image',
+        markdown: '![Local](asset-without-extension)',
+        mediaId: hostileId,
+      }],
+      media: [{
+        id: hostileId,
+        kind: 'image',
+        path: 'asset-without-extension',
+      }],
+      provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: [] },
+      warnings: [],
+    }));
+    try {
+      let payload = '';
+      try {
+        await runRichIngest(parseIngestCliOptions([
+          '--bundle', bundle, '--vault-dir', vault, '--mode', 'raw', '--write',
+        ]));
+      } catch (error) {
+        payload = JSON.stringify(ingestErrorPayload(error));
+      }
+      expect(payload).toMatch(/extension|media kind/i);
+      expect(payload).not.toContain(hostileId);
+      expect(fs.readdirSync(vault)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -642,7 +760,7 @@ function xTranscribeUrlRunner(): CommandRunner {
   };
 }
 
-function inlineDuplicateArticleRunner(url: string): CommandRunner {
+function inlineDuplicateArticleRunner(url: string, downloadedUrls: string[] = []): CommandRunner {
   let download = 0;
   const markdown = [
     '# Inline duplicate article',
@@ -654,6 +772,12 @@ function inlineDuplicateArticleRunner(url: string): CommandRunner {
       '![same](https://cdn.example.com/same.png)',
       'After the second occurrence.',
     ].join(' '),
+    '',
+    '`![inline-code](https://cdn.example.com/inline-code.png)`',
+    '',
+    '```md',
+    '![fenced-code](https://cdn.example.com/fenced-code.png)',
+    '```',
     '',
     'This substantive public article body is intentionally long enough for the X Article readability gate. '
       + 'It contains ordinary explanatory prose, evidence, and a conclusion without depending on a live source. '.repeat(2),
@@ -671,6 +795,7 @@ function inlineDuplicateArticleRunner(url: string): CommandRunner {
       }
       if (command === 'curl') {
         const destination = args[args.indexOf('-o') + 1];
+        downloadedUrls.push(args.at(-1) ?? '');
         download += 1;
         fs.writeFileSync(destination, `download-${download}`);
         return { stdout: 'image/png', stderr: '', status: 0 };

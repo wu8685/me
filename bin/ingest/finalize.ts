@@ -83,6 +83,21 @@ const VISUAL_EXTENSIONS = new Set([
 const TAG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const STEM_PATTERN = /^(\d{4}-\d{2}-\d{2})-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
+function isVisualAsset(asset: MediaAsset): boolean {
+  return VISUAL_KINDS.has(asset.kind);
+}
+
+function visualAssets(source: ExtractedSource): MediaAsset[] {
+  return source.media.filter(isVisualAsset);
+}
+
+function visualReferenceIds(source: ExtractedSource): string[] {
+  return source.blocks
+    .filter(block => block.kind === 'image' || block.kind === 'figure')
+    .map(block => block.mediaId)
+    .filter((id): id is string => Boolean(id));
+}
+
 function isInside(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
@@ -409,13 +424,9 @@ function hasSubstantiveVideoBody(source: ExtractedSource): boolean {
 }
 
 function hasPublishableVideoMedia(source: ExtractedSource): boolean {
-  const referenced = new Set(source.blocks
-    .filter(block => block.kind === 'image' || block.kind === 'figure')
-    .map(block => block.mediaId)
-    .filter((id): id is string => Boolean(id)));
-  return source.media.some(asset =>
+  const referenced = new Set(visualReferenceIds(source));
+  return visualAssets(source).some(asset =>
     Boolean(asset.path)
-    && VISUAL_KINDS.has(asset.kind)
     && referenced.has(asset.id));
 }
 
@@ -497,7 +508,7 @@ function validateSource(source: ExtractedSource, handout?: HandoutResult): void 
 
 function extensionFor(asset: MediaAsset, sourcePath: string): string {
   const extension = path.extname(sourcePath);
-  if (!extension || extension === '.') throw new Error(`missing asset extension for ${asset.id}`);
+  if (!extension || extension === '.') throw new Error('missing asset extension');
   return extension.toLowerCase();
 }
 
@@ -521,7 +532,7 @@ function articleBodyAndAssets(
     if (block.kind !== 'image' && block.kind !== 'figure') continue;
     if (!block.mediaId) throw new Error('missing asset reference');
     const asset = mediaById.get(block.mediaId);
-    if (!asset || !VISUAL_KINDS.has(asset.kind) || referenced.has(asset.id)) {
+    if (!asset || !isVisualAsset(asset) || referenced.has(asset.id)) {
       throw new Error('missing asset or invalid image count');
     }
     referenced.add(asset.id);
@@ -541,8 +552,7 @@ function articleBodyAndAssets(
     });
   }
 
-  const visualIds = input.source.media.filter(asset => asset.kind === 'image' || asset.kind === 'figure')
-    .map(asset => asset.id);
+  const visualIds = visualAssets(input.source).map(asset => asset.id);
   if (visualIds.length !== referenced.size || visualIds.some(id => !referenced.has(id))) {
     throw new Error('invalid image count');
   }
@@ -575,7 +585,7 @@ function handoutBodyAndAssets(
   }
   const assets = handout.usedMediaIds.map((id): PlannedAsset => {
     const asset = mediaById.get(id);
-    if (!asset || !VISUAL_KINDS.has(asset.kind)) throw new Error('missing asset reference');
+    if (!asset || !isVisualAsset(asset)) throw new Error('missing asset reference');
     const sourcePath = resolveResourcePath(asset.path, resourceRoots);
     validateMediaExtension(asset, sourcePath);
     const filename = path.basename(asset.path as string);

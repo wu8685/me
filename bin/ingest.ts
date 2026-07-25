@@ -1078,7 +1078,7 @@ function prepareSourceMedia(
       '--max-filesize', String(MAX_REMOTE_MEDIA_BYTES),
       '-o', staging, '-w', '%{content_type}', asset.url,
     ], { timeoutMs: 35000 });
-    if (result.status !== 0) throw new Error(`failed to stage media asset: ${asset.id}`);
+    if (result.status !== 0) throw new Error('failed to stage media asset');
     requireCompatibleRemoteContentType(asset, result.stdout);
     if (
       !fs.existsSync(staging)
@@ -1087,7 +1087,7 @@ function prepareSourceMedia(
       || fs.statSync(staging).size > MAX_REMOTE_MEDIA_BYTES
     ) {
       fs.rmSync(staging, { force: true });
-      throw new Error(`failed to stage media asset: ${asset.id}`);
+      throw new Error('failed to stage media asset');
     }
     fs.renameSync(staging, destination);
     return { ...asset, path: destination };

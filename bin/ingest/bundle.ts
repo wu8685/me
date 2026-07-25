@@ -17,9 +17,39 @@ export interface SourceBundleV1 {
   warnings: Array<{ code: string; message: string; mediaId?: string }>;
 }
 
-const FORBIDDEN_KEYS = /^(cookie|authorization|token|decrypt(?:ion)?key|secret)$/i;
-const SENSITIVE_QUERY_VALUE = /^(?:Bearer|Basic)\s+\S+|^(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{8,}|^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/i;
-const CREDENTIAL_VALUE = /\b(?:Bearer|Basic)\s+\S+|\b(?:proxy-)?authorization\s*:\s*\S+|\bcookie\s*:\s*\S+|\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+/i;
+const SENSITIVE_KEYS = new Set([
+  'accesskey',
+  'accesskeyid',
+  'accesstoken',
+  'apikey',
+  'auth',
+  'authorization',
+  'awsaccesskeyid',
+  'awssecretaccesskey',
+  'clientsecret',
+  'cookie',
+  'credential',
+  'decryptkey',
+  'decryptionkey',
+  'password',
+  'passwd',
+  'privatekey',
+  'proxyauthorization',
+  'refreshtoken',
+  'secret',
+  'secretaccesskey',
+  'securitytoken',
+  'sessiontoken',
+  'setcookie',
+  'signature',
+  'token',
+  'xapikey',
+  'xamzcredential',
+  'xamzsecuritytoken',
+  'xamzsignature',
+]);
+const HIGH_CONFIDENCE_CREDENTIAL = /(?:^|[\s"'=:,(])(?:Bearer|Basic)\s+\S+|(?:^|[\s"'=:,(])(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{16,}|(?:^|[\s"'=:,(])(?:AKIA|ASIA)[A-Z0-9]{16}(?:$|[\s"',;)])|(?:^|[\s"'=:,(])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:$|[\s"',;)])|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/i;
+const KEYED_VALUE = /\b([A-Za-z][A-Za-z0-9_-]{1,63})\s*[:=]\s*(\S+)/g;
 const ABSOLUTE_LOCAL_PATH = /(?:^|[\s"'=(])(?:\/(?!\/)[^\s"']+|[A-Za-z]:\\[^\s"']+)/;
 const SOURCE_KINDS = new Set(['article', 'paper', 'video', 'course']);
 const BLOCK_KINDS = new Set(['heading', 'paragraph', 'quote', 'code', 'image', 'figure']);
@@ -73,22 +103,93 @@ function rejectUnknownKeys(value: RecordValue, allowed: string[], label: string,
   }
 }
 
-function isHttpUrl(value: string, label: string, issues: string[]): boolean {
+function normalizeSensitiveKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_KEYS.has(normalizeSensitiveKey(key));
+}
+
+function isSourceBody(pathParts: Array<string | number>): boolean {
+  return (
+    pathParts.length === 3
+    && pathParts[0] === 'blocks'
+    && typeof pathParts[1] === 'number'
+    && pathParts[2] === 'markdown'
+  ) || (
+    pathParts.length === 3
+    && pathParts[0] === 'transcript'
+    && typeof pathParts[1] === 'number'
+    && pathParts[2] === 'text'
+  );
+}
+
+function addIssue(issues: string[], issue: string): void {
+  if (!issues.includes(issue)) issues.push(issue);
+}
+
+function scanSensitiveString(value: string, issues: string[]): void {
+  if (HIGH_CONFIDENCE_CREDENTIAL.test(value)) {
+    addIssue(issues, 'bundle contains sensitive credential data');
+  }
+
+  KEYED_VALUE.lastIndex = 0;
+  for (const match of value.matchAll(KEYED_VALUE)) {
+    if (isSensitiveKey(match[1])) {
+      addIssue(issues, 'bundle contains sensitive credential data');
+      break;
+    }
+  }
+
   try {
     const url = new URL(value);
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-    if (url.username || url.password) issues.push(`${label} contains credentials`);
-    for (const [key, queryValue] of url.searchParams) {
-      const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (
-        /^(?:accesstoken|apikey|authorization|authtoken|clientsecret|cookie|credential|decryptkey|password|refreshtoken|secret|sessionid|signature|token)$/.test(normalizedKey)
-        || SENSITIVE_QUERY_VALUE.test(queryValue)
-      ) {
-        issues.push(`${label} contains sensitive query data`);
-        break;
+    if (url.protocol === 'http:' || url.protocol === 'https:') {
+      if (url.username || url.password) {
+        addIssue(issues, 'bundle contains sensitive credential data');
+      }
+      for (const [key, queryValue] of url.searchParams) {
+        if (isSensitiveKey(key) || HIGH_CONFIDENCE_CREDENTIAL.test(queryValue)) {
+          addIssue(issues, 'bundle contains sensitive credential data');
+          break;
+        }
       }
     }
-    return true;
+  } catch {
+    // Non-URL strings still receive keyed-value and token scanning above.
+  }
+
+  if (ABSOLUTE_LOCAL_PATH.test(value)) {
+    addIssue(issues, 'bundle contains a local path');
+  }
+}
+
+function scanSensitiveStructure(
+  value: unknown,
+  issues: string[],
+  pathParts: Array<string | number> = [],
+  seen = new WeakSet<object>(),
+): void {
+  if (typeof value === 'string') {
+    if (!isSourceBody(pathParts)) scanSensitiveString(value, issues);
+    return;
+  }
+  if (typeof value !== 'object' || value === null || seen.has(value)) return;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    value.forEach((child, index) => scanSensitiveStructure(child, issues, [...pathParts, index], seen));
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (isSensitiveKey(key)) addIssue(issues, 'forbidden sensitive credential field');
+    scanSensitiveStructure(child, issues, [...pathParts, key], seen);
+  }
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
   } catch {
     return false;
   }
@@ -96,7 +197,7 @@ function isHttpUrl(value: string, label: string, issues: string[]): boolean {
 
 function requireHttpUrl(value: unknown, label: string, issues: string[]): value is string {
   if (!requireString(value, label, issues)) return false;
-  if (!isHttpUrl(value, label, issues)) {
+  if (!isHttpUrl(value)) {
     issues.push(`${label} must be an http(s) URL`);
     return false;
   }
@@ -106,21 +207,6 @@ function requireHttpUrl(value: unknown, label: string, issues: string[]): value 
 function optionalString(value: unknown, label: string, issues: string[]): string | undefined {
   if (value === undefined) return undefined;
   return requireString(value, label, issues) ? value : undefined;
-}
-
-function rejectForbiddenKeys(value: unknown, issues: string[], seen = new WeakSet<object>()): void {
-  if (typeof value !== 'object' || value === null || seen.has(value)) return;
-  seen.add(value);
-  for (const [key, child] of Object.entries(value)) {
-    if (FORBIDDEN_KEYS.test(key)) issues.push('forbidden credential field');
-    rejectForbiddenKeys(child, issues, seen);
-  }
-}
-
-function rejectSensitiveMetadata(value: string | undefined, label: string, issues: string[]): void {
-  if (!value) return;
-  if (CREDENTIAL_VALUE.test(value)) issues.push(`${label} contains sensitive credential data`);
-  if (ABSOLUTE_LOCAL_PATH.test(value)) issues.push(`${label} contains a local path`);
 }
 
 function validateSource(value: unknown, issues: string[]): ExtractedSource['source'] | undefined {
@@ -135,10 +221,6 @@ function validateSource(value: unknown, issues: string[]): ExtractedSource['sour
   const author = optionalString(source.author, 'source.author', issues);
   const publishedAt = optionalString(source.publishedAt, 'source.publishedAt', issues);
   const language = optionalString(source.language, 'source.language', issues);
-  rejectSensitiveMetadata(title, 'source.title', issues);
-  rejectSensitiveMetadata(author, 'source.author', issues);
-  rejectSensitiveMetadata(publishedAt, 'source.publishedAt', issues);
-  rejectSensitiveMetadata(language, 'source.language', issues);
   if (source.durationSec !== undefined && (typeof source.durationSec !== 'number' || !Number.isFinite(source.durationSec) || source.durationSec <= 0)) {
     issues.push('source.durationSec must be a positive finite number');
   }
@@ -165,12 +247,16 @@ function validateBlocks(value: unknown, issues: string[]): SourceBlock[] {
     rejectUnknownKeys(block, ['id', 'kind', 'markdown', 'mediaId', 'page'], `blocks[${index}]`, issues);
     const id = requireString(block.id, `blocks[${index}].id`, issues) ? block.id : '';
     requireUniqueId(id, ids, 'block', issues);
-    rejectSensitiveMetadata(id, `blocks[${index}].id`, issues);
     if (typeof block.kind !== 'string' || !BLOCK_KINDS.has(block.kind)) issues.push(`blocks[${index}].kind is invalid`);
     const markdown = requireString(block.markdown, `blocks[${index}].markdown`, issues) ? block.markdown : '';
     const mediaId = optionalString(block.mediaId, `blocks[${index}].mediaId`, issues);
-    rejectSensitiveMetadata(mediaId, `blocks[${index}].mediaId`, issues);
-    if (block.page !== undefined && (!Number.isInteger(block.page) || block.page < 1)) issues.push(`blocks[${index}].page must be a positive integer`);
+    if (block.page !== undefined && (
+      typeof block.page !== 'number'
+      || !Number.isInteger(block.page)
+      || block.page < 1
+    )) {
+      issues.push(`blocks[${index}].page must be a positive integer`);
+    }
     return {
       id,
       kind: block.kind as SourceBlock['kind'],
@@ -194,13 +280,10 @@ function validateMedia(value: unknown, bundleDir: string, issues: string[]): Med
     rejectUnknownKeys(media, ['id', 'kind', 'path', 'url', 'durationSec', 'alt', 'caption', 'timestampSec', 'page'], `media[${index}]`, issues);
     const id = requireString(media.id, `media[${index}].id`, issues) ? media.id : '';
     requireUniqueId(id, ids, 'media', issues);
-    rejectSensitiveMetadata(id, `media[${index}].id`, issues);
     if (typeof media.kind !== 'string' || !MEDIA_KINDS.has(media.kind)) issues.push(`media[${index}].kind is invalid`);
     const url = media.url === undefined ? undefined : (requireHttpUrl(media.url, `media[${index}].url`, issues) ? media.url : undefined);
     const alt = optionalString(media.alt, `media[${index}].alt`, issues);
     const caption = optionalString(media.caption, `media[${index}].caption`, issues);
-    rejectSensitiveMetadata(alt, `media[${index}].alt`, issues);
-    rejectSensitiveMetadata(caption, `media[${index}].caption`, issues);
     if (media.durationSec !== undefined && (
       typeof media.durationSec !== 'number'
       || !Number.isFinite(media.durationSec)
@@ -209,7 +292,13 @@ function validateMedia(value: unknown, bundleDir: string, issues: string[]): Med
       issues.push(`media[${index}].durationSec must be a positive finite number`);
     }
     if (media.timestampSec !== undefined && (typeof media.timestampSec !== 'number' || !Number.isFinite(media.timestampSec))) issues.push(`media[${index}].timestampSec must be a finite number`);
-    if (media.page !== undefined && (!Number.isInteger(media.page) || media.page < 1)) issues.push(`media[${index}].page must be a positive integer`);
+    if (media.page !== undefined && (
+      typeof media.page !== 'number'
+      || !Number.isInteger(media.page)
+      || media.page < 1
+    )) {
+      issues.push(`media[${index}].page must be a positive integer`);
+    }
     let assetPath: string | undefined = media.path === undefined ? undefined : media.path as string;
     if (assetPath !== undefined) {
       if (typeof assetPath !== 'string' || assetPath.length === 0) {
@@ -267,7 +356,6 @@ function validateTranscript(value: unknown, issues: string[]): TranscriptSegment
     if (typeof end === 'number' && Number.isFinite(end)) previousEnd = end;
     const text = requireString(segment.text, `transcript[${index}].text`, issues) ? segment.text : '';
     const speaker = optionalString(segment.speaker, `transcript[${index}].speaker`, issues);
-    rejectSensitiveMetadata(speaker, `transcript[${index}].speaker`, issues);
     return { start: start as number, end: end as number, text, ...(speaker === undefined ? {} : { speaker }) };
   });
 }
@@ -279,13 +367,6 @@ function validateProvenance(value: unknown, issues: string[]): ExtractedSource['
   const extractor = requireString(provenance.extractor, 'provenance.extractor', issues) ? provenance.extractor : '';
   const extractedAt = requireString(provenance.extractedAt, 'provenance.extractedAt', issues) ? provenance.extractedAt : '';
   if (!Array.isArray(provenance.methods) || provenance.methods.some(method => typeof method !== 'string')) issues.push('provenance.methods must be an array of strings');
-  rejectSensitiveMetadata(extractor, 'provenance.extractor', issues);
-  rejectSensitiveMetadata(extractedAt, 'provenance.extractedAt', issues);
-  if (Array.isArray(provenance.methods)) {
-    provenance.methods.forEach((method, index) => {
-      if (typeof method === 'string') rejectSensitiveMetadata(method, `provenance.methods[${index}]`, issues);
-    });
-  }
   return { extractor, extractedAt, methods: Array.isArray(provenance.methods) ? provenance.methods as string[] : [] };
 }
 
@@ -300,16 +381,13 @@ function validateWarnings(value: unknown, issues: string[]): SourceBundleV1['war
     const code = requireString(warning.code, `warnings[${index}].code`, issues) ? warning.code : '';
     const message = requireString(warning.message, `warnings[${index}].message`, issues) ? warning.message : '';
     const mediaId = optionalString(warning.mediaId, `warnings[${index}].mediaId`, issues);
-    rejectSensitiveMetadata(code, `warnings[${index}].code`, issues);
-    rejectSensitiveMetadata(message, `warnings[${index}].message`, issues);
-    rejectSensitiveMetadata(mediaId, `warnings[${index}].mediaId`, issues);
     return { code, message, ...(mediaId === undefined ? {} : { mediaId }) };
   });
 }
 
 export function validateSourceBundle(value: unknown, bundleDir: string): SourceBundleV1 {
   const issues: string[] = [];
-  rejectForbiddenKeys(value, issues);
+  scanSensitiveStructure(value, issues);
   const bundle = requireRecord(value, 'bundle', issues) ?? {};
   rejectUnknownKeys(bundle, ['version', 'source', 'blocks', 'transcript', 'media', 'provenance', 'warnings'], 'bundle', issues);
   if (bundle.version !== 1) issues.push('version must be 1');

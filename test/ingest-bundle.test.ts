@@ -81,19 +81,73 @@ test('rejects credential headers and absolute local paths in provenance and non-
   }
 });
 
+test('rejects audited sensitive query keys and high-confidence tokens across non-body values without echoing them', () => {
+  const secret = ['sk', '-', 'A'.repeat(32)].join('');
+  const queryKeys = [
+    ['au', 'th'].join(''),
+    ['X', '-Amz-', 'Credential'].join(''),
+    ['X', '-Amz-', 'Signature'].join(''),
+    ['decrypt', '-', 'key'].join(''),
+    ['client', '_', 'secret'].join(''),
+    ['access', '-', 'key'].join(''),
+  ];
+  const cases: Array<Record<string, unknown>> = [
+    ...queryKeys.map(key => ({
+      source: {
+        url: `https://example.com/source?${encodeURIComponent(key)}=${encodeURIComponent(secret)}`,
+        kind: 'article',
+        title: 'Source',
+      },
+    })),
+    { source: { url: 'https://example.com/source', kind: 'article', title: secret } },
+    {
+      provenance: {
+        extractor: 'test',
+        extractedAt: NOW,
+        methods: [`${['client', '_', 'secret'].join('')}=${secret}`],
+      },
+    },
+    {
+      media: [{
+        id: secret,
+        kind: 'image',
+        url: 'https://cdn.example.com/image.png',
+      }],
+    },
+    {
+      warnings: [{
+        code: 'credential-warning',
+        message: `${['access', '-', 'key'].join('')}=${secret}`,
+      }],
+    },
+  ];
+
+  for (const invalid of cases) {
+    let message = '';
+    try {
+      validateSourceBundle(bundle(invalid), fixture('bundle-valid'));
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/sensitive|credential/i);
+    expect(message).not.toContain(secret);
+  }
+});
+
 test('does not treat quoted source body prose as executable metadata', () => {
   const headerName = ['Authoriza', 'tion'].join('');
   const localPath = ['/', 'Users', '/', 'example', '/', 'quoted.txt'].join('');
+  const exampleToken = ['sk', '-', 'B'.repeat(32)].join('');
   const validated = validateSourceBundle(bundle({
     blocks: [{
       id: 'b1',
       kind: 'quote',
-      markdown: `The article literally quotes "${headerName}: Bearer illustrative-value" and ${localPath}.`,
+      markdown: `The article discusses auth, X-Amz-Credential, "${headerName}: Bearer illustrative-value", ${exampleToken}, and ${localPath}.`,
     }],
     transcript: [{
       start: 0,
       end: 2,
-      text: `Spoken prose mentions ${localPath} without granting filesystem access.`,
+      text: `Spoken prose mentions ${exampleToken} and ${localPath} without granting filesystem access.`,
     }],
   }), fixture('bundle-valid'));
 

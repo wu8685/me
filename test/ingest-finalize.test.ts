@@ -82,6 +82,56 @@ function validArticleInput(vault: string): FinalizeInput {
   };
 }
 
+const RAW_VISUAL_CASES = [
+  ['image', 'video'],
+  ['figure', 'course'],
+  ['slide', 'video'],
+  ['frame', 'course'],
+] as const;
+
+function rawVisualInput(
+  vault: string,
+  mediaKind: typeof RAW_VISUAL_CASES[number][0],
+  sourceKind: typeof RAW_VISUAL_CASES[number][1],
+  referenceCount = 1,
+): FinalizeInput {
+  const mediaId = `visual-${mediaKind}`;
+  const stem = `2026-07-25-raw-${mediaKind}`;
+  return {
+    vaultDir: vault,
+    source: {
+      source: {
+        url: `https://example.com/${sourceKind}/${mediaKind}`,
+        kind: sourceKind,
+        title: `Raw ${mediaKind}`,
+        durationSec: 60,
+      },
+      blocks: Array.from({ length: referenceCount }, (_, index) => ({
+        id: `block-${index + 1}`,
+        kind: mediaKind === 'figure' ? 'figure' as const : 'image' as const,
+        markdown: `![Visual ${index + 1}](source-${mediaKind}.jpg)`,
+        mediaId,
+      })),
+      media: [{
+        id: mediaId,
+        kind: mediaKind,
+        path: writeAsset(vault, `source-${mediaKind}.jpg`, `${mediaKind} bytes`),
+        alt: `${mediaKind} visual`,
+      }],
+      provenance: {
+        extractor: 'fixture',
+        extractedAt: '2026-07-25T00:00:00Z',
+        methods: ['fixture'],
+      },
+      warnings: [],
+    },
+    topic: 'raw-visual',
+    stem,
+    created: '2026-07-25',
+    trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+  };
+}
+
 function stagingEntries(vault: string): string[] {
   const found: string[] = [];
   const walk = (directory: string): void => {
@@ -548,6 +598,44 @@ describe('finalizeIngest', () => {
       trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
     })).toThrow(/processed handout|coverage|transcript/i);
   });
+
+  test.each(RAW_VISUAL_CASES)(
+    'publishes a raw %s-backed %s when its only substantive content is one referenced visual',
+    (mediaKind, sourceKind) => {
+      const vault = makeVault();
+      const result = finalizeIngest(rawVisualInput(vault, mediaKind, sourceKind));
+      const note = fs.readFileSync(result.notePath, 'utf8');
+
+      expect(result.assetPaths).toHaveLength(1);
+      expect(path.basename(result.assetPaths[0])).toBe('image-001.jpg');
+      expect(fs.readFileSync(result.assetPaths[0], 'utf8')).toBe(`${mediaKind} bytes`);
+      expect(note).toContain(`![${mediaKind} visual](images/image-001.jpg)`);
+    },
+  );
+
+  test.each(RAW_VISUAL_CASES)(
+    'rejects an unreferenced raw %s-backed %s without publishing an artifact',
+    (mediaKind, sourceKind) => {
+      const vault = makeVault();
+      const input = rawVisualInput(vault, mediaKind, sourceKind, 0);
+
+      expect(() => finalizeIngest(input)).toThrow(/metadata-only|publishable media/i);
+      expect(fs.existsSync(path.join(vault, 'knowledge/raw/raw-visual', input.stem))).toBeFalse();
+      expect(stagingEntries(vault)).toEqual([]);
+    },
+  );
+
+  test.each(RAW_VISUAL_CASES)(
+    'rejects duplicate raw %s-backed %s associations without publishing an artifact',
+    (mediaKind, sourceKind) => {
+      const vault = makeVault();
+      const input = rawVisualInput(vault, mediaKind, sourceKind, 2);
+
+      expect(() => finalizeIngest(input)).toThrow(/invalid image count/i);
+      expect(fs.existsSync(path.join(vault, 'knowledge/raw/raw-visual', input.stem))).toBeFalse();
+      expect(stagingEntries(vault)).toEqual([]);
+    },
+  );
 
   test('rejects a handout whose included mapping does not cover every transcript segment', () => {
     const vault = makeVault();

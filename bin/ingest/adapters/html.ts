@@ -16,6 +16,42 @@ function blockId(index: number): string {
   return `block-${String(index).padStart(3, '0')}`;
 }
 
+function markdownOutsideInlineCode(line: string): string {
+  const visible = line.split('');
+  let index = 0;
+  while (index < line.length) {
+    if (line[index] !== '`' || (index > 0 && line[index - 1] === '\\')) {
+      index += 1;
+      continue;
+    }
+    let openerEnd = index;
+    while (line[openerEnd] === '`') openerEnd += 1;
+    const openerLength = openerEnd - index;
+    let cursor = openerEnd;
+    let closerEnd = -1;
+    while (cursor < line.length) {
+      if (line[cursor] !== '`') {
+        cursor += 1;
+        continue;
+      }
+      let runEnd = cursor;
+      while (line[runEnd] === '`') runEnd += 1;
+      if (runEnd - cursor === openerLength) {
+        closerEnd = runEnd;
+        break;
+      }
+      cursor = runEnd;
+    }
+    if (closerEnd < 0) {
+      index = openerEnd;
+      continue;
+    }
+    visible.fill(' ', index, closerEnd);
+    index = closerEnd;
+  }
+  return visible.join('');
+}
+
 /** Convert the Markdown emitted by defuddle into ordered source blocks and media. */
 export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]; media: MediaAsset[] } {
   const blocks: SourceBlock[] = [];
@@ -24,6 +60,7 @@ export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]
   const imagePattern = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+)(?:\s+"[^"]*")?\)/g;
   const lines = normalizedMarkdown.split('\n');
   let paragraph: string[] = [];
+  let fence: { marker: '`' | '~'; length: number; lines: string[] } | undefined;
 
   const addBlock = (kind: SourceBlock['kind'], value: string, mediaId?: string) => {
     blocks.push({ id: blockId(blocks.length + 1), kind, markdown: value, ...(mediaId ? { mediaId } : {}) });
@@ -35,9 +72,34 @@ export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]
   };
 
   for (const line of lines) {
+    if (fence) {
+      fence.lines.push(line);
+      const closing = line.match(/^ {0,3}(`+|~+)[ \t]*$/);
+      if (
+        closing
+        && closing[1][0] === fence.marker
+        && closing[1].length >= fence.length
+      ) {
+        addBlock('code', fence.lines.join('\n'));
+        fence = undefined;
+      }
+      continue;
+    }
+
+    const opening = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (opening && !(opening[1][0] === '`' && opening[2].includes('`'))) {
+      flushParagraph();
+      fence = {
+        marker: opening[1][0] as '`' | '~',
+        length: opening[1].length,
+        lines: [line],
+      };
+      continue;
+    }
+
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
     imagePattern.lastIndex = 0;
-    const images = [...line.matchAll(imagePattern)];
+    const images = [...markdownOutsideInlineCode(line).matchAll(imagePattern)];
     if (heading && images.length === 0) {
       flushParagraph();
       addBlock('heading', line);
@@ -72,6 +134,7 @@ export function markdownToSourceParts(markdown: string): { blocks: SourceBlock[]
     if (after) paragraph.push(after);
   }
   flushParagraph();
+  if (fence) addBlock('code', fence.lines.join('\n'));
 
   return { blocks, media };
 }

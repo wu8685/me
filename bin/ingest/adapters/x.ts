@@ -299,7 +299,7 @@ function audioOnlyWarnings(probe: XVideoProbe): string[] {
     : []);
 }
 
-function extractVideo(runner: CommandRunner, context: ExtractContext, probe: XVideoProbe): ExtractedSource {
+function extractVideo(runner: CommandRunner, context: ExtractContext & { url: URL }, probe: XVideoProbe): ExtractedSource {
   const media: MediaAsset[] = [];
   try {
     for (const [index, entry] of probe.media.entries()) {

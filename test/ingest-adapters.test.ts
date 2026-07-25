@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { CommandResult, CommandRunner } from '../bin/ingest/command.ts';
-import { createHtmlAdapter } from '../bin/ingest/adapters/html.ts';
+import { createHtmlAdapter, markdownToSourceParts } from '../bin/ingest/adapters/html.ts';
 import { createBilibiliAdapter } from '../bin/ingest/adapters/bilibili.ts';
 import { createPdfAdapter, parsePdftohtmlXml, probePdfContentType } from '../bin/ingest/adapters/pdf.ts';
 import { createXAdapter } from '../bin/ingest/adapters/x.ts';
@@ -274,6 +274,53 @@ test('splits every inline and duplicate Markdown image occurrence into an associ
     ['paragraph', 'after', undefined],
     ['image', '![same](https://cdn.example.com/same.png)', 'image-003'],
   ]);
+});
+
+test('keeps fenced and inline code images as code while extracting only true Markdown resources', () => {
+  const markdown = [
+    '# Code-aware images',
+    '',
+    'Before `![inline-code](https://cdn.example.com/inline-code.png)` and ![real](https://cdn.example.com/real.png) after.',
+    '',
+    '````md',
+    '```',
+    '![nested-fence](https://cdn.example.com/nested-fence.png)',
+    '```',
+    '````',
+    '',
+    '~~~md',
+    '![tilde-fence](https://cdn.example.com/tilde-fence.png)',
+    '~~~',
+    '',
+    '```md`invalid',
+    '![visible-after-invalid-opener](https://cdn.example.com/visible.png)',
+    '',
+  ].join('\n');
+
+  const source = markdownToSourceParts(markdown);
+
+  expect(source.media.map((asset) => asset.url)).toEqual([
+    'https://cdn.example.com/real.png',
+    'https://cdn.example.com/visible.png',
+  ]);
+  expect(source.blocks.filter((block) => block.kind === 'code').map((block) => block.markdown)).toEqual([
+    [
+      '````md',
+      '```',
+      '![nested-fence](https://cdn.example.com/nested-fence.png)',
+      '```',
+      '````',
+    ].join('\n'),
+    [
+      '~~~md',
+      '![tilde-fence](https://cdn.example.com/tilde-fence.png)',
+      '~~~',
+    ].join('\n'),
+  ]);
+  expect(source.blocks.map((block) => block.markdown).join('\n\n')).toContain(
+    '`![inline-code](https://cdn.example.com/inline-code.png)`',
+  );
+  expect(source.blocks.map((block) => block.markdown).join('\n\n')).toContain('```md`invalid');
 });
 
 test('extracts an X Article body and ordered images', async () => {
