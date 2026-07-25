@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pdf2xml>
+  <page number="1" width="612" height="792">
+    <text top="72" left="72" width="420" height="14">An introduction to adapter boundaries.</text>
+    <image top="112" left="72" width="420" height="220" src="figure-1.png" />
+    <text top="338" left="72" width="420" height="14">Figure 1: Adapter architecture</text>
+    <text top="372" left="72" width="420" height="14">The extraction continues after the figure.</text>
+  </page>
+</pdf2xml>

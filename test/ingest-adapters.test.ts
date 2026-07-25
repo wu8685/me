@@ -1,13 +1,16 @@
 import { expect, test } from 'bun:test';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import type { CommandResult, CommandRunner } from '../bin/ingest/command.ts';
 import { createHtmlAdapter } from '../bin/ingest/adapters/html.ts';
 import { createBilibiliAdapter } from '../bin/ingest/adapters/bilibili.ts';
+import { createPdfAdapter, parsePdftohtmlXml } from '../bin/ingest/adapters/pdf.ts';
 import { extractContent, transcribeBilibili } from '../bin/ingest.ts';
 
 const FIXTURES = path.join(import.meta.dir, 'fixtures', 'ingest');
 const BILI_URL = 'https://www.bilibili.com/video/BV1fixture';
+const PDF_URL = 'https://example.com/paper.pdf';
 
 function fixtureText(name: string): string {
   return fs.readFileSync(path.join(FIXTURES, name), 'utf8');
@@ -50,6 +53,99 @@ function bilibiliFixtureRunner(): CommandRunner {
     },
   };
 }
+
+test('matches PDF URLs before the fallback HTML adapter', () => {
+  expect(createPdfAdapter(recordingRunner({})).matches(new URL(PDF_URL))).toBe(true);
+  expect(createPdfAdapter(recordingRunner({})).matches(new URL('https://example.com/paper.PDF?download=1'))).toBe(true);
+  expect(createPdfAdapter(recordingRunner({})).matches(new URL('https://example.com/paper.html'))).toBe(false);
+});
+
+test('keeps PDF figures and reliable captions at their source position', () => {
+  const parsed = parsePdftohtmlXml(fixtureText('paper.xml'));
+
+  expect(parsed.blocks.map((block) => [block.kind, block.mediaId])).toEqual([
+    ['paragraph', undefined],
+    ['figure', 'figure-1'],
+    ['paragraph', undefined],
+  ]);
+  expect(parsed.media).toEqual([{
+    id: 'figure-1',
+    kind: 'figure',
+    path: 'figure-1.png',
+    caption: 'Figure 1: Adapter architecture',
+    page: 1,
+  }]);
+});
+
+test('does not guess a PDF caption without an adjacent figure prefix', () => {
+  const parsed = parsePdftohtmlXml(`
+    <pdf2xml><page number="1">
+      <text top="10" left="10">Before figure</text>
+      <image top="30" left="10" src="figure-1.png" />
+      <text top="140" left="10">Architecture overview</text>
+      <text top="180" left="10">After figure</text>
+    </page></pdf2xml>
+  `);
+
+  expect(parsed.media[0].caption).toBeUndefined();
+  expect(parsed.blocks.map((block) => block.kind)).toEqual(['paragraph', 'figure', 'paragraph', 'paragraph']);
+});
+
+test('reports a scanned PDF without OCR as degraded', async () => {
+  const report = await createPdfAdapter(scannedPdfRunner()).probe({ url: new URL(PDF_URL), vaultDir: '/tmp/v' });
+
+  expect(report).toMatchObject({
+    adapterId: 'pdf',
+    readable: false,
+    capabilities: ['body', 'images', 'captions'],
+    degradation: 'partial',
+  });
+  expect(report.warnings).toContain('ocr-required');
+});
+
+test('reports an encrypted PDF as blocked instead of falling back', async () => {
+  const report = await createPdfAdapter(encryptedPdfRunner()).probe({ url: new URL(PDF_URL), vaultDir: '/tmp/v' });
+
+  expect(report).toMatchObject({ readable: false, degradation: 'blocked' });
+  expect(report.warnings).toContain('encrypted-or-drm');
+});
+
+test('reports PDF encryption detected by pdftohtml as blocked', async () => {
+  const report = await createPdfAdapter(encryptedXmlPdfRunner()).probe({ url: new URL(PDF_URL), vaultDir: '/tmp/v' });
+
+  expect(report).toMatchObject({ readable: false, degradation: 'blocked' });
+  expect(report.warnings).toContain('encrypted-or-drm');
+});
+
+test('reports encrypted PDF status stderr as blocked without exposing it', async () => {
+  const report = await createPdfAdapter(encryptedStatusPdfRunner()).probe({ url: new URL(PDF_URL), vaultDir: '/tmp/v' });
+
+  expect(report).toMatchObject({ readable: false, degradation: 'blocked' });
+  expect(report.warnings).toContain('encrypted-or-drm');
+});
+
+test('passes untrusted PDF URLs and Poppler arguments through the argv runner', async () => {
+  const runner = pdfFixtureRunner();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'me-pdf-adapter-test-'));
+  try {
+    const source = await createPdfAdapter(runner).extract({
+      url: new URL('https://example.com/paper.pdf?next=$(touch%20/tmp/pwn)'),
+      vaultDir: '/tmp/v',
+      tempDir,
+    });
+
+    const curlCall = runner.calls.find((call) => call.command === 'curl');
+    expect(curlCall?.args).toEqual(['-L', '--fail', '--max-time', '30', '-o', expect.any(String), 'https://example.com/paper.pdf?next=$(touch%20/tmp/pwn)']);
+    expect(runner.calls.find((call) => call.command === 'pdftotext')?.args).toEqual(['-layout', expect.any(String), expect.any(String)]);
+    expect(runner.calls.find((call) => call.command === 'pdftohtml')?.args).toEqual(['-xml', '-hidden', '-nodrm', expect.any(String), expect.any(String)]);
+    expect(source.source.kind).toBe('paper');
+    expect(source.blocks.map((block) => block.kind)).toEqual(['paragraph', 'figure', 'paragraph']);
+    expect(source.media[0].path).toBeDefined();
+    expect(fs.existsSync(source.media[0].path!)).toBe(true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
 
 test('passes an untrusted URL as one argv item', async () => {
   const runner = recordingRunner({ stdout: fixtureText('article.md') });
@@ -243,6 +339,63 @@ function twoPageWithoutCcRunner(): CommandRunner {
       if (url.includes('/x/web-interface/view')) return { stdout: JSON.stringify(meta), stderr: '', status: 0 };
       if (url.includes('/x/player/v2')) return { stdout: JSON.stringify({ code: 0, data: { subtitle: { subtitles: [] } } }), stderr: '', status: 0 };
       throw new Error(`Unexpected command arguments: ${args.join(' ')}`);
+    },
+  };
+}
+
+function scannedPdfRunner(): CommandRunner {
+  return pdfRunner({ text: '' });
+}
+
+function encryptedPdfRunner(): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'which') return { stdout: '/safe/bin/tool\n', stderr: '', status: 0 };
+      if (command === 'pdftotext') throw new Error('Command pdftotext failed with exit code 1: encrypted PDF');
+      return { stdout: '', stderr: '', status: 0 };
+    },
+  };
+}
+
+function encryptedXmlPdfRunner(): CommandRunner {
+  return {
+    run(command, args) {
+      if (command === 'which') return { stdout: '/safe/bin/tool\n', stderr: '', status: 0 };
+      if (command === 'pdftotext') fs.writeFileSync(args[2], 'Visible PDF text');
+      if (command === 'pdftohtml') throw new Error('Command pdftohtml failed with exit code 1: DRM protected PDF');
+      return { stdout: '', stderr: '', status: 0 };
+    },
+  };
+}
+
+function encryptedStatusPdfRunner(): CommandRunner {
+  return {
+    run(command) {
+      if (command === 'which') return { stdout: '/safe/bin/tool\n', stderr: '', status: 0 };
+      if (command === 'pdftotext') return { stdout: '', stderr: 'PDF is encrypted', status: 1 };
+      return { stdout: '', stderr: '', status: 0 };
+    },
+  };
+}
+
+function pdfFixtureRunner(): CommandRunner & { calls: Array<{ command: string; args: string[] }> } {
+  return pdfRunner({ text: 'An introduction to adapter boundaries.\nThe extraction continues after the figure.\n' });
+}
+
+function pdfRunner({ text }: { text: string }): CommandRunner & { calls: Array<{ command: string; args: string[] }> } {
+  const calls: Array<{ command: string; args: string[] }> = [];
+  return {
+    calls,
+    run(command, args) {
+      calls.push({ command, args });
+      if (command === 'which') return { stdout: '/safe/bin/tool\n', stderr: '', status: 0 };
+      if (command === 'curl') fs.writeFileSync(args[5], '%PDF-fixture');
+      if (command === 'pdftotext') fs.writeFileSync(args[2], text);
+      if (command === 'pdftohtml') {
+        fs.writeFileSync(args.at(-1)!, fixtureText('paper.xml'));
+        fs.writeFileSync(path.join(path.dirname(args.at(-1)!), 'figure-1.png'), 'fixture-image');
+      }
+      return { stdout: '', stderr: '', status: 0 };
     },
   };
 }
