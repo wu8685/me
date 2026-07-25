@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { VaultWriterError } from './contracts';
+import { markdownCodeSearchMask } from './markdown-mask';
 import {
   assertSafeWriterPath,
   type ResolvedVaultLayout,
@@ -47,6 +48,37 @@ function failUnsafe(): never {
   throw new VaultWriterError('UNSAFE_PATH');
 }
 
+function fileType(stat: fs.BigIntStats): string {
+  if (stat.isFile()) return 'file';
+  if (stat.isDirectory()) return 'directory';
+  if (stat.isSymbolicLink()) return 'symlink';
+  if (stat.isBlockDevice()) return 'block-device';
+  if (stat.isCharacterDevice()) return 'character-device';
+  if (stat.isFIFO()) return 'fifo';
+  if (stat.isSocket()) return 'socket';
+  return 'unknown';
+}
+
+function statFingerprint(stat: fs.BigIntStats): {
+  type: string;
+  mode: string;
+  size: string;
+  mtimeNs: string;
+  ctimeNs: string;
+  dev: string;
+  ino: string;
+} {
+  return {
+    type: fileType(stat),
+    mode: stat.mode.toString(),
+    size: stat.size.toString(),
+    mtimeNs: stat.mtimeNs.toString(),
+    ctimeNs: stat.ctimeNs.toString(),
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+  };
+}
+
 export function compareCodePoints(first: string, second: string): number {
   const left = Array.from(first, character => character.codePointAt(0) as number);
   const right = Array.from(second, character => character.codePointAt(0) as number);
@@ -65,24 +97,21 @@ export function stemIdentity(stem: string): string {
 
 function readUtf8(file: string): { bytes: Buffer; markdown: string; identity: string } {
   try {
-    const entryStat = fs.lstatSync(file);
-    const stat = fs.statSync(file);
+    const entryStat = fs.lstatSync(file, { bigint: true });
+    const stat = fs.statSync(file, { bigint: true });
     if (!stat.isFile()) failUnsafe();
     const canonical = fs.realpathSync(file);
     const bytes = fs.readFileSync(file);
     const markdown = bytes.toString('utf8');
     if (!Buffer.from(markdown, 'utf8').equals(bytes)) failUnsafe();
-    const canonicalIdentity = crypto.createHash('sha256').update(canonical).digest('hex');
     return {
       bytes,
       markdown,
-      identity: [
-        entryStat.dev,
-        entryStat.ino,
-        stat.dev,
-        stat.ino,
-        canonicalIdentity,
-      ].join(':'),
+      identity: JSON.stringify({
+        entry: statFingerprint(entryStat),
+        target: statFingerprint(stat),
+        canonicalPath: canonical,
+      }),
     };
   } catch (error) {
     if (error instanceof VaultWriterError) throw error;
@@ -109,95 +138,18 @@ function maskRange(searchable: boolean[], start: number, end: number): void {
   for (let index = start; index < end; index += 1) searchable[index] = false;
 }
 
-function isEscaped(markdown: string, index: number): boolean {
-  let slashes = 0;
-  for (let cursor = index - 1; cursor >= 0 && markdown[cursor] === '\\'; cursor -= 1) {
-    slashes += 1;
-  }
-  return slashes % 2 === 1;
-}
-
 function buildSearchMask(markdown: string): boolean[] {
   const searchable = Array<boolean>(markdown.length).fill(true);
   const lines = lineRanges(markdown);
-  let firstBodyLine = 0;
 
   if (lines.length > 0 && markdown.slice(lines[0].start, lines[0].contentEnd) === '---') {
     const closing = lines.findIndex((line, index) =>
       index > 0 && markdown.slice(line.start, line.contentEnd) === '---');
     if (closing >= 0) {
       maskRange(searchable, 0, lines[closing].end);
-      firstBodyLine = closing + 1;
     }
   }
-
-  let fence:
-    | { marker: '`' | '~'; length: number; start: number }
-    | undefined;
-  for (let lineIndex = firstBodyLine; lineIndex < lines.length; lineIndex += 1) {
-    const line = lines[lineIndex];
-    const content = markdown.slice(line.start, line.contentEnd);
-    if (fence) {
-      maskRange(searchable, line.start, line.end);
-      const closing = content.match(/^ {0,3}(`+|~+)[ \t]*$/);
-      if (
-        closing
-        && closing[1][0] === fence.marker
-        && closing[1].length >= fence.length
-      ) {
-        fence = undefined;
-      }
-      continue;
-    }
-
-    const opening = content.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-    if (opening && !(opening[1][0] === '`' && opening[2].includes('`'))) {
-      fence = {
-        marker: opening[1][0] as '`' | '~',
-        length: opening[1].length,
-        start: line.start,
-      };
-      maskRange(searchable, line.start, line.end);
-      continue;
-    }
-
-    let cursor = line.start;
-    while (cursor < line.contentEnd) {
-      if (markdown[cursor] !== '`' || isEscaped(markdown, cursor)) {
-        cursor += 1;
-        continue;
-      }
-      let openerEnd = cursor;
-      while (openerEnd < line.contentEnd && markdown[openerEnd] === '`') openerEnd += 1;
-      const length = openerEnd - cursor;
-      let candidate = openerEnd;
-      let closerEnd = -1;
-      while (candidate < line.contentEnd) {
-        if (markdown[candidate] !== '`') {
-          candidate += 1;
-          continue;
-        }
-        let runEnd = candidate;
-        while (runEnd < line.contentEnd && markdown[runEnd] === '`') runEnd += 1;
-        if (runEnd - candidate === length) {
-          closerEnd = runEnd;
-          break;
-        }
-        candidate = runEnd;
-      }
-      if (closerEnd < 0) {
-        cursor = openerEnd;
-        continue;
-      }
-      maskRange(searchable, cursor, closerEnd);
-      cursor = closerEnd;
-    }
-  }
-
-  if (fence) {
-    for (let index = fence.start; index < markdown.length; index += 1) searchable[index] = true;
-  }
-  return searchable;
+  return markdownCodeSearchMask(markdown, searchable);
 }
 
 function allSearchable(searchable: boolean[], start: number, end: number): boolean {

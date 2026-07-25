@@ -1068,6 +1068,10 @@ beforePostValidation
 - PlanFingerprint inputs 按 relative path deterministic sort，包含 bytes hash +
   dev/ino/type/mode/size/mtimeNs/ctimeNs。
 
+`VaultGraphInput.identity` 固定序列化 entry `lstat`、resolved target `stat` 与
+canonical path；所有 BigInt metadata 使用十进制字符串、key 顺序固定，content
+SHA-256 保持独立字段。
+
 `beforeFsMutation` 必须在每一次实际 fs mutation 的最终 containment/ownership check
 之前且紧邻调用触发；`paths` 顺序固定：
 

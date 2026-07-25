@@ -896,6 +896,11 @@ preview/write plan 产生 `PlanFingerprintV1`，至少包括：
   README bytes/identity；
 - planned note/index bytes digest。
 
+Graph input 的 `identity` 使用固定 key 顺序序列化 entry `lstat` 与 resolved target
+`stat`；BigInt metadata 写为十进制字符串，并包含 canonical path。content SHA-256
+仍是独立字段。这样 chmod/touch、regular↔symlink、symlink retarget 与相同 bytes 的
+inode replacement 都会改变 fingerprint，且序列化不依赖 JSON BigInt 支持。
+
 获得 lock 后重新 plan；`afterLock`/`afterStaging` 之后且**第一次 publish 前**必须重读
 所有 fingerprint input，任何差异返回 `conflict/INPUT_CHANGED` 且零 target mutation。
 note publish 后、index preserve/publish 前，允许 operation-owned expected change，其余

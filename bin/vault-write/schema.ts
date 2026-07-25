@@ -9,6 +9,7 @@ import {
   assertSafeWriterPath,
   type ResolvedVaultLayout,
 } from './path-safety';
+import { markdownCodeSearchMask } from './markdown-mask';
 
 export interface FieldContract {
   name: string;
@@ -444,77 +445,15 @@ function validateSource(
 
 function maskCode(markdown: string): string {
   const characters = markdown.split('');
-  const maskRange = (start: number, end: number) => {
-    for (let index = start; index < end; index += 1) {
-      if (characters[index] !== '\n' && characters[index] !== '\r') characters[index] = ' ';
-    }
-  };
-
-  const lines = markdown.split(/(?<=\n)/);
-  let offset = 0;
-  let fence: { character: '`' | '~'; length: number; start: number } | undefined;
-  for (const line of lines) {
-    const withoutNewline = line.replace(/\r?\n$/, '');
-    if (!fence) {
-      const opening = withoutNewline.match(/^[ ]{0,3}(`{3,}|~{3,})(?:[^`~]*)$/);
-      if (opening) {
-        fence = {
-          character: opening[1][0] as '`' | '~',
-          length: opening[1].length,
-          start: offset,
-        };
-      }
-    } else {
-      const closePattern = new RegExp(`^[ ]{0,3}\\${fence.character}{${fence.length},}[ \\t]*$`);
-      if (closePattern.test(withoutNewline)) {
-        maskRange(fence.start, offset + line.length);
-        fence = undefined;
-      }
-    }
-    offset += line.length;
-  }
-  if (fence) maskRange(fence.start, markdown.length);
-
-  const fencedMasked = characters.join('');
-  for (let index = 0; index < fencedMasked.length;) {
-    if (fencedMasked[index] !== '`') {
-      index += 1;
-      continue;
-    }
-    let run = 1;
-    while (fencedMasked[index + run] === '`') run += 1;
-    let precedingBackslashes = 0;
-    for (
-      let preceding = index - 1;
-      preceding >= 0 && fencedMasked[preceding] === '\\';
-      preceding -= 1
+  const searchable = markdownCodeSearchMask(markdown);
+  for (let index = 0; index < markdown.length; index += 1) {
+    if (
+      !searchable[index]
+      && characters[index] !== '\n'
+      && characters[index] !== '\r'
     ) {
-      precedingBackslashes += 1;
+      characters[index] = ' ';
     }
-    if (precedingBackslashes % 2 === 1) {
-      index += run;
-      continue;
-    }
-    let close = -1;
-    for (let candidate = index + run; candidate < fencedMasked.length;) {
-      if (fencedMasked[candidate] !== '`') {
-        candidate += 1;
-        continue;
-      }
-      let candidateRun = 1;
-      while (fencedMasked[candidate + candidateRun] === '`') candidateRun += 1;
-      if (candidateRun === run) {
-        close = candidate;
-        break;
-      }
-      candidate += candidateRun;
-    }
-    if (close === -1) {
-      index += run;
-      continue;
-    }
-    maskRange(index, close + run);
-    index = close + run;
   }
   return characters.join('');
 }

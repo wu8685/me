@@ -191,6 +191,60 @@ describe('writer-owned Markdown graph', () => {
     expect(plan.index.action).toBe('none');
   });
 
+  test('masks a code span across line endings until an exact delimiter run', () => {
+    const { vault, layout, target } = makeVault();
+    write(vault, 'raw/multiline-code.md', [
+      '``opening',
+      '[[2026-07-26-orchid-choice]] Orchid Choice',
+      '`',
+      'still code [[2026-07-26-orchid-choice]] Orchid Choice',
+      '``',
+      'visible Orchid Choice',
+      '',
+    ].join('\n'));
+
+    const plan = planIndexUpdate(layout, 'practices', target, 'Orchid Choice');
+    expect(plan.suggestions.backlinks).toEqual([]);
+    expect(plan.suggestions.unlinkedMentions).toEqual([
+      {
+        path: 'raw/multiline-code.md',
+        count: 1,
+        offsets: [120],
+      },
+    ]);
+    expect(plan.index.action).toBe('create');
+  });
+
+  test.each(['```', '~~~', '~~~~'])(
+    'masks an unclosed %s code block through EOF',
+    opener => {
+      const { vault, layout, target } = makeVault();
+      const body = `${opener}md\n[[2026-07-26-orchid-choice]] Orchid Choice\n`;
+      write(vault, 'raw/unclosed.md', body);
+      const plan = planIndexUpdate(layout, 'practices', target, 'Orchid Choice');
+      expect(plan.suggestions.backlinks).toEqual([]);
+      expect(plan.suggestions.unlinkedMentions).toEqual([]);
+      expect(plan.index.action).toBe('create');
+    },
+  );
+
+  test('uses opening escape parity while keeping exact-run closer semantics', () => {
+    const { vault, layout, target } = makeVault();
+    write(vault, 'raw/escape-parity.md', [
+      '\\`escaped opener [[2026-07-26-orchid-choice]]',
+      '\\\\``real opener',
+      '[[2026-07-26-orchid-choice]]',
+      '`',
+      'still masked [[2026-07-26-orchid-choice]]',
+      '``',
+      '',
+    ].join('\n'));
+    const plan = planIndexUpdate(layout, 'practices', target, 'Orchid Choice');
+    expect(plan.suggestions.backlinks).toEqual([
+      { path: 'raw/escape-parity.md', count: 1 },
+    ]);
+  });
+
   test('fingerprints sorted note inputs and excludes README from ordinary notes', () => {
     const { vault, layout } = makeVault();
     write(vault, 'raw/z.md', '# z\n');
@@ -514,4 +568,35 @@ describe('post-write graph no-regression', () => {
       'POST_VALIDATION_FAILED',
     );
   });
+
+  test.each(['chmod', 'touch', 'type', 'size'])(
+    'rejects an unrelated graph input %s fingerprint change',
+    mutation => {
+      const { vault, layout, target } = makeVault();
+      const note = write(vault, 'raw/metadata.md', '# stable bytes\n');
+      const sameInode = path.join(vault, 'same-inode.txt');
+      fs.linkSync(note, sameInode);
+      const before = snapshotVaultGraph(layout);
+      const plan = planIndexUpdate(layout, 'practices', target, 'Orchid Choice');
+      publishPlanned(vault, target, plan);
+
+      if (mutation === 'chmod') {
+        const currentMode = fs.statSync(note).mode & 0o777;
+        fs.chmodSync(note, currentMode ^ 0o100);
+      } else if (mutation === 'touch') {
+        const future = new Date(Date.now() + 60_000);
+        fs.utimesSync(note, future, future);
+      } else if (mutation === 'type') {
+        fs.unlinkSync(note);
+        fs.symlinkSync(sameInode, note);
+      } else {
+        fs.appendFileSync(note, 'larger\n');
+      }
+
+      expectCode(
+        () => validatePostWriteGraph(before, layout, target, plan.index),
+        'POST_VALIDATION_FAILED',
+      );
+    },
+  );
 });
