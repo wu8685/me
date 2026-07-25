@@ -1,6 +1,6 @@
 # Decision Brief Skill 设计
 
-**状态：** Draft，等待书面评审
+**状态：** Approved
 **日期：** 2026-07-25
 **所属项目：** ME
 
