@@ -10,10 +10,13 @@ import {
   type WriterErrorCode,
 } from './vault-write/contracts';
 import {
-  assertSafeWriterPath,
   resolveVaultLayout,
 } from './vault-write/path-safety';
 import { executeVaultWrite } from './vault-write/transaction';
+import {
+  RuntimePathError,
+  assertSafeRuntimePath,
+} from './runtime-paths';
 
 interface CliArguments {
   mode: 'preview' | 'write';
@@ -120,7 +123,7 @@ export function readContainedRequestFile(
   const candidate = path.isAbsolute(requestValue)
     ? path.resolve(requestValue)
     : path.resolve(layout.lexicalVault, requestValue);
-  const expectedParent = path.join(layout.meDir, 'tmp');
+  const expectedParent = layout.inboxDir;
 
   if (
     path.dirname(candidate) !== expectedParent
@@ -130,7 +133,12 @@ export function readContainedRequestFile(
     throw new VaultWriterError('UNSAFE_PATH');
   }
 
-  assertSafeWriterPath(layout, candidate, 'request file');
+  try {
+    assertSafeRuntimePath(layout, candidate);
+  } catch (error) {
+    if (error instanceof RuntimePathError) throw new VaultWriterError('UNSAFE_PATH');
+    throw error;
+  }
   let descriptor: number | undefined;
   try {
     const noFollow = fs.constants.O_NOFOLLOW;

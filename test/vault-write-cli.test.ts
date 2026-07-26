@@ -14,6 +14,7 @@ import {
   readContainedRequestFile,
   readLimitedRequest,
 } from '../bin/vault-write.ts';
+import { resolveVaultLayout } from '../bin/vault-write/path-safety.ts';
 
 const pluginRoot = path.resolve(import.meta.dir, '..');
 const cli = path.join(pluginRoot, 'bin/vault-write.ts');
@@ -33,7 +34,9 @@ function temporaryDirectory(prefix: string): string {
 }
 
 function makeVault(): string {
-  const vault = temporaryDirectory('me-vault-cli-');
+  const fixture = temporaryDirectory('me-vault-cli-');
+  const vault = path.join(fixture, 'vault');
+  fs.mkdirSync(vault);
   fs.mkdirSync(path.join(vault, '.me'));
   for (const layer of ['raw', 'practices', 'cognition']) {
     fs.mkdirSync(path.join(vault, layer));
@@ -41,6 +44,12 @@ function makeVault(): string {
   fs.copyFileSync(path.join(pluginRoot, 'templates/SCHEMA.md'), path.join(vault, 'SCHEMA.md'));
   fs.writeFileSync(path.join(vault, 'raw/source.md'), '# Source\n');
   return vault;
+}
+
+function prepareInbox(vault: string): string {
+  const inbox = resolveVaultLayout(vault).inboxDir;
+  fs.mkdirSync(inbox, { recursive: true });
+  return inbox;
 }
 
 function request(
@@ -128,8 +137,7 @@ describe('vault-write CLI JSON boundary', () => {
 
   test('write reads a contained request file without deleting it and commits', () => {
     const vault = makeVault();
-    fs.mkdirSync(path.join(vault, '.me/tmp'));
-    const requestPath = path.join(vault, '.me/tmp/request.json');
+    const requestPath = path.join(prepareInbox(vault), 'request.json');
     const bytes = JSON.stringify(request());
     fs.writeFileSync(requestPath, bytes);
 
@@ -138,7 +146,7 @@ describe('vault-write CLI JSON boundary', () => {
       '--vault-dir',
       vault,
       '--request',
-      '.me/tmp/request.json',
+      requestPath,
     ]);
 
     expect(result.status).toBe(0);
@@ -194,7 +202,7 @@ describe('vault-write CLI JSON boundary', () => {
 
   test('manual recovery serializes every incomplete and unrecognized operation', () => {
     const vault = makeVault();
-    const tmp = path.join(vault, '.me/tmp');
+    const tmp = resolveVaultLayout(vault).transactionDir;
     fs.mkdirSync(path.join(tmp, 'vault-write-first'), { recursive: true });
     fs.writeFileSync(path.join(tmp, 'vault-write-first/journal.json'), JSON.stringify({
       version: 1,
@@ -214,7 +222,7 @@ describe('vault-write CLI JSON boundary', () => {
     expect(recoveries.filter(item => item.journal === undefined)).toHaveLength(3);
     for (const recovery of recoveries) {
       expect(recovery.operationId).toMatch(/^recovery-[a-f0-9]{12}$/);
-      expect(recovery.directory).toBe('.me/tmp');
+      expect(recovery.directory).toBe('<ME_RUNTIME>/transactions');
       expect(JSON.stringify(recovery)).not.toContain(vault);
       expect(JSON.stringify(recovery)).not.toContain('\\');
     }
@@ -242,26 +250,29 @@ describe('vault-write CLI JSON boundary', () => {
     }
   });
 
-  test('request files must be real json files directly contained by vault .me/tmp', () => {
+  test('request files must be real json files directly contained by the runtime inbox', () => {
     const vault = makeVault();
     const outside = temporaryDirectory('me-vault-cli-outside-');
-    fs.mkdirSync(path.join(vault, '.me/tmp'));
+    const inbox = prepareInbox(vault);
     fs.writeFileSync(path.join(outside, 'request.json'), JSON.stringify(request()));
-    fs.symlinkSync(path.join(outside, 'request.json'), path.join(vault, '.me/tmp/escape.json'));
-    fs.symlinkSync(path.join(outside, 'missing.json'), path.join(vault, '.me/tmp/dangling.json'));
-    fs.mkdirSync(path.join(vault, '.me/tmp/nested'));
+    fs.symlinkSync(path.join(outside, 'request.json'), path.join(inbox, 'escape.json'));
+    fs.symlinkSync(path.join(outside, 'missing.json'), path.join(inbox, 'dangling.json'));
+    fs.mkdirSync(path.join(inbox, 'nested'));
     fs.writeFileSync(
-      path.join(vault, '.me/tmp/nested/request.json'),
+      path.join(inbox, 'nested/request.json'),
       JSON.stringify(request()),
     );
+    fs.mkdirSync(path.join(vault, '.me/tmp'), { recursive: true });
+    fs.writeFileSync(path.join(vault, '.me/tmp/request.json'), JSON.stringify(request()));
 
     for (const requestPath of [
       path.join(outside, 'request.json'),
       '../outside.json',
-      '.me/tmp/escape.json',
-      '.me/tmp/dangling.json',
-      '.me/tmp/nested/request.json',
-      '.me/tmp/request.txt',
+      path.join(inbox, 'escape.json'),
+      path.join(inbox, 'dangling.json'),
+      path.join(inbox, 'nested/request.json'),
+      path.join(inbox, 'request.txt'),
+      path.join(vault, '.me/tmp/request.json'),
     ]) {
       expectPublicFailure(invoke([
         'preview',
@@ -275,8 +286,7 @@ describe('vault-write CLI JSON boundary', () => {
 
   testPosixFifo('rejects a request FIFO without blocking the CLI open boundary', () => {
     const vault = makeVault();
-    fs.mkdirSync(path.join(vault, '.me/tmp'));
-    const requestPath = path.join(vault, '.me/tmp/request.json');
+    const requestPath = path.join(prepareInbox(vault), 'request.json');
     const mkfifo = spawnSync('mkfifo', [requestPath], {
       cwd: pluginRoot,
       encoding: null,
@@ -286,7 +296,7 @@ describe('vault-write CLI JSON boundary', () => {
 
     const result = spawnSync(
       'bun',
-      ['run', cli, 'preview', '--vault-dir', vault, '--request', '.me/tmp/request.json'],
+      ['run', cli, 'preview', '--vault-dir', vault, '--request', requestPath],
       {
         cwd: pluginRoot,
         encoding: null,
@@ -303,14 +313,14 @@ describe('vault-write CLI JSON boundary', () => {
 
   test('reads a request from one no-follow descriptor and rejects a checked-path replacement', () => {
     const vault = makeVault();
-    fs.mkdirSync(path.join(vault, '.me/tmp'));
-    const requestPath = path.join(vault, '.me/tmp/request.json');
-    const moved = path.join(vault, '.me/tmp/original.json');
+    const inbox = prepareInbox(vault);
+    const requestPath = path.join(inbox, 'request.json');
+    const moved = path.join(inbox, 'original.json');
     const foreign = path.join(temporaryDirectory('me-vault-cli-foreign-'), 'secret.json');
     fs.writeFileSync(requestPath, JSON.stringify(request()));
     fs.writeFileSync(foreign, '{"secret":"descriptor-race-secret"}');
 
-    expect(() => readContainedRequestFile(vault, '.me/tmp/request.json', {
+    expect(() => readContainedRequestFile(vault, requestPath, {
       afterIdentityValidation() {
         fs.renameSync(requestPath, moved);
         fs.symlinkSync(foreign, requestPath);
@@ -371,7 +381,7 @@ describe('vault-write CLI JSON boundary', () => {
     const secretName = 'alice-secret\\backslash';
     const controlName = `control-${String.fromCharCode(1)}-entry`;
     const forgedUuid = '1be1506d-6b3a-4d1b-9f9a-a551dd66c037';
-    const tmp = path.join(vault, '.me/tmp');
+    const tmp = resolveVaultLayout(vault).transactionDir;
     for (const name of [secretName, controlName]) {
       const directory = path.join(tmp, `vault-write-${name}`);
       fs.mkdirSync(directory, { recursive: true });
@@ -400,7 +410,7 @@ describe('vault-write CLI JSON boundary', () => {
     expect((body.recoveries as Array<Record<string, unknown>>)).toHaveLength(3);
     for (const recovery of body.recoveries as Array<Record<string, unknown>>) {
       expect(recovery.operationId).toMatch(/^recovery-[a-f0-9]{12}$/);
-      expect(recovery.directory).toBe('.me/tmp');
+      expect(recovery.directory).toBe('<ME_RUNTIME>/transactions');
       expect(recovery.journal).toBeUndefined();
       expect(JSON.stringify(recovery)).not.toContain('\\');
     }
@@ -463,7 +473,7 @@ describe('vault-write CLI JSON boundary', () => {
     let journalPath: string | undefined;
     try {
       await waitFor(() => {
-        const tmp = path.join(vault, '.me/tmp');
+        const tmp = resolveVaultLayout(vault).transactionDir;
         if (!fs.existsSync(afterJournalMarker) || !fs.existsSync(tmp)) return false;
         for (const name of fs.readdirSync(tmp)) {
           const operation = name.match(
@@ -513,14 +523,18 @@ describe('vault-write CLI JSON boundary', () => {
     expect(journalPath).toBeDefined();
     expect(fs.existsSync(journalPath!)).toBeTrue();
 
-    const staleLock = path.join(vault, '.me/locks/vault-write.lock');
+    const layout = resolveVaultLayout(vault);
+    const staleLock = path.join(layout.lockDir, 'vault-write.lock');
     if (fs.existsSync(staleLock)) fs.unlinkSync(staleLock);
     const recovery = invoke(['write', '--vault-dir', vault], JSON.stringify(request()));
     const body = expectPublicFailure(recovery, 'INCOMPLETE_OPERATION');
     const recoveries = body.recoveries as Array<Record<string, unknown>>;
     expect(recoveries.some(item =>
       item.state === 'incomplete-operation'
-      && item.journal === path.relative(vault, journalPath!).split(path.sep).join('/'),
+      && item.journal === `<ME_RUNTIME>/${path.relative(
+        layout.runtimeRoot,
+        journalPath!,
+      ).split(path.sep).join('/')}`,
     )).toBeTrue();
     expect(JSON.stringify(body)).not.toContain('MARKDOWN-SENTINEL');
   });
@@ -556,7 +570,7 @@ describe('vault-write CLI JSON boundary', () => {
     let operationDirectory: string | undefined;
     try {
       await waitFor(() => {
-        const tmp = path.join(vault, '.me/tmp');
+        const tmp = resolveVaultLayout(vault).transactionDir;
         if (!fs.existsSync(beforeJournalMarker) || !fs.existsSync(tmp)) return false;
         const operation = fs.readdirSync(tmp).find(name =>
           /^vault-write-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
@@ -580,14 +594,15 @@ describe('vault-write CLI JSON boundary', () => {
     expect(operationDirectory).toBeDefined();
     expect(fs.existsSync(path.join(operationDirectory!, 'journal.json'))).toBeFalse();
 
-    const staleLock = path.join(vault, '.me/locks/vault-write.lock');
+    const layout = resolveVaultLayout(vault);
+    const staleLock = path.join(layout.lockDir, 'vault-write.lock');
     if (fs.existsSync(staleLock)) fs.unlinkSync(staleLock);
     const recovery = invoke(['write', '--vault-dir', vault], JSON.stringify(request()));
     const body = expectPublicFailure(recovery, 'INCOMPLETE_OPERATION');
     const recoveries = body.recoveries as Array<Record<string, unknown>>;
     expect(recoveries.some(item =>
       item.state === 'unrecognized-operation'
-      && item.directory === path.relative(vault, operationDirectory!).split(path.sep).join('/'),
+      && item.directory === `<ME_RUNTIME>/transactions/${path.basename(operationDirectory!)}`,
     )).toBeTrue();
     expect(JSON.stringify(body)).not.toContain('MARKDOWN-SENTINEL');
   });

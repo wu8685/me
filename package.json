@@ -29,6 +29,7 @@
     "backlinks": "bun run bin/backlinks.ts",
     "move": "bun run bin/move.ts",
     "ingest": "bun run bin/ingest.ts",
+    "me-runtime": "bin/runtime.ts",
     "vault-write": "bin/vault-write.ts"
   },
   "keywords": [
