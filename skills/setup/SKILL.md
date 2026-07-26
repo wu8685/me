@@ -124,4 +124,4 @@ Next steps:
 - Layer directories always from `.me/config.yaml` — never hardcode `raw/`, `practices/`, `cognition/`.
 - `.me/config.yaml` is committed to git — shared across machines.
 - Setup writes only portable vault configuration and does not create runtime directories.
-- Host-local locks, staging, inbox, and recovery data live outside the vault under `.me-runtime`; never add an absolute runtime path to `.me/config.yaml`.
+- Host-local locks, staging, inbox, and recovery data live outside the vault under `~/.me/runtime/vault-<path-hash>/`; never add an absolute runtime path to `.me/config.yaml`. If the vault is on another filesystem, require `ME_RUNTIME_ROOT` to point to an absolute same-filesystem directory; never choose a vault-adjacent fallback or cross-device copy.

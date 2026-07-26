@@ -30,7 +30,7 @@ ME 是一个 **Claude Code / Codex 插件**，将任何 Git 仓库变成一个�
 ├──────────────────────────────────────────────────────────┤
 │  配置层：.me/config.yaml (层级目录映射)                     │
 ├──────────────────────────────────────────────────────────┤
-│  本机运行时：vault 外相邻 .me-runtime/                     │
+│  本机运行时：~/.me/runtime/vault-<path-hash>/             │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -62,11 +62,13 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 
 ME 允许 vault 通过 Obsidian Sync、Git 或其他文件同步工具跨设备使用。
 `.me/config.yaml` 和 Profile 属于可迁移配置；锁、事务 journal、staging、
-inbox 与恢复材料属于本机状态，默认存放在 canonical vault 相邻的
-`.me-runtime/vault-<path-hash>/`。
+inbox 与恢复材料属于本机状态，默认存放在
+`~/.me/runtime/vault-<path-hash>/`。
 
 每台机器可用 `ME_RUNTIME_ROOT` 指定另一个 host-local base。该值不会进入
-vault 配置。只读命令和 preview 不创建 runtime；需要检查恢复材料时，
+vault 配置。runtime base 必须与 vault 位于同一 filesystem；不满足时操作
+会停止，并要求把 `ME_RUNTIME_ROOT` 指到同盘目录，不会自动回退或跨盘
+copy。只读命令和 preview 不创建 runtime；需要检查恢复材料时，
 `bin/runtime.ts path` 才显式返回绝对路径。
 
 ## /me:setup - 初始化工作空间

@@ -59,8 +59,8 @@ Next steps:
 
 ME vault 可以放进 Obsidian Sync 或 Git。vault 内的 `.me/` 只保存
 `.me/config.yaml`、Profile 等可迁移配置；临时输入、锁、事务、ingest
-staging 和恢复材料默认位于 vault 相邻的 `.me-runtime/`，不会被 Obsidian
-当作 vault 内容同步。
+staging 和恢复材料默认位于
+`~/.me/runtime/vault-<path-hash>/`，不会被 Obsidian 当作 vault 内容同步。
 
 查询当前机器为某个 vault 解析出的 runtime（只读，不创建目录）：
 
@@ -80,7 +80,10 @@ bun run /path/to/me/bin/runtime.ts prepare-inbox --vault-dir /path/to/vault
 
 如需把 runtime 放到另一本机目录，设置绝对路径环境变量
 `ME_RUNTIME_ROOT`。它只在当前 host 生效，不能写入 `.me/config.yaml`，且
-必须与 vault 位于同一 filesystem，才能保持原子 rename 语义。
+必须与 vault 位于同一 filesystem，才能保持原子 rename 语义。如果 home
+和 vault 位于不同 filesystem，ME 会在创建锁或 staging 前停止；把
+`ME_RUNTIME_ROOT` 指向 vault 所在 filesystem 即可。ME 不会自动回退到
+vault 邻近目录，也不会使用非原子的跨盘 copy。
 
 从 1.5 升级时，如果 vault 中仍有非空的旧 runtime 目录或 ingest marker，
 ME 会停止写入并要求人工检查，不会自动删除或迁移。

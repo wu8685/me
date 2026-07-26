@@ -48,8 +48,8 @@ me/
 
 vault 可能由 Obsidian Sync 或 Git 同步，因此 `.me/` 只允许 portable config
 和 Profile。所有会变化的 host-local 状态统一经 `bin/runtime-paths.ts`
-解析到 canonical vault 相邻的
-`.me-runtime/vault-<sha256(canonical-path)[0:24]>/`：
+解析到
+`~/.me/runtime/vault-<sha256(canonical-path)[0:24]>/`：
 
 - `locks/`：vault writer cooperative lock；
 - `transactions/`：journal、staging、originals 与 recovery；
@@ -57,9 +57,11 @@ vault 可能由 Obsidian Sync 或 Git 同步，因此 `.me/` 只允许 portable 
 - `ingest/locks/`、`ingest/staging/`：ingest finalizer 状态。
 
 `ME_RUNTIME_ROOT` 只覆盖本机 runtime base，禁止写入 `.me/config.yaml`。
-resolver 拒绝 vault 内路径、symlink 逃逸和跨 filesystem 布局。对外 recovery
-使用 `<ME_RUNTIME>/...`，只有 `bin/runtime.ts path --vault-dir DIR` 会按操作者
-请求显示绝对路径；`prepare-inbox` 只创建 runtime namespace 和 inbox。
+resolver 拒绝 vault 内路径、symlink 逃逸和跨 filesystem 布局；跨 filesystem
+时必须把 `ME_RUNTIME_ROOT` 指向 vault 所在 filesystem，不会自动回退到
+vault 邻近目录，也不会退化为 copy。对外 recovery 使用 `<ME_RUNTIME>/...`，
+只有 `bin/runtime.ts path --vault-dir DIR` 会按操作者请求显示绝对路径；
+`prepare-inbox` 只创建 runtime namespace 和 inbox。
 
 ME 1.6 不自动清理 1.5 留下的非空 vault-local runtime state。writer 与
 ingest 都必须在新 runtime 发生 mutation 前 fail closed，让用户先检查旧

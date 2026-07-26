@@ -266,9 +266,12 @@ test_codex_public_docs() {
 test_external_runtime_documented() {
   local file
   for file in README.md docs/user-guide.md docs/features.md docs/development.md; do
-    assert_file_contains "$PLUGIN_ROOT/$file" '.me-runtime' || return 1
+    assert_file_contains "$PLUGIN_ROOT/$file" '~/.me/runtime' || return 1
     assert_file_contains "$PLUGIN_ROOT/$file" 'ME_RUNTIME_ROOT' || return 1
+    assert_file_not_contains "$PLUGIN_ROOT/$file" 'vault 相邻的 .me-runtime' || return 1
   done
+  assert_file_contains "$PLUGIN_ROOT/skills/setup/SKILL.md" '~/.me/runtime' || return 1
+  assert_file_not_contains "$PLUGIN_ROOT/skills/setup/SKILL.md" 'under `.me-runtime`' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'bin/runtime.ts path' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'bin/runtime.ts prepare-inbox' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/development.md" '<ME_RUNTIME>' || return 1

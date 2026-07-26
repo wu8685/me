@@ -61,10 +61,11 @@ Raw (调研) → Practices (实践) → Cognition (认知)
 ## 同步安全
 
 vault 可以由 Obsidian Sync、Git 或其他工具同步。ME 只把可迁移配置保留在
-vault 的 `.me/` 中；锁、事务、临时输入和恢复材料默认写到同文件系统的相邻
-`.me-runtime/`，不会进入 Obsidian vault。需要把运行时放到其他本机目录时，
-可设置 host-local 环境变量 `ME_RUNTIME_ROOT`；该绝对路径不会写入
-`.me/config.yaml`。
+vault 的 `.me/` 中；锁、事务、临时输入和恢复材料默认写到
+`~/.me/runtime/vault-<path-hash>/`，不会进入 Obsidian vault。如果 home 与
+vault 不在同一 filesystem，ME 会在写入前停止；此时用 host-local 环境变量
+`ME_RUNTIME_ROOT` 指向 vault 所在 filesystem 的绝对目录。该值不会写入
+`.me/config.yaml`，也不会自动回退到 vault 邻近目录。
 
 ## 技术栈
 

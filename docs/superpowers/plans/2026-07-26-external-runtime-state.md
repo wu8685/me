@@ -1,5 +1,9 @@
 # ME External Runtime State Implementation Plan
 
+> **Design amendment (2026-07-26):** The approved default is
+> `~/.me/runtime/vault-<path-hash>/`, not a vault-adjacent `.me-runtime`.
+> Cross-filesystem layouts fail closed and require `ME_RUNTIME_ROOT`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Move all ME host-local locks, staging, journals, request files, and recovery artifacts outside synchronized vaults by default.
