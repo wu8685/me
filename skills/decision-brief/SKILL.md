@@ -192,10 +192,11 @@ Construct this v1 JSON request, omitting every unknown or empty optional field:
 ```
 
 Do not set `acknowledgeCognition`. Send the complete Markdown request through stdin,
-not a shell argument. If tooling requires a temporary request file, it may
-exist only directly under `.me/tmp`, must be passed with `--request`, and must
-be removed after use. Never use `apply_patch`, shell redirect, `mv`, or another
-generic file operation to write a vault target.
+not a shell argument. If tooling cannot supply stdin, run
+`bin/runtime.ts prepare-inbox --vault-dir "$VAULT_DIR"`, write one unique
+`.json` file directly inside the returned host-local `inboxDir`, pass its
+absolute path with `--request`, and remove it after use. Never use `apply_patch`, shell redirect, `mv`, or
+another generic file operation to write a vault target.
 
 ### Preview, then write
 
@@ -230,7 +231,9 @@ Parse the write JSON rather than inferring success from its exit code:
 The writer's model is cooperative and journaled; describe it only as
 `commitModel: journaled-cooperative`. A preview result, exit code zero, partial
 filesystem observation, or an empty recovery list never independently proves a
-save.
+save. Recovery paths beginning with `<ME_RUNTIME>` are host-local; resolve the
+absolute root only when inspection is required by running
+`bin/runtime.ts path --vault-dir "$VAULT_DIR"`.
 
 Raw sources belong in raw. Even when the user says “这是我的原则”, first apply the
 current vault's cognition validation and confirmation requirements; never claim

@@ -55,6 +55,40 @@ Next steps:
   Run `/me:ingest <url>` to add your first research note.
 ```
 
+## 同步与本机运行时
+
+ME vault 可以放进 Obsidian Sync 或 Git。vault 内的 `.me/` 只保存
+`.me/config.yaml`、Profile 等可迁移配置；临时输入、锁、事务、ingest
+staging 和恢复材料默认位于 vault 相邻的 `.me-runtime/`，不会被 Obsidian
+当作 vault 内容同步。
+
+查询当前机器为某个 vault 解析出的 runtime（只读，不创建目录）：
+
+```bash
+bun run /path/to/me/bin/runtime.ts path --vault-dir /path/to/vault
+```
+
+只有无法通过 stdin 传递临时输入时，才准备 inbox：
+
+```bash
+bun run /path/to/me/bin/runtime.ts prepare-inbox --vault-dir /path/to/vault
+```
+
+命令返回绝对 `inboxDir`。文件必须是该目录的直接普通文件；调用方在使用后
+删除。`vault-write` 的 `.json` request 与 ingest 的 `.md` processed body
+都优先走 stdin。
+
+如需把 runtime 放到另一本机目录，设置绝对路径环境变量
+`ME_RUNTIME_ROOT`。它只在当前 host 生效，不能写入 `.me/config.yaml`，且
+必须与 vault 位于同一 filesystem，才能保持原子 rename 语义。
+
+从 1.5 升级时，如果 vault 中仍有非空的旧 runtime 目录或 ingest marker，
+ME 会停止写入并要求人工检查，不会自动删除或迁移。
+
+runtime namespace 含 canonical vault path 的 hash。移动或重命名 vault 前，先用
+`bin/runtime.ts path` 检查当前 namespace，处理完 `manual_recovery` 与未完成
+事务；移动后会解析到新的 namespace，ME 不会把旧恢复材料静默搬过去。
+
 ## 摄入文章、PDF 与公开视频
 
 ```bash

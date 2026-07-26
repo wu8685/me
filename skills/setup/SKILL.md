@@ -1,6 +1,6 @@
 ---
 name: setup
-description: "Initialize a new workspace vault with three-layer structure, frontmatter schema, CLAUDE.md navigation contract, and .me/config.yaml layer mapping."
+description: "Use when a workspace needs initial ME vault setup or an existing ME vault needs its managed schema and navigation files upgraded."
 ---
 
 # /me:setup
@@ -123,3 +123,5 @@ Next steps:
 - No git hooks (D-09). No `status:` or `lifecycle:` frontmatter (D-06).
 - Layer directories always from `.me/config.yaml` — never hardcode `raw/`, `practices/`, `cognition/`.
 - `.me/config.yaml` is committed to git — shared across machines.
+- Setup writes only portable vault configuration and does not create runtime directories.
+- Host-local locks, staging, inbox, and recovery data live outside the vault under `.me-runtime`; never add an absolute runtime path to `.me/config.yaml`.

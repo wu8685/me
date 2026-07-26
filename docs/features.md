@@ -29,6 +29,8 @@ ME 是一个 **Claude Code / Codex 插件**，将任何 Git 仓库变成一个�
 │  └────────────┴──────────────┴─────────────────┘         │
 ├──────────────────────────────────────────────────────────┤
 │  配置层：.me/config.yaml (层级目录映射)                     │
+├──────────────────────────────────────────────────────────┤
+│  本机运行时：vault 外相邻 .me-runtime/                     │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -54,6 +56,18 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 | Events | `bin/events.ts` | JSONL 事件日志 — append/query，支持 UUID 关联 |
 | Wikilink Graph | `bin/wikilink-graph.ts` | 无依赖的链接图引擎 |
 | Vault Write | `bin/vault-write.ts` | 通用笔记写入的预览、校验、索引维护与恢复报告 |
+| Runtime | `bin/runtime.ts` | 查询本机 runtime、准备受控 inbox |
+
+## 可同步 vault 与本机运行时
+
+ME 允许 vault 通过 Obsidian Sync、Git 或其他文件同步工具跨设备使用。
+`.me/config.yaml` 和 Profile 属于可迁移配置；锁、事务 journal、staging、
+inbox 与恢复材料属于本机状态，默认存放在 canonical vault 相邻的
+`.me-runtime/vault-<path-hash>/`。
+
+每台机器可用 `ME_RUNTIME_ROOT` 指定另一个 host-local base。该值不会进入
+vault 配置。只读命令和 preview 不创建 runtime；需要检查恢复材料时，
+`bin/runtime.ts path` 才显式返回绝对路径。
 
 ## /me:setup - 初始化工作空间
 

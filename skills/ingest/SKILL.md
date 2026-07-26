@@ -60,9 +60,10 @@ For bundles, replace `"$URL"` with `--bundle "$BUNDLE_DIR"`.
 
 ### 3. Apply only the necessary LLM edit
 
-Write any processed input as **UTF-8 body-only Markdown** in a unique file under
-`"$VAULT_DIR/.me/tmp/"`. Do not include frontmatter; the finalizer generates and
-validates it.
+Prepare processed input as **UTF-8 body-only Markdown**. Do not include frontmatter;
+the finalizer generates and validates it. Prefer passing the
+complete body through stdin with `--processed-markdown -`; never place it in a
+shell argument.
 
 **Translation (`translate-cn`):** translate narrative prose while preserving
 Markdown structure, source order, wikilinks, code, image references, and all
@@ -87,13 +88,25 @@ body:
 ```bash
 bun run "$PLUGIN_ROOT/bin/ingest.ts" "$URL" \
   --vault-dir "$VAULT_DIR" --mode "$MODE" --topic "$TOPIC" \
-  --processed-markdown "$VAULT_DIR/.me/tmp/$TEMP_FILE" --write
+  --processed-markdown - --write
 ```
 
 Without an edited body, omit `--processed-markdown`. For bundles, use
 `--bundle "$BUNDLE_DIR"`. The finalizer creates the
 `{raw_dir}/{topic}/YYYY-MM-DD-slug/` artifact, validates frontmatter and every
 resource, localizes available assets, and updates reachability atomically.
+
+If the tool cannot supply stdin, prepare the host-local inbox:
+
+```bash
+bun run "$PLUGIN_ROOT/bin/runtime.ts" prepare-inbox --vault-dir "$VAULT_DIR"
+```
+
+Write one unique `.md` file directly inside the returned `inboxDir`, pass its
+absolute path to `--processed-markdown`, then remove it after success or
+failure. Never put temporary input, locks, staging, or recovery state inside
+the vault. Runtime paths reported as `<ME_RUNTIME>/...` can be resolved with
+`bin/runtime.ts path --vault-dir "$VAULT_DIR"`.
 
 The Agent's browser may produce a Source Bundle only when the public CLI cannot
 read the source and the user already has lawful access. Never put browser login

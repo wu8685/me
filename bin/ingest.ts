@@ -1474,7 +1474,7 @@ Options:
   --vault-dir  Vault directory (default: current directory)
   --topic      Optional ASCII kebab topic path under the configured raw layer
   --processed-markdown
-               Agent-edited Markdown inside <vault>/.me/tmp/ (requires --write)
+               "-" for stdin or a direct .md file in the host-local runtime inbox (requires --write)
   --write      Atomically finalize the note and assets; otherwise emit JSON preview only
   --help       Show this help
 

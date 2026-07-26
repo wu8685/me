@@ -58,6 +58,14 @@ Raw (调研) → Practices (实践) → Cognition (认知)
 
 目录可配置（`.me/config.yaml`），默认为 `raw/`、`practices/`、`cognition/`。
 
+## 同步安全
+
+vault 可以由 Obsidian Sync、Git 或其他工具同步。ME 只把可迁移配置保留在
+vault 的 `.me/` 中；锁、事务、临时输入和恢复材料默认写到同文件系统的相邻
+`.me-runtime/`，不会进入 Obsidian vault。需要把运行时放到其他本机目录时，
+可设置 host-local 环境变量 `ME_RUNTIME_ROOT`；该绝对路径不会写入
+`.me/config.yaml`。
+
 ## 技术栈
 
 - **TypeScript** + **Bun** - 类型安全的 CLI 工具
@@ -66,7 +74,7 @@ Raw (调研) → Practices (实践) → Cognition (认知)
 
 ## 版本
 
-**v1.5.0**
+**v1.6.0**
 
 ## 文档
 

@@ -168,16 +168,22 @@ test_plugin_manifest() {
 
 test_vault_writer_public_binary() {
   assert_file_exists "$PLUGIN_ROOT/bin/vault-write.ts" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/runtime.ts" || return 1
   node -e '
     const p=require(process.argv[1]);
     if (p.bin["vault-write"] !== "bin/vault-write.ts") process.exit(1)
+    if (p.bin["me-runtime"] !== "bin/runtime.ts") process.exit(1)
   ' "$PLUGIN_ROOT/package.json" || return 1
   if [ ! -x "$PLUGIN_ROOT/bin/vault-write.ts" ]; then
     echo -e "    ${RED}FAIL${NC}: vault-write entrypoint is not executable"
     return 1
   fi
+  if [ ! -x "$PLUGIN_ROOT/bin/runtime.ts" ]; then
+    echo -e "    ${RED}FAIL${NC}: runtime entrypoint is not executable"
+    return 1
+  fi
 
-  local pack_dir install_dir tarball binary result
+  local pack_dir install_dir tarball binary runtime_binary result
   pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-pack.XXXXXX")
   install_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-install.XXXXXX")
   tarball=$(npm pack --silent --pack-destination "$pack_dir" "$PLUGIN_ROOT") || return 1
@@ -186,6 +192,11 @@ test_vault_writer_public_binary() {
   binary="$install_dir/node_modules/.bin/vault-write"
   if [ ! -x "$binary" ]; then
     echo -e "    ${RED}FAIL${NC}: packed vault-write binary is not executable"
+    return 1
+  fi
+  runtime_binary="$install_dir/node_modules/.bin/me-runtime"
+  if [ ! -x "$runtime_binary" ]; then
+    echo -e "    ${RED}FAIL${NC}: packed me-runtime binary is not executable"
     return 1
   fi
 
@@ -218,6 +229,11 @@ test_vault_writer_public_binary() {
     const result=JSON.parse(process.argv[1]);
     if (result.status !== "preview") process.exit(1);
   ' "$result" || return 1
+  result=$("$runtime_binary" path --vault-dir "$MOCK_VAULT") || return 1
+  node -e '
+    const result=JSON.parse(process.argv[1]);
+    if (!result.runtimeRoot || result.vaultDir !== process.argv[2]) process.exit(1);
+  ' "$result" "$(cd "$MOCK_VAULT" && pwd -P)" || return 1
   rm -rf "$pack_dir" "$install_dir"
 
   local public_writer_paths=(
@@ -247,6 +263,41 @@ test_codex_public_docs() {
   assert_file_contains "$PLUGIN_ROOT/docs/features.md" 'Codex skill' || return 1
 }
 
+test_external_runtime_documented() {
+  local file
+  for file in README.md docs/user-guide.md docs/features.md docs/development.md; do
+    assert_file_contains "$PLUGIN_ROOT/$file" '.me-runtime' || return 1
+    assert_file_contains "$PLUGIN_ROOT/$file" 'ME_RUNTIME_ROOT' || return 1
+  done
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'bin/runtime.ts path' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'bin/runtime.ts prepare-inbox' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/development.md" '<ME_RUNTIME>' || return 1
+  if grep -Fq 'same directory, no sync' "$PLUGIN_ROOT/AGENTS.md" \
+    || grep -Fq 'same directory, no sync' "$PLUGIN_ROOT/CLAUDE.md"; then
+    echo -e "    ${RED}FAIL${NC}: project instructions still assume vaults are never synced"
+    return 1
+  fi
+}
+
+test_skills_use_external_runtime() {
+  local skills=(
+    "$PLUGIN_ROOT/skills/ingest/SKILL.md"
+    "$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
+    "$PLUGIN_ROOT/skills/setup/SKILL.md"
+  )
+  if rg -n '\.me/tmp|\.me/locks|\.me/ingest-reservations' "${skills[@]}"; then
+    echo -e "    ${RED}FAIL${NC}: public skills still direct runtime state into the vault"
+    return 1
+  fi
+  grep -Fq -- '--processed-markdown -' "$PLUGIN_ROOT/skills/ingest/SKILL.md" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" 'bin/runtime.ts' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" 'prepare-inbox' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/decision-brief/SKILL.md" 'bin/runtime.ts' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/decision-brief/SKILL.md" 'prepare-inbox' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/decision-brief/SKILL.md" '<ME_RUNTIME>' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/setup/SKILL.md" 'does not create runtime directories' || return 1
+}
+
 test_decision_brief_documented() {
   assert_file_contains "$PLUGIN_ROOT/README.md" 'decision-brief' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/features.md" '决策简报\|Decision Brief' || return 1
@@ -274,8 +325,8 @@ test_decision_brief_discovery_and_release_version() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.5.0" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected current release version 1.5.0"
+  [ "$(echo "$versions" | head -n 1)" = "1.6.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected current release version 1.6.0"
     return 1
   }
 }
@@ -448,8 +499,8 @@ test_ingest_docs_rich_media() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.5.0" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.5.0"
+  [ "$(echo "$versions" | head -n 1)" = "1.6.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.6.0"
     return 1
   }
 
@@ -3675,7 +3726,7 @@ test_decision_brief_writer_contract() {
   grep -Fq 'existing path-qualified local wikilink' "$skill" || return 1
   grep -Fq 'Do not use `type: experiment`' "$skill" || return 1
   grep -Fq 'Markdown request through stdin' "$skill" || return 1
-  grep -Fq '.me/tmp' "$skill" || return 1
+  grep -Fq '<ME_RUNTIME>' "$skill" || return 1
   grep -Fq 'Do not add a numeric suffix' "$skill" || return 1
   grep -Fq "decision.normalize('NFKC').trim()" "$skill" || return 1
   grep -Fq "replace(/\\p{White_Space}+/gu, ' ').toLowerCase()" "$skill" || return 1
@@ -5055,6 +5106,8 @@ main() {
     run_test test_plugin_manifest
     run_test test_vault_writer_public_binary
     run_test test_codex_public_docs
+    run_test test_external_runtime_documented
+    run_test test_skills_use_external_runtime
     run_test test_ingest_docs_rich_media
     run_test test_schema_fields
     run_test test_templates_match_schema

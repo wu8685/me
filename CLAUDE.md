@@ -3,7 +3,7 @@
 
 **me**
 
-A Claude Code plugin that gives any workspace knowledge management capabilities. When installed, it provides skills, hooks, and templates for a three-layer knowledge flow system (raw → practices → cognition). The target workspace doubles as an Obsidian vault and git repo — same directory, no sync. Built for personal use, evolving toward automated knowledge processing and eventually a digital twin.
+A Claude Code plugin that gives any workspace knowledge management capabilities. When installed, it provides skills, hooks, and templates for a three-layer knowledge flow system (raw → practices → cognition). The target workspace can double as an Obsidian vault and git repo and may be synchronized across devices; host-local runtime state stays outside it. Built for personal use, evolving toward automated knowledge processing and eventually a digital twin.
 
 **Core Value:** A reusable plugin that turns any workspace into a knowledge flywheel — ingest research, record practice, distill cognition — with zero infrastructure beyond Git + Markdown + Claude Code.
 
