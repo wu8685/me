@@ -139,18 +139,21 @@ function hasExactKeys(
 }
 
 function parsePath(candidate: unknown): readonly string[] {
-  if (
-    !Array.isArray(candidate)
-    || candidate.length === 0
-    || candidate.some(component => (
+  if (!Array.isArray(candidate) || candidate.length === 0) invalidRequest();
+  const path: string[] = [];
+  for (let index = 0; index < candidate.length; index += 1) {
+    if (!Object.hasOwn(candidate, index)) invalidRequest();
+    const component = candidate[index];
+    if (
       typeof component !== 'string'
       || component.length === 0
       || component.includes('\u0000')
-    ))
-  ) {
-    invalidRequest();
+    ) {
+      invalidRequest();
+    }
+    path.push(component);
   }
-  return [...candidate] as string[];
+  return path;
 }
 
 function isVaultSchemaVersionPath(path: readonly string[]): boolean {
@@ -174,11 +177,15 @@ function parseSetValue(value: unknown, path: readonly string[]): ConfigEditValue
   }
   if (typeof value === 'boolean') return value;
   if (typeof value === 'number') return value;
-  if (
-    Array.isArray(value)
-    && value.every(item => typeof item === 'string')
-  ) {
-    return [...value] as string[];
+  if (Array.isArray(value)) {
+    const strings: string[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) invalidRequest();
+      const item = value[index];
+      if (typeof item !== 'string') invalidRequest();
+      strings.push(item);
+    }
+    return strings;
   }
   return invalidRequest();
 }
@@ -223,7 +230,12 @@ function parseConfigEdit(value: unknown): ConfigEdit {
 function parseConfigEdits(edits: unknown): ConfigEdit[] {
   if (!Array.isArray(edits)) invalidRequest();
   try {
-    return edits.map(parseConfigEdit);
+    const parsed: ConfigEdit[] = [];
+    for (let index = 0; index < edits.length; index += 1) {
+      if (!Object.hasOwn(edits, index)) invalidRequest();
+      parsed.push(parseConfigEdit(edits[index]));
+    }
+    return parsed;
   } catch (error) {
     if (error instanceof UpdateError) throw error;
     return invalidRequest();
@@ -240,13 +252,53 @@ function parentMap(document: Document, path: readonly string[]): YAMLMap {
   return current;
 }
 
-type ComparableNode =
+type ComparableScalar =
   | null
   | string
   | number
   | boolean
-  | ComparableNode[]
-  | { readonly entries: ReadonlyArray<readonly [string, ComparableNode]> };
+  | { readonly kind: 'buffer'; readonly bytes: readonly number[] }
+  | { readonly kind: 'date'; readonly epochMilliseconds: number };
+
+type ComparableNode =
+  | {
+      readonly kind: 'scalar';
+      readonly tag: string | undefined;
+      readonly value: ComparableScalar;
+    }
+  | {
+      readonly kind: 'sequence';
+      readonly items: readonly ComparableNode[];
+    }
+  | {
+      readonly kind: 'mapping';
+      readonly entries: ReadonlyArray<readonly [string, ComparableNode]>;
+    };
+
+function comparableScalar(
+  value: unknown,
+  tag: string | undefined,
+): ComparableNode {
+  let comparable: ComparableScalar;
+  if (
+    value === null
+    || typeof value === 'string'
+    || typeof value === 'number'
+    || typeof value === 'boolean'
+  ) {
+    comparable = value as null | string | number | boolean;
+  } else if (Buffer.isBuffer(value)) {
+    comparable = { kind: 'buffer', bytes: [...value] };
+  } else if (value instanceof Date) {
+    comparable = {
+      kind: 'date',
+      epochMilliseconds: value.getTime(),
+    };
+  } else {
+    return invalidConfig();
+  }
+  return { kind: 'scalar', tag, value: comparable };
+}
 
 function comparableNode(node: unknown): ComparableNode {
   if (
@@ -255,25 +307,19 @@ function comparableNode(node: unknown): ComparableNode {
     || typeof node === 'number'
     || typeof node === 'boolean'
   ) {
-    return node as null | string | number | boolean;
+    return comparableScalar(node, undefined);
   }
-  if (Array.isArray(node)) return node.map(comparableNode);
+  if (Array.isArray(node)) {
+    return { kind: 'sequence', items: node.map(comparableNode) };
+  }
   if (isAlias(node) || !isNode(node) || node.anchor) invalidConfig();
-  if (isScalar(node)) {
-    const value = node.value;
-    if (
-      value === null
-      || typeof value === 'string'
-      || typeof value === 'number'
-      || typeof value === 'boolean'
-    ) {
-      return value as null | string | number | boolean;
-    }
-    return invalidConfig();
+  if (isScalar(node)) return comparableScalar(node.value, node.tag);
+  if (isSeq(node)) {
+    return { kind: 'sequence', items: node.items.map(comparableNode) };
   }
-  if (isSeq(node)) return node.items.map(comparableNode);
   if (isMap(node)) {
     return {
+      kind: 'mapping',
       entries: node.items.map(pair => {
         const key = typeof pair.key === 'string'
           ? pair.key
@@ -288,21 +334,41 @@ function comparableNode(node: unknown): ComparableNode {
 }
 
 function comparableEqual(left: ComparableNode, right: ComparableNode): boolean {
-  if (Object.is(left, right)) return true;
-  if (Array.isArray(left) || Array.isArray(right)) {
-    return Array.isArray(left)
-      && Array.isArray(right)
-      && left.length === right.length
-      && left.every((item, index) => comparableEqual(item, right[index]));
+  if (left.kind !== right.kind) return false;
+  if (left.kind === 'scalar' && right.kind === 'scalar') {
+    if (left.tag !== right.tag) return false;
+    const leftValue = left.value;
+    const rightValue = right.value;
+    if (Object.is(leftValue, rightValue)) return true;
+    if (
+      leftValue === null
+      || rightValue === null
+      || typeof leftValue !== 'object'
+      || typeof rightValue !== 'object'
+      || leftValue.kind !== rightValue.kind
+    ) {
+      return false;
+    }
+    if (leftValue.kind === 'date' && rightValue.kind === 'date') {
+      return Object.is(
+        leftValue.epochMilliseconds,
+        rightValue.epochMilliseconds,
+      );
+    }
+    return leftValue.kind === 'buffer'
+      && rightValue.kind === 'buffer'
+      && leftValue.bytes.length === rightValue.bytes.length
+      && leftValue.bytes.every((byte, index) => (
+        rightValue.bytes[index] === byte
+      ));
   }
-  if (
-    !left
-    || !right
-    || typeof left !== 'object'
-    || typeof right !== 'object'
-  ) {
-    return false;
+  if (left.kind === 'sequence' && right.kind === 'sequence') {
+    return left.items.length === right.items.length
+      && left.items.every((item, index) => (
+        comparableEqual(item, right.items[index])
+      ));
   }
+  if (left.kind !== 'mapping' || right.kind !== 'mapping') return false;
   return left.entries.length === right.entries.length
     && left.entries.every(([key, value], index) => (
       right.entries[index][0] === key

@@ -286,6 +286,48 @@ describe('renderConfigEdits', () => {
     expect(parseDocument(rendered).get('vault_schema_version')).toBe(1);
   });
 
+  test('round-trips an untouched binary tagged scalar while applying another edit', () => {
+    const config = fixtureConfig([
+      'custom:',
+      '  payload: !!binary SGVsbG8=',
+      '',
+    ].join('\n'));
+
+    const result = renderConfigEdits(config, [{
+      kind: 'set',
+      path: ['vault_schema_version'],
+      value: 1,
+    }]);
+    const rendered = result.desiredBytes.toString('utf8');
+    const payload = parseDocument(rendered).getIn(['custom', 'payload']);
+
+    expect(Buffer.isBuffer(payload)).toBeTrue();
+    expect((payload as Buffer).equals(Buffer.from('Hello', 'utf8'))).toBeTrue();
+    expect(rendered).toContain('payload: !!binary SGVsbG8=');
+  });
+
+  test('round-trips an untouched YAML 1.1 timestamp while applying another edit', () => {
+    const config = fixtureConfig([
+      '%YAML 1.1',
+      '---',
+      'custom:',
+      '  observed_at: 2001-12-15T02:59:43.1Z',
+      '',
+    ].join('\n'));
+
+    const result = renderConfigEdits(config, [{
+      kind: 'set',
+      path: ['vault_schema_version'],
+      value: 1,
+    }]);
+    const rendered = result.desiredBytes.toString('utf8');
+    const observedAt = parseDocument(rendered).getIn(['custom', 'observed_at']);
+
+    expect(observedAt).toBeInstanceOf(Date);
+    expect((observedAt as Date).toISOString()).toBe('2001-12-15T02:59:43.100Z');
+    expect(rendered).toStartWith('%YAML 1.1\n---\n');
+  });
+
   test('verifies the final state after repeated set and set then remove edits', () => {
     const config = fixtureConfig('custom:\n  keep: original\n');
 
@@ -371,6 +413,50 @@ describe('renderConfigEdits', () => {
         to: ['custom', 'destination'],
       }]),
       'INVALID_CONFIG',
+    );
+  });
+
+  test('rejects a sparse edit path as INVALID_REQUEST', () => {
+    const sparsePath = ['custom'] as string[];
+    sparsePath.length = 2;
+    const config = fixtureConfig('custom:\n  keep: true\n');
+
+    expectStableError(
+      () => renderConfigEdits(config, [{
+        kind: 'set',
+        path: sparsePath,
+        value: true,
+      }]),
+      'INVALID_REQUEST',
+    );
+  });
+
+  test('rejects a sparse string-array value as INVALID_REQUEST', () => {
+    const sparseValue = ['kept'] as string[];
+    sparseValue.length = 2;
+    const config = fixtureConfig('custom:\n  keep: true\n');
+
+    expectStableError(
+      () => renderConfigEdits(config, [{
+        kind: 'set',
+        path: ['custom', 'providers'],
+        value: sparseValue,
+      }]),
+      'INVALID_REQUEST',
+    );
+  });
+
+  test('rejects a sparse edit list as INVALID_REQUEST', () => {
+    const sparseEdits = [{
+      kind: 'remove',
+      path: ['custom', 'keep'],
+    }] as Array<{ kind: 'remove'; path: string[] }>;
+    sparseEdits.length = 2;
+    const config = fixtureConfig('custom:\n  keep: true\n');
+
+    expectStableError(
+      () => renderConfigEdits(config, sparseEdits),
+      'INVALID_REQUEST',
     );
   });
 

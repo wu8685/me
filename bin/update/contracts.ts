@@ -188,46 +188,83 @@ export class UpdateError extends Error {
   }
 }
 
-const PATH_TOKEN_END = String.raw`\s,;)}\]"'<>`;
+const PATH_TOKEN_END = String.raw`\s,;)}\]"'<>\uE000\uE001`;
 const ABSOLUTE_PATH_PATTERNS = [
   new RegExp(
     String.raw`(?<![A-Za-z0-9_:/\\])file:[\\/]{1,3}[^${PATH_TOKEN_END}]+`,
     'gi',
   ),
   new RegExp(
-    String.raw`(?<![A-Za-z0-9_/\\<])\\\\[^${PATH_TOKEN_END}]+`,
+    String.raw`(?<![A-Za-z0-9_/\\])\\\\[^${PATH_TOKEN_END}]+`,
     'g',
   ),
   new RegExp(
-    String.raw`(?<![A-Za-z0-9_/\\<])[A-Za-z]:[\\/][^${PATH_TOKEN_END}]+`,
+    String.raw`(?<![A-Za-z0-9_/\\])[A-Za-z]:[\\/][^${PATH_TOKEN_END}]+`,
     'g',
   ),
   new RegExp(
-    String.raw`(?<![A-Za-z0-9_/\\<])\/+[^${PATH_TOKEN_END}]*`,
+    String.raw`(?<![A-Za-z0-9_/\\])\/+[^${PATH_TOKEN_END}]*`,
     'g',
   ),
 ] as const;
 
+function isAbsolutePathToken(value: string): boolean {
+  return /^file:[\\/]{1,3}/i.test(value)
+    || /^\/+/.test(value)
+    || /^[A-Za-z]:[\\/]/.test(value)
+    || /^\\\\/.test(value);
+}
+
+function redactDelimitedPaths(value: string): string {
+  return value
+    .replace(/<([^<>\r\n]*)>/g, (match, contents: string) => (
+      isAbsolutePathToken(contents) ? '<ABSOLUTE_PATH>' : match
+    ))
+    .replace(/"([^"\r\n]*)"|'([^'\r\n]*)'/g, (
+      match,
+      doubleQuoted: string | undefined,
+      singleQuoted: string | undefined,
+    ) => {
+      const contents = doubleQuoted ?? singleQuoted;
+      if (!isAbsolutePathToken(contents)) return match;
+      return doubleQuoted === undefined
+        ? "'<ABSOLUTE_PATH>'"
+        : '"<ABSOLUTE_PATH>"';
+    });
+}
+
 function redactAbsolutePaths(value: string): string {
-  const protectedRuntimePaths: string[] = [];
-  let sentinelPrefix = '\u{e000}ME_RUNTIME_';
+  const protectedTokens: string[] = [];
+  let sentinelPrefix = '\u{e000}PROTECTED_';
   while (value.includes(sentinelPrefix)) sentinelPrefix += '_';
-  const protectedValue = value.replace(
-    /<ME_RUNTIME>(?:[\\/][^\s,;)}\]"'<>]+)?/g,
-    match => {
-      const sentinel = `${sentinelPrefix}${protectedRuntimePaths.length}\u{e001}`;
-      protectedRuntimePaths.push(match);
+  const protect = (source: string, pattern: RegExp): string => (
+    source.replace(pattern, match => {
+      const sentinel = `${sentinelPrefix}${protectedTokens.length}\u{e001}`;
+      protectedTokens.push(match);
       return sentinel;
-    },
+    })
   );
+  let protectedValue = protect(
+    value,
+    /<ME_RUNTIME>(?:[\\/][^\s,;)}\]"'<>]+)?/g,
+  );
+  protectedValue = protect(
+    protectedValue,
+    /\b(?!file:)[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s,;)}\]"'<>]+/gi,
+  );
+  protectedValue = protect(
+    protectedValue,
+    /<\/[A-Za-z][A-Za-z0-9:-]*\s*>/g,
+  );
+  protectedValue = redactDelimitedPaths(protectedValue);
   const redacted = ABSOLUTE_PATH_PATTERNS.reduce(
     (redacted, pattern) => redacted.replace(pattern, '<ABSOLUTE_PATH>'),
     protectedValue,
   );
-  return protectedRuntimePaths.reduce(
-    (restored, runtimePath, index) => restored.replace(
+  return protectedTokens.reduce(
+    (restored, token, index) => restored.replace(
       `${sentinelPrefix}${index}\u{e001}`,
-      runtimePath,
+      token,
     ),
     redacted,
   );

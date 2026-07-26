@@ -202,4 +202,50 @@ describe('update contracts', () => {
       'portable=<ME_RUNTIME>/transactions/public.json keep this text',
     ]);
   });
+
+  test('redacts complete angle-wrapped and quoted paths containing spaces', () => {
+    const unixPath = [
+      '',
+      'Users',
+      'alice',
+      'ME Runtime',
+      'journal.json',
+    ].join('/');
+    const serialized = serializeUpdateResult(result({
+      warnings: [
+        `angle-unix=<${unixPath}> after`,
+        'angle-windows=<C:\\Users\\Alice\\ME Runtime\\journal.json> after',
+        'angle-unc=<\\\\server\\share\\ME Runtime\\journal.json> after',
+        `quoted-unix="${unixPath}" after`,
+        "quoted-windows='C:\\Users\\Alice\\ME Runtime\\journal.json' after",
+      ],
+    }));
+    const warnings = JSON.parse(serialized).warnings;
+
+    expect(warnings).toEqual([
+      'angle-unix=<ABSOLUTE_PATH> after',
+      'angle-windows=<ABSOLUTE_PATH> after',
+      'angle-unc=<ABSOLUTE_PATH> after',
+      'quoted-unix="<ABSOLUTE_PATH>" after',
+      "quoted-windows='<ABSOLUTE_PATH>' after",
+    ]);
+  });
+
+  test('preserves ordinary non-file URI tokens exactly', () => {
+    const uris = [
+      'http://example.com/runtime/journal.json',
+      'https://example.com/a/b?digest=abc#preview',
+      'ssh://git@example.com/team/repository.git',
+    ];
+    const serialized = serializeUpdateResult(result({
+      warnings: [
+        `HTTP ${uris[0]} retained`,
+        `HTTPS <${uris[1]}> retained`,
+        `SSH "${uris[2]}" retained`,
+      ],
+    }));
+
+    for (const uri of uris) expect(serialized).toContain(uri);
+    expect(serialized).not.toContain('<ABSOLUTE_PATH>');
+  });
 });
