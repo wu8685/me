@@ -6,6 +6,23 @@
     "test": "bash test/vault-test.sh",
     "test:ingest": "bun test test/ingest-*.test.ts"
   },
+  "files": [
+    ".agents/",
+    ".claude-plugin/",
+    ".codex-plugin/",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "DEVELOPMENT.md",
+    "LEGAL.md",
+    "bin/",
+    "docs/development.md",
+    "docs/features.md",
+    "docs/philosophy.md",
+    "docs/user-guide.md",
+    "references/",
+    "skills/",
+    "templates/"
+  ],
   "bin": {
     "checklinks": "bun run bin/checklinks.ts",
     "autolinks": "bun run bin/autolinks.ts",

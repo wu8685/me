@@ -154,9 +154,10 @@ $me:decision-brief 团队是否应该在下个季度采用新的发布流程？
 如果某类决策有长期稳定的检索入口或判断纪律，可以在 vault 内创建 Profile，并在 `.me/config.yaml` 中引用：
 
 ```yaml
-raw: raw
-practices: practices
-cognition: cognition
+layers:
+  raw: sources
+  practices: field-notes
+  cognition: insights
 decision:
   profile: .me/profiles/decision-brief.md
 ```
@@ -175,7 +176,7 @@ decision:
 请把这份决策简报保存到 Practices。
 ```
 
-保存要求至少有一篇实际影响本次建议、已经存在于 vault 的本地来源。ME 会先预览目标路径和索引动作，再尝试写入 `practices/decisions/`（或配置中的 Practices 目录）。只有写入结果明确 committed 才会报告已保存；没有合格来源、路径冲突、校验失败或环境不支持时会说明 `not written`，不会改用另一个文件名，也不会自动提升到 Cognition。
+保存要求至少有一篇实际影响本次建议、已经存在于 vault 的本地来源。ME 会先预览目标路径和索引动作，再尝试写入配置中的 Practices 目录；按上面的示例会写入 `field-notes/decisions/`。只有写入结果明确 committed 才会报告已保存；没有合格来源、路径冲突、校验失败或环境不支持时会说明 `not written`，不会改用另一个文件名，也不会自动提升到 Cognition。
 
 ## 搜索笔记
 

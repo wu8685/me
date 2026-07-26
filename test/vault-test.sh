@@ -280,6 +280,117 @@ test_decision_brief_discovery_and_release_version() {
   }
 }
 
+test_packed_release_has_no_private_paths() {
+  local pack_dir extract_dir pack_json tarball scan_output
+  pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-public-pack.XXXXXX")
+  extract_dir="$pack_dir/extracted"
+  mkdir -p "$extract_dir"
+
+  pack_json=$(npm pack --json --pack-destination "$pack_dir" "$PLUGIN_ROOT") || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  tarball=$(node -e '
+    const entries = JSON.parse(process.argv[1]);
+    if (!Array.isArray(entries) || entries.length !== 1 || !entries[0].filename) process.exit(1);
+    process.stdout.write(entries[0].filename);
+  ' "$pack_json") || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  tar -xzf "$pack_dir/$tarball" -C "$extract_dir" || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+
+  scan_output=$(node - "$extract_dir/package" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const root = process.argv[2];
+const forbidden = [
+  { label: 'absolute user path', value: '/' + 'Users/' },
+  { label: 'private vault name', value: ['brain', 'spark'].join('-') },
+  { label: 'private product', value: ['小鹅', '通'].join('') },
+  { label: 'private product alias', value: ['xiao', 'etong'].join('') },
+];
+const decoder = new TextDecoder('utf-8', { fatal: true });
+const findings = [];
+
+function walk(directory) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      walk(absolute);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const bytes = fs.readFileSync(absolute);
+    if (bytes.includes(0)) continue;
+    let text;
+    try {
+      text = decoder.decode(bytes);
+    } catch {
+      continue;
+    }
+    for (const rule of forbidden) {
+      if (text.toLowerCase().includes(rule.value.toLowerCase())) {
+        findings.push(`${path.relative(root, absolute)}: ${rule.label}`);
+      }
+    }
+  }
+}
+
+walk(root);
+process.stdout.write(findings.join('\n'));
+NODE
+  ) || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  rm -rf "$pack_dir"
+
+  if [ -n "$scan_output" ]; then
+    echo "$scan_output"
+    echo -e "    ${RED}FAIL${NC}: packed release contains private or machine-specific text"
+    return 1
+  fi
+}
+
+test_decision_brief_profile_example_uses_real_layer_contract() {
+  mkdir -p "$MOCK_VAULT/.me" \
+    "$MOCK_VAULT/sources" \
+    "$MOCK_VAULT/field-notes" \
+    "$MOCK_VAULT/insights"
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+
+  node - "$PLUGIN_ROOT/docs/user-guide.md" "$MOCK_VAULT/.me/config.yaml" <<'NODE'
+const fs = require('fs');
+const guide = fs.readFileSync(process.argv[2], 'utf8');
+const section = guide.match(/### 使用本地 Profile[\s\S]*?```yaml\n([\s\S]*?)```/);
+if (!section) process.exit(1);
+fs.writeFileSync(process.argv[3], section[1], 'utf8');
+NODE
+
+  local resolved
+  resolved=$(bun -e "
+    import { resolveVaultLayout } from '$PLUGIN_ROOT/bin/vault-write/path-safety.ts';
+    import path from 'path';
+    const layout = resolveVaultLayout('$MOCK_VAULT');
+    console.log(JSON.stringify({
+      raw: path.relative('$MOCK_VAULT', layout.layers.raw),
+      practices: path.relative('$MOCK_VAULT', layout.layers.practices),
+      cognition: path.relative('$MOCK_VAULT', layout.layers.cognition),
+    }));
+  ") || return 1
+
+  [ "$resolved" = '{"raw":"sources","practices":"field-notes","cognition":"insights"}' ] || {
+    echo -e "    ${RED}FAIL${NC}: documented Profile config did not resolve custom layers: $resolved"
+    return 1
+  }
+  assert_file_contains "$MOCK_VAULT/.me/config.yaml" '^decision:' || return 1
+  assert_file_contains "$MOCK_VAULT/.me/config.yaml" 'profile: .me/profiles/decision-brief.md' || return 1
+}
+
 test_ingest_docs_rich_media() {
   local readme="$PLUGIN_ROOT/README.md"
   local features="$PLUGIN_ROOT/docs/features.md"
@@ -5056,6 +5167,8 @@ main() {
     run_test test_decision_brief_writer_contract
     run_test test_decision_brief_documented
     run_test test_decision_brief_discovery_and_release_version
+    run_test test_packed_release_has_no_private_paths
+    run_test test_decision_brief_profile_example_uses_real_layer_contract
 
     # E2E tests (require claude CLI)
     run_test test_e2e_me_setup
