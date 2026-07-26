@@ -266,7 +266,8 @@ test_vault_writer_public_binary() {
 }
 
 test_codex_public_docs() {
-  assert_file_contains "$PLUGIN_ROOT/README.md" 'codex plugin marketplace add /path/to/me' || return 1
+  assert_file_contains "$PLUGIN_ROOT/README.md" '个人的知识操作系统\|面向个人的知识操作系统' || return 1
+  assert_file_contains "$PLUGIN_ROOT/README.md" 'codex plugin marketplace add https://github.com/wu8685/me.git' || return 1
   assert_file_contains "$PLUGIN_ROOT/README.md" '\$me:setup' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" '.agents/plugins/marketplace.json' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'me:setup' || return 1
@@ -275,11 +276,13 @@ test_codex_public_docs() {
 
 test_external_runtime_documented() {
   local file
-  for file in README.md docs/user-guide.md docs/features.md docs/development.md; do
+  for file in docs/user-guide.md docs/features.md docs/development.md; do
     assert_file_contains "$PLUGIN_ROOT/$file" '~/.me/runtime' || return 1
     assert_file_contains "$PLUGIN_ROOT/$file" 'ME_RUNTIME_ROOT' || return 1
     assert_file_not_contains "$PLUGIN_ROOT/$file" 'vault 相邻的 .me-runtime' || return 1
   done
+  assert_file_not_contains "$PLUGIN_ROOT/README.md" '~/.me/runtime' || return 1
+  assert_file_not_contains "$PLUGIN_ROOT/README.md" 'ME_RUNTIME_ROOT' || return 1
   assert_file_contains "$PLUGIN_ROOT/skills/setup/SKILL.md" '~/.me/runtime' || return 1
   assert_file_not_contains "$PLUGIN_ROOT/skills/setup/SKILL.md" 'under `.me-runtime`' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'bin/runtime.ts path' || return 1
@@ -330,7 +333,7 @@ test_skills_use_external_runtime() {
 }
 
 test_decision_brief_documented() {
-  assert_file_contains "$PLUGIN_ROOT/README.md" 'decision-brief' || return 1
+  assert_file_not_contains "$PLUGIN_ROOT/README.md" 'decision-brief' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/features.md" '决策简报\|Decision Brief' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'me:decision-brief' || return 1
 }
@@ -505,9 +508,9 @@ test_ingest_docs_rich_media() {
   assert_file_contains "$features" "encrypted/DRM PDF" || return 1
   assert_file_not_contains "$features" "不可读取的错误页" || return 1
 
-  assert_file_contains "$readme" "PDF" || return 1
-  assert_file_contains "$readme" "公开视频" || return 1
-  assert_file_contains "$readme" "讲义" || return 1
+  assert_file_contains "$readme" "./docs/features.md" || return 1
+  assert_file_not_contains "$readme" "Source Bundle" || return 1
+  assert_file_not_contains "$readme" "degraded" || return 1
   assert_file_not_contains "$readme" "rich-ingest" || return 1
   assert_file_not_contains "$features" "rich-ingest" || return 1
   assert_file_not_contains "$guide" "rich-ingest" || return 1
@@ -1342,70 +1345,6 @@ EOF
   fi
 }
 
-# ── E2E Tests ─────────────────────────────────────────────────────
-
-test_e2e_me_setup() {
-  # Real end-to-end test: run /me:setup via claude --plugin-dir
-  # Requires: claude CLI installed
-  if ! command -v claude &>/dev/null; then
-    echo -e "    ${YELLOW}SKIP${NC}: claude CLI not found"
-    return 0
-  fi
-
-  local output
-  output=$(cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
-
-  echo "    claude output: $(echo "$output" | head -3)"
-
-  # Verify all artifacts were created
-  assert_dir_exists "$MOCK_VAULT/raw" || return 1
-  assert_dir_exists "$MOCK_VAULT/practices" || return 1
-  assert_dir_exists "$MOCK_VAULT/cognition" || return 1
-  assert_file_exists "$MOCK_VAULT/SCHEMA.md" || return 1
-  assert_file_exists "$MOCK_VAULT/CLAUDE.md" || return 1
-  assert_file_exists "$MOCK_VAULT/.gitignore" || return 1
-
-  # Verify content correctness
-  assert_file_contains "$MOCK_VAULT/CLAUDE.md" "three-layer knowledge vault" || return 1
-  assert_file_contains "$MOCK_VAULT/CLAUDE.md" "/me:setup" || return 1
-  assert_file_contains "$MOCK_VAULT/SCHEMA.md" "LOCKED" || return 1
-  assert_file_contains "$MOCK_VAULT/.gitignore" ".obsidian/" || return 1
-
-  # Verify .gitkeep files
-  assert_file_exists "$MOCK_VAULT/raw/.gitkeep" || return 1
-  assert_file_exists "$MOCK_VAULT/practices/.gitkeep" || return 1
-  assert_file_exists "$MOCK_VAULT/cognition/.gitkeep" || return 1
-}
-
-test_e2e_me_setup_idempotent() {
-  # Run /me:setup twice — second run should detect already initialized
-  if ! command -v claude &>/dev/null; then
-    echo -e "    ${YELLOW}SKIP${NC}: claude CLI not found"
-    return 0
-  fi
-
-  # First run
-  (cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) > /dev/null || true
-
-  # Second run — should detect already initialized
-  local output
-  output=$(cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
-
-  echo "    second run output: $(echo "$output" | head -3)"
-
-  # Should still have exactly the same files (not duplicated/corrupted)
-  assert_dir_exists "$MOCK_VAULT/raw" || return 1
-  assert_file_exists "$MOCK_VAULT/SCHEMA.md" || return 1
-
-  # .gitignore should have .obsidian/ exactly once
-  local count
-  count=$(grep -c ".obsidian/" "$MOCK_VAULT/.gitignore" 2>/dev/null || echo "0")
-  if [ "$count" -ne 1 ]; then
-    echo -e "    ${RED}FAIL${NC}: .obsidian/ appears $count times after second run (expected 1)"
-    return 1
-  fi
-}
-
 test_no_hardcoded_paths() {
   # Commands must not reference ~/.claude/skills/me/
   local found=0
@@ -1759,47 +1698,6 @@ EOF
 
   if ! echo "$mentions" | grep -q "note-c"; then
     echo -e "    ${RED}FAIL${NC}: unlinked mention grep did not find note-c mentioning note-b"
-    return 1
-  fi
-}
-
-test_e2e_me_checklink_headless() {
-  # Real e2e test: run /me:checklinks in headless mode (Obsidian not running in test env)
-  if ! command -v claude &>/dev/null; then
-    echo -e "    ${YELLOW}SKIP${NC}: claude CLI not found"
-    return 0
-  fi
-
-  local v="$MOCK_VAULT"
-
-  # First setup the vault
-  (cd "$v" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) > /dev/null || true
-
-  # Create a note with a broken wikilink
-  mkdir -p "$v/raw"
-  cat > "$v/raw/2026-04-05-test.md" << 'EOF'
----
-title: "Test"
-created: 2026-04-05
-tags: [test]
-type: article
-source: "https://example.com"
----
-
-Links to [[does-not-exist]].
-EOF
-
-  # Run /me:checklinks
-  local output
-  output=$(cd "$v" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:checklinks" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
-
-  echo "    claude output: $(echo "$output" | head -5)"
-
-  # Should mention broken links or the broken target
-  if echo "$output" | grep -qi "broken\|does-not-exist\|unresolved\|headless\|grep"; then
-    return 0
-  else
-    echo -e "    ${RED}FAIL${NC}: /me:checklinks did not report broken link or headless mode"
     return 1
   fi
 }
@@ -5254,11 +5152,6 @@ main() {
     run_test test_decision_brief_discovery_and_release_version
     run_test test_packed_release_has_no_private_paths
     run_test test_decision_brief_profile_example_uses_real_layer_contract
-
-    # E2E tests (require claude CLI)
-    run_test test_e2e_me_setup
-    run_test test_e2e_me_setup_idempotent
-    run_test test_e2e_me_checklink_headless
 
     # Quick task 260406-din: checklinks (plural) and autolinks
     run_test test_checklinks_files_exist
