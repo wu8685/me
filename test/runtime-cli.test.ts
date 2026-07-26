@@ -23,20 +23,22 @@ function makeVault(): string {
   return vault;
 }
 
-function invoke(args: string[]) {
+function invoke(args: string[], environment: NodeJS.ProcessEnv = {}) {
   return spawnSync('bun', ['run', cli, ...args], {
     cwd: pluginRoot,
     encoding: 'utf8',
-    env: process.env,
+    env: { ...process.env, ...environment },
   });
 }
 
 describe('runtime CLI', () => {
   test('path reports the canonical vault runtime without creating it', () => {
     const vault = makeVault();
-    const layout = resolveRuntimeLayout(vault, {});
+    const runtimeBase = path.join(path.dirname(vault), 'runtime');
+    const environment = { ME_RUNTIME_ROOT: runtimeBase };
+    const layout = resolveRuntimeLayout(vault, environment);
 
-    const result = invoke(['path', '--vault-dir', vault]);
+    const result = invoke(['path', '--vault-dir', vault], environment);
 
     expect(result.status).toBe(0);
     expect(result.stderr).toBe('');
@@ -50,9 +52,11 @@ describe('runtime CLI', () => {
 
   test('prepare-inbox creates only the private runtime namespace and inbox', () => {
     const vault = makeVault();
-    const layout = resolveRuntimeLayout(vault, {});
+    const runtimeBase = path.join(path.dirname(vault), 'runtime');
+    const environment = { ME_RUNTIME_ROOT: runtimeBase };
+    const layout = resolveRuntimeLayout(vault, environment);
 
-    const result = invoke(['prepare-inbox', '--vault-dir', vault]);
+    const result = invoke(['prepare-inbox', '--vault-dir', vault], environment);
 
     expect(result.status).toBe(0);
     expect(result.stderr).toBe('');

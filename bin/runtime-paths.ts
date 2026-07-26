@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 export type RuntimePathErrorCode = 'UNSAFE_PATH' | 'UNSUPPORTED_FILESYSTEM';
@@ -124,7 +125,7 @@ export function resolveRuntimeLayout(
 
   const runtimeBase = override
     ? path.resolve(override)
-    : path.join(path.dirname(canonicalVault), '.me-runtime');
+    : path.join(os.homedir(), '.me', 'runtime');
   if (isInside(lexicalVault, runtimeBase) || isInside(canonicalVault, runtimeBase)) {
     fail('UNSAFE_PATH');
   }

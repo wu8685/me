@@ -25,17 +25,24 @@ describe('external runtime path resolution', () => {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   });
 
-  test('derives a deterministic sibling namespace without creating it', () => {
+  test('derives a deterministic home runtime namespace without creating it', () => {
+    const expectedBase = path.join(os.homedir(), '.me', 'runtime');
+    const entriesBefore = fs.existsSync(expectedBase)
+      ? fs.readdirSync(expectedBase).sort()
+      : undefined;
     const first = resolveRuntimeLayout(vault, {});
     const second = resolveRuntimeLayout(vault, {});
-    const expectedBase = path.join(path.dirname(fs.realpathSync(vault)), '.me-runtime');
+    const oldSiblingBase = path.join(path.dirname(fs.realpathSync(vault)), '.me-runtime');
+    const entriesAfter = fs.existsSync(expectedBase)
+      ? fs.readdirSync(expectedBase).sort()
+      : undefined;
 
     expect(first.runtimeBase).toBe(expectedBase);
     expect(first.runtimeRoot).toBe(second.runtimeRoot);
     expect(path.dirname(first.runtimeRoot)).toBe(expectedBase);
     expect(path.basename(first.runtimeRoot)).toMatch(/^vault-[a-f0-9]{24}$/);
-    expect(fs.existsSync(first.runtimeBase)).toBeFalse();
-    expect(fs.existsSync(first.runtimeRoot)).toBeFalse();
+    expect(entriesAfter).toEqual(entriesBefore);
+    expect(fs.existsSync(oldSiblingBase)).toBeFalse();
   });
 
   test('uses an absolute host-local override and still appends a vault namespace', () => {
@@ -88,7 +95,9 @@ describe('external runtime path resolution', () => {
   });
 
   test('renders a lexically contained unsafe entry for recovery reporting', () => {
-    const layout = resolveRuntimeLayout(vault, {});
+    const layout = resolveRuntimeLayout(vault, {
+      ME_RUNTIME_ROOT: path.join(fixtureRoot, 'runtime'),
+    });
     bootstrapRuntimeDirectories(layout, [layout.transactionDir]);
     const outside = path.join(fixtureRoot, 'foreign-journal');
     const linkedJournal = path.join(layout.transactionDir, 'journal.json');
@@ -101,7 +110,9 @@ describe('external runtime path resolution', () => {
   });
 
   test('bootstraps only requested contained directories with private permissions', () => {
-    const layout = resolveRuntimeLayout(vault, {});
+    const layout = resolveRuntimeLayout(vault, {
+      ME_RUNTIME_ROOT: path.join(fixtureRoot, 'runtime'),
+    });
 
     bootstrapRuntimeDirectories(layout, [layout.lockDir, layout.inboxDir]);
 
@@ -116,7 +127,9 @@ describe('external runtime path resolution', () => {
   });
 
   test('rejects a runtime prefix replaced by a symlink before bootstrap', () => {
-    const layout = resolveRuntimeLayout(vault, {});
+    const layout = resolveRuntimeLayout(vault, {
+      ME_RUNTIME_ROOT: path.join(fixtureRoot, 'runtime'),
+    });
     const outside = path.join(fixtureRoot, 'outside');
     fs.mkdirSync(outside);
     fs.mkdirSync(layout.runtimeBase);
