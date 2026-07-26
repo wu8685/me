@@ -272,6 +272,11 @@ test_codex_public_docs() {
   assert_file_contains "$PLUGIN_ROOT/README.md" '/me:setup' || return 1
   assert_file_contains "$PLUGIN_ROOT/README.md" 'codex plugin marketplace add https://github.com/wu8685/me.git' || return 1
   assert_file_contains "$PLUGIN_ROOT/README.md" '\$me:setup' || return 1
+  assert_file_contains "$PLUGIN_ROOT/README.md" '一套知识库，多台工作机器' || return 1
+  assert_file_contains "$PLUGIN_ROOT/README.md" 'Obsidian Sync' || return 1
+  assert_file_contains "$PLUGIN_ROOT/README.md" 'ME 不接管云存储' || return 1
+  assert_file_contains "$PLUGIN_ROOT/README.md" '跨工具、跨机器持续使用' || return 1
+  assert_file_not_contains "$PLUGIN_ROOT/README.md" '跨工具、跨机器迁移' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" '.agents/plugins/marketplace.json' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'me:setup' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/features.md" 'Codex skill' || return 1
