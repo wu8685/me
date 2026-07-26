@@ -3448,13 +3448,15 @@ test_decision_brief_write_transaction_contract() {
   local block
 
   assert_file_exists "$skill" || return 1
-  grep -Fq 'Do not implement the transaction yourself. Ordinary shell checks,' "$skill" || return 1
-  grep -Fq '`apply_patch`, and `mv` do not atomically couple comparison with mutation' "$skill" || return 1
-  grep -Fq 'Only call a deterministic transactional writer already provided by the' "$skill" || return 1
-  grep -Fq 'contract guarantees atomic' "$skill" || return 1
-  grep -Fq 'no-clobber creates, conditional replacements, post-write validation,' "$skill" || return 1
-  grep -Fq 'output a schema-targeted practices draft and the exact validation checklist' "$skill" || return 1
-  grep -Fq 'explicitly say `not written`' "$skill" || return 1
+  grep -Fq 'bin/vault-write.ts preview' "$skill" || return 1
+  grep -Fq 'bin/vault-write.ts write' "$skill" || return 1
+  grep -Fq 'Do not invoke the CLI' "$skill" || return 1
+  grep -Fq 'with empty, placeholder, or' "$skill" || return 1
+  grep -Fq 'The first invocation must be `bin/vault-write.ts preview`' "$skill" || return 1
+  grep -Fq 'Never use `apply_patch`, shell redirect, `mv`, or' "$skill" || return 1
+  grep -Fq 'generic file operation to write a vault target.' "$skill" || return 1
+  grep -Fq '`commitModel: journaled-cooperative`' "$skill" || return 1
+  grep -Fq 'say `not written`' "$skill" || return 1
 
   assert_file_exists "$evidence" || return 1
   grep -Fq 'These checks validate evidence structure, not agent behavior.' "$evidence" || return 1
@@ -3497,6 +3499,130 @@ test_decision_brief_write_transaction_contract() {
     echo "$block" | grep -Fq '**Exact excerpt:**' || return 1
     echo "$block" | grep -Fq '**Filesystem verdict:**' || return 1
   done
+}
+
+test_decision_brief_writer_contract() {
+  local skill="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
+  local output="$PLUGIN_ROOT/skills/decision-brief/references/output-contract.md"
+  local evidence="$PLUGIN_ROOT/test/skills/decision-brief/writer-results.md"
+  local id
+  local block
+  local locale_slug_c
+  local locale_slug_tr
+
+  assert_file_exists "$skill" || return 1
+  assert_file_exists "$output" || return 1
+
+  grep -Fq 'bin/vault-write.ts preview' "$skill" || return 1
+  grep -Fq 'bin/vault-write.ts write' "$skill" || return 1
+  grep -Fq 'commitModel: journaled-cooperative' "$skill" || return 1
+  grep -Fq 'status: committed' "$skill" || return 1
+  grep -Fq 'status: validation_failed' "$skill" || return 1
+  grep -Fq 'status: conflict' "$skill" || return 1
+  grep -Fq 'status: unsupported' "$skill" || return 1
+  grep -Fq 'status: manual_recovery' "$skill" || return 1
+  grep -Fq 'recoveryState' "$skill" || return 1
+  grep -Fq 'preservedPaths' "$skill" || return 1
+  grep -Fq 'remainingMutations' "$skill" || return 1
+  grep -Fq 'actions' "$skill" || return 1
+  grep -Fq 'Do not set `acknowledgeCognition`' "$skill" || return 1
+  grep -Fq 'type: reflection' "$skill" || return 1
+  grep -Fq 'decisions/YYYY-MM-DD-<slug>.md' "$skill" || return 1
+  grep -Fq 'existing path-qualified local wikilink' "$skill" || return 1
+  grep -Fq 'Do not use `type: experiment`' "$skill" || return 1
+  grep -Fq 'Markdown request through stdin' "$skill" || return 1
+  grep -Fq '.me/tmp' "$skill" || return 1
+  grep -Fq 'Do not add a numeric suffix' "$skill" || return 1
+  grep -Fq "decision.normalize('NFKC').trim()" "$skill" || return 1
+  grep -Fq "replace(/\\p{White_Space}+/gu, ' ').toLowerCase()" "$skill" || return 1
+  grep -Fq "normalizedDecision.replace(/[^a-z0-9]+/g, '-')" "$skill" || return 1
+  grep -Fq ".update(Buffer.from(normalizedDecision, 'utf8'))" "$skill" || return 1
+  grep -Fq ".slice(0, 12)" "$skill" || return 1
+  if grep -Fq 'requestDigest' "$skill"; then
+    echo -e "    ${RED}FAIL${NC}: decision slug must not derive from requestDigest"
+    return 1
+  fi
+  if grep -Fq 'atomic commit' "$skill"; then
+    echo -e "    ${RED}FAIL${NC}: Skill must not claim a cross-file atomic commit"
+    return 1
+  fi
+  grep -Fq 'Never use `apply_patch`, shell redirect, `mv`, or' "$skill" || return 1
+  grep -Fq 'generic file operation to write a vault target.' "$skill" || return 1
+
+  LC_ALL=C bun run - <<'EOF' || return 1
+const { createHash } = require('crypto');
+function slug(decision) {
+  const normalizedDecision = decision.normalize('NFKC').trim()
+    .replace(/\p{White_Space}+/gu, ' ').toLowerCase();
+  const ascii = normalizedDecision.replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, '');
+  return ascii || `decision-${
+    createHash('sha256')
+      .update(Buffer.from(normalizedDecision, 'utf8'))
+      .digest('hex')
+      .slice(0, 12)
+  }`;
+}
+const cases = [
+  ['Build Orchid Relay', 'build-orchid-relay'],
+  ['Ｂｕｉｌｄ　ＯＲＣＨＩＤ', 'build-orchid'],
+  ['one\u00a0two\u2003three', 'one-two-three'],
+  ['MiXeD CaSe', 'mixed-case'],
+  ['全中文决策', 'decision-d0fc28be7e6e'],
+  ['***', 'decision-596f4162a52f'],
+  ['', 'decision-e3b0c44298fc'],
+  ['a'.repeat(61), 'a'.repeat(60)],
+  [`${'a'.repeat(59)} b`, 'a'.repeat(59)],
+];
+for (const [input, want] of cases) {
+  const got = slug(input);
+  if (got !== want) throw new Error(`${JSON.stringify(input)}: ${got} != ${want}`);
+}
+EOF
+  locale_slug_c="$(
+    LC_ALL=C bun -e "console.log('INDIGO'.normalize('NFKC').trim().replace(/\\p{White_Space}+/gu, ' ').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, ''))"
+  )" || return 1
+  locale_slug_tr="$(
+    LC_ALL=tr_TR.UTF-8 bun -e "console.log('INDIGO'.normalize('NFKC').trim().replace(/\\p{White_Space}+/gu, ' ').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, ''))"
+  )" || return 1
+  [ "$locale_slug_c" = "indigo" ] || return 1
+  [ "$locale_slug_tr" = "$locale_slug_c" ] || return 1
+
+  grep -Fq 'Only `status: committed` with `commitModel: journaled-cooperative` means saved.' "$output" || return 1
+  grep -Fq '`not written`' "$output" || return 1
+
+  assert_file_exists "$evidence" || return 1
+  grep -Fq 'Each sample ran twice in a separate fresh context.' "$evidence" || return 1
+  grep -Fq 'Verdicts are based on human semantic review' "$evidence" || return 1
+  for id in DW1 DW2 DW3 DW4 DW5 DW6 DW7; do
+    [ "$(grep -Fc "### $id run " "$evidence")" -eq 2 ] || return 1
+    for run in 1 2; do
+      block="$(
+        awk -v heading="### $id run $run" '
+          $0 == heading { in_probe = 1; next }
+          in_probe && /^### DW[1-7] run [12]$/ { exit }
+          in_probe { print }
+        ' "$evidence"
+      )"
+      echo "$block" | grep -Fq '**Exact prompt:**' || return 1
+      echo "$block" | grep -Fq '**Fresh-context metadata:**' || return 1
+      echo "$block" | grep -Fq '**Writer fixture result:**' || return 1
+      echo "$block" | grep -Fq '**Before hash:**' || return 1
+      echo "$block" | grep -Fq '**After hash:**' || return 1
+      echo "$block" | grep -Fq '**Agent exact excerpt:**' || return 1
+      echo "$block" | grep -Fq '**Human semantic verdict:** PASS' || return 1
+    done
+  done
+
+  block="$(
+    awk '
+      /^### DW5 run 1$/ { in_probe = 1; next }
+      in_probe && /^### DW[1-7] run [12]$/ { exit }
+      in_probe { print }
+    ' "$evidence"
+  )"
+  [ "$(echo "$block" | grep -Fc 'operationId:')" -eq 2 ] || return 1
+  echo "$block" | grep -Fq 'recoveryState: incomplete' || return 1
 }
 
 # ── Quick Task 260406-e00: Convert Commands to Skills Tests ─────────────────
@@ -4894,6 +5020,7 @@ main() {
     run_test test_decision_brief_profile_contract
     run_test test_decision_brief_profile_behavior_evidence
     run_test test_decision_brief_write_transaction_contract
+    run_test test_decision_brief_writer_contract
 
     # E2E tests (require claude CLI)
     run_test test_e2e_me_setup

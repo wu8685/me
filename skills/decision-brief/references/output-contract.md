@@ -77,3 +77,18 @@ fact or experiment that could unlock the decision. A blocked brief must not
 recommend an option or interim direction: `推荐理由` explains why no direction is
 supportable, and `最小验证实验` gathers the missing fact without prescribing the
 status quo, delay, or “先不要 X.”
+
+## Save result
+
+Keep the brief unchanged when the user explicitly authorizes a practices save.
+Append a compact save result after it.
+
+Only `status: committed` with `commitModel: journaled-cooperative` means saved.
+For `validation_failed`, `conflict`, or `unsupported`, say `not written` and
+preserve the writer's public status, error code, and message. Do not choose a
+new filename after a conflict.
+
+For `manual_recovery`, do not say saved or rolled back. State the aggregate
+`recoveryState`, then list every recovery—not only the first—with its
+`operationId`, `state`, `preservedPaths`, `remainingMutations`, and every
+recommended action.

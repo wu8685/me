@@ -138,35 +138,99 @@ Default output: chat only; do not write the vault without explicit authorization
 
 Never promote a decision directly to cognition
 
-If the user explicitly asks to save a provisional decision, use practices and
-then:
+An explicit request to save a provisional decision authorizes only the
+practices path below. Agreement such as “建议不错” is not save authorization.
 
-1. Resolve the configured practices layer from `.me/config.yaml`.
-2. Read the current vault's schema, matching template, and project instructions,
-   including post-create rules. If a required contract is unavailable, stay
-   chat-only and report that nothing was saved.
-3. Use only the type, fields, and source shape explicitly allowed for that
-   practices layer by its current schema and template. Reject an unknown type or
-   field; stay chat-only rather than inventing one.
-4. Do not implement the transaction yourself. Ordinary shell checks,
-   `apply_patch`, and `mv` do not atomically couple comparison with mutation and
-   therefore are not sufficient for an automatic vault write.
-5. Only call a deterministic transactional writer already provided by the
-   current vault or environment when its documented contract guarantees atomic
-   no-clobber creates, conditional replacements, post-write validation,
-   ownership-aware rollback, and concurrent-change preservation for the whole
-   mutation set.
-6. The writer contract must also enforce the current schema and template,
-   configured practices layer, link health, index reachability, and backlinks
-   workflow. Do not infer these guarantees from generic filesystem tools.
-7. If no qualifying writer exists, do not mutate any vault target. Instead,
-   output a schema-targeted practices draft and the exact validation checklist
-   that a future writer must run; explicitly say `not written`. Explicit save
-   authorization does not relax this boundary.
-8. Report “saved” only when the qualifying writer reports an atomic commit and
-   all required checks passed. If it reports a conflict or incomplete recovery,
-   preserve its exact status and list remaining mutations and manual recovery;
-   never upgrade that result to “saved” or “rolled back”.
+### Prepare a practices request
+
+1. Resolve `PLUGIN_ROOT` to this installed plugin/repository and `VAULT_DIR` to
+   the current vault. Read `.me/config.yaml`, the schema, practices template,
+   and project instructions.
+2. Require at least one local note that materially informed this brief. Choose
+   one such note as the primary provenance and verify it already exists. Its
+   `source` must be an existing path-qualified local wikilink, such as
+   `[[raw/topic/source-note]]`: no basename-only link, remote URL, conversation
+   inference, or planned note qualifies. With no qualifying provenance, do not
+   call the writer; suggest ingesting the source into raw or remain chat-only,
+   and say `not written`.
+3. Build a practices note with the current schema's exact fields. It must use
+   `type: reflection`; Do not use `type: experiment` for the planned minimum
+   experiment. The body preserves the Decision Brief output sections.
+4. Derive the slug only from the raw `Decision` field of the Decision Contract,
+   never from a summary, title, date, source, or result. Use Node's `createHash`
+   from `crypto`:
+
+```ts
+const normalizedDecision = decision.normalize('NFKC').trim()
+  .replace(/\p{White_Space}+/gu, ' ').toLowerCase();
+const ascii = normalizedDecision.replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, '');
+const slug = ascii || `decision-${
+  createHash('sha256')
+    .update(Buffer.from(normalizedDecision, 'utf8'))
+    .digest('hex')
+    .slice(0, 12)
+}`;
+```
+
+This algorithm is locale-independent. Use it unchanged for ASCII, full-width
+characters, Unicode whitespace, mixed case, all-Unicode, all-symbol, empty, and
+over-60-character inputs. The requested relative target is always
+`decisions/YYYY-MM-DD-<slug>.md`. Apply the writer's ASCII-fold/exact-Unicode
+collision rule. Do not add a numeric suffix; a collision is a conflict.
+
+Construct this v1 JSON request, omitting every unknown or empty optional field:
+
+```json
+{
+  "version": 1,
+  "layer": "practices",
+  "relativePath": "decisions/YYYY-MM-DD-<slug>.md",
+  "markdown": "<complete schema-valid reflection note>",
+  "index": { "mode": "auto" }
+}
+```
+
+Do not set `acknowledgeCognition`. Send the complete Markdown request through stdin,
+not a shell argument. If tooling requires a temporary request file, it may
+exist only directly under `.me/tmp`, must be passed with `--request`, and must
+be removed after use. Never use `apply_patch`, shell redirect, `mv`, or another
+generic file operation to write a vault target.
+
+### Preview, then write
+
+Fully prepare the request before any writer invocation. Do not invoke the CLI
+for discovery, `--help`, capability probing, or with empty, placeholder, or
+partial stdin. The first invocation must be `bin/vault-write.ts preview` with
+the complete request:
+
+```bash
+bun run "$PLUGIN_ROOT/bin/vault-write.ts" preview --vault-dir "$VAULT_DIR"
+```
+
+Parse its actual JSON. Continue only when `status: preview`,
+`commitModel: preview-only`, the note path and planned paths match the prepared
+practices request, and no error is present. Preview reserves nothing. Only then
+invoke `bin/vault-write.ts write` with the same request bytes:
+
+```bash
+bun run "$PLUGIN_ROOT/bin/vault-write.ts" write --vault-dir "$VAULT_DIR"
+```
+
+Parse the write JSON rather than inferring success from its exit code:
+
+| Result | Required report |
+| --- | --- |
+| `status: committed` and `commitModel: journaled-cooperative` | Report saved; include `notePath`, changed paths, warnings, backlinks, and unlinked mentions. |
+| `status: validation_failed` | Report `not written`; include the public error code/message. |
+| `status: conflict` | Report `not written`; include the conflict without choosing a new path or suffix. |
+| `status: unsupported` | Report `not written`; explain that the filesystem cannot provide the required primitive. |
+| `status: manual_recovery` | Do not say saved or rolled back. Report aggregate `recoveryState`, then iterate over every item in `recoveries[]` and transcribe its `operationId`, `state`, `preservedPaths`, `remainingMutations`, and every `actions` entry. |
+
+The writer's model is cooperative and journaled; describe it only as
+`commitModel: journaled-cooperative`. A preview result, exit code zero, partial
+filesystem observation, or an empty recovery list never independently proves a
+save.
 
 Raw sources belong in raw. Even when the user says “这是我的原则”, first apply the
 current vault's cognition validation and confirmation requirements; never claim
