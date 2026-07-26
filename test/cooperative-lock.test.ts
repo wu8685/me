@@ -402,4 +402,119 @@ describe('vault-wide cooperative lock', () => {
     });
     releaseVaultLock(layout, next);
   });
+
+  test('initial ownership read cannot return while a real second owner is acquired', () => {
+    const layout = preparedRuntime();
+    let second: ReturnType<typeof acquireVaultLock> | undefined;
+    let first: ReturnType<typeof acquireVaultLock> | undefined;
+    let firstError: unknown;
+    let raced = false;
+    const hooks = {
+      __operations: {
+        readFileSync(candidate: string) {
+          const bytes = fs.readFileSync(candidate);
+          if (!raced && candidate === path.join(layout.lockDir, 'vault.lock')) {
+            raced = true;
+            fs.unlinkSync(candidate);
+            second = acquireVaultLock(layout, {
+              operationId: 'second',
+              owner: 'me-update',
+            });
+          }
+          return bytes;
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        readFileSync(candidate: string): Buffer;
+      };
+    };
+
+    try {
+      first = acquireVaultLock(layout, {
+        operationId: 'first',
+        owner: 'vault-write',
+      }, hooks);
+    } catch (error) {
+      firstError = error;
+    }
+    const bothAcquired = first !== undefined && second !== undefined;
+
+    if (first) {
+      try {
+        releaseVaultLock(layout, first, hooks);
+      } catch {
+        // The real second owner must remain authoritative.
+      }
+    }
+    if (second) releaseVaultLock(layout, second);
+
+    expect(raced).toBeTrue();
+    expect(bothAcquired).toBeFalse();
+    expect(firstError).toBeInstanceOf(Error);
+    expect((firstError as Error).message).toMatch(/RECOVERY_REQUIRED/);
+  });
+
+  test('release preserves same-inode corruption when rename does not occur', () => {
+    const layout = preparedRuntime();
+    const hooks = {
+      __operations: {
+        renameSync(source: string) {
+          fs.writeFileSync(source, 'same-inode release corruption');
+          throw new Error('injected rename-before-mutation failure');
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        renameSync(source: string, destination: string): void;
+      };
+    };
+    const lock = acquireVaultLock(layout, {
+      operationId: 'owned',
+      owner: 'vault-write',
+    }, hooks);
+    const before = fs.statSync(lock.path, { bigint: true });
+
+    expect(() => releaseVaultLock(layout, lock, hooks)).toThrow(/RECOVERY_REQUIRED/);
+    const after = fs.statSync(lock.path, { bigint: true });
+    expect(after.dev).toBe(before.dev);
+    expect(after.ino).toBe(before.ino);
+    expect(fs.readFileSync(lock.path, 'utf8')).toBe('same-inode release corruption');
+  });
+
+  test('failed acquisition preserves same-inode corruption when rename does not occur', () => {
+    const layout = preparedRuntime();
+    let ownedIdentity: fs.BigIntStats | undefined;
+    const hooks = {
+      __operations: {
+        fsyncSync() {
+          ownedIdentity = fs.statSync(
+            path.join(layout.lockDir, 'vault.lock'),
+            { bigint: true },
+          );
+          throw new Error('injected acquisition fsync failure');
+        },
+        renameSync(source: string) {
+          fs.writeFileSync(source, 'same-inode acquisition corruption');
+          throw new Error('injected acquisition rename-before-mutation failure');
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        fsyncSync(descriptor: number): void;
+        renameSync(source: string, destination: string): void;
+      };
+    };
+
+    expect(() => acquireVaultLock(layout, {
+      operationId: 'failed',
+      owner: 'ingest',
+    }, hooks)).toThrow(/RECOVERY_REQUIRED/);
+    const lockPath = path.join(layout.lockDir, 'vault.lock');
+    const after = fs.statSync(lockPath, { bigint: true });
+    expect(after.dev).toBe(ownedIdentity?.dev);
+    expect(after.ino).toBe(ownedIdentity?.ino);
+    expect(fs.readFileSync(lockPath, 'utf8'))
+      .toBe('same-inode acquisition corruption');
+  });
 });

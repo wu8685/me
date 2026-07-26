@@ -74,7 +74,12 @@ interface CooperativeLockIdentity {
   owner: CooperativeLockOwner;
 }
 
-type PathOwnershipState = 'owned' | 'foreign' | 'missing' | 'unknown';
+type PathOwnershipState =
+  | 'owned'
+  | 'same-inode-corrupt'
+  | 'replacement'
+  | 'missing'
+  | 'unknown';
 
 const lockStates = new WeakMap<OwnedCooperativeLock, CooperativeLockState>();
 
@@ -131,6 +136,60 @@ function isExpectedOwnership(
     && parsed.owner === owner;
 }
 
+function readPathOwnership(
+  candidate: string,
+  descriptor: number,
+  identity: CooperativeLockIdentity,
+  operations: CooperativeLockOperations,
+): Exclude<PathOwnershipState, 'missing'> {
+  const opened = operations.fstatSync(descriptor);
+  const entryBeforeRead = operations.lstatSync(candidate);
+  const targetBeforeRead = operations.statSync(candidate);
+  const actualBytes = operations.readFileSync(candidate);
+  /*
+   * Reading bytes is not an identity-stable operation. Re-read both path
+   * identities afterwards so a replacement made during readFileSync can
+   * never inherit the ownership proof for the previous inode.
+   */
+  const entryAfterRead = operations.lstatSync(candidate);
+  const targetAfterRead = operations.statSync(candidate);
+  const openedIsOwned = opened.isFile()
+    && opened.dev === identity.device
+    && opened.ino === identity.inode;
+  const beforeIsRegular = entryBeforeRead.isFile()
+    && !entryBeforeRead.isSymbolicLink()
+    && targetBeforeRead.isFile()
+    && entryBeforeRead.dev === targetBeforeRead.dev
+    && entryBeforeRead.ino === targetBeforeRead.ino;
+  const afterIsRegular = entryAfterRead.isFile()
+    && !entryAfterRead.isSymbolicLink()
+    && targetAfterRead.isFile()
+    && entryAfterRead.dev === targetAfterRead.dev
+    && entryAfterRead.ino === targetAfterRead.ino;
+  if (!openedIsOwned || !beforeIsRegular || !afterIsRegular) return 'unknown';
+
+  const beforeIsOwned = entryBeforeRead.dev === identity.device
+    && entryBeforeRead.ino === identity.inode;
+  const afterIsOwned = entryAfterRead.dev === identity.device
+    && entryAfterRead.ino === identity.inode;
+  if (beforeIsOwned && afterIsOwned) {
+    return isExpectedOwnership(
+      actualBytes,
+      identity.bytes,
+      identity.operationId,
+      identity.owner,
+    )
+      ? 'owned'
+      : 'same-inode-corrupt';
+  }
+
+  const stableReplacement = !beforeIsOwned
+    && !afterIsOwned
+    && entryBeforeRead.dev === entryAfterRead.dev
+    && entryBeforeRead.ino === entryAfterRead.ino;
+  return stableReplacement ? 'replacement' : 'unknown';
+}
+
 function inspectPathOwnership(
   candidate: string,
   descriptor: number,
@@ -138,42 +197,7 @@ function inspectPathOwnership(
   operations: CooperativeLockOperations,
 ): PathOwnershipState {
   try {
-    const opened = operations.fstatSync(descriptor);
-    const entryBeforeRead = operations.lstatSync(candidate);
-    const targetBeforeRead = operations.statSync(candidate);
-    const actualBytes = operations.readFileSync(candidate);
-    /*
-     * Reading bytes is not an identity-stable operation. Re-read both path
-     * identities afterwards so a replacement made during readFileSync can
-     * never inherit the ownership proof for the previous inode.
-     */
-    const entryAfterRead = operations.lstatSync(candidate);
-    const targetAfterRead = operations.statSync(candidate);
-    return opened.isFile()
-      && entryBeforeRead.isFile()
-      && !entryBeforeRead.isSymbolicLink()
-      && targetBeforeRead.isFile()
-      && entryAfterRead.isFile()
-      && !entryAfterRead.isSymbolicLink()
-      && targetAfterRead.isFile()
-      && opened.dev === identity.device
-      && opened.ino === identity.inode
-      && entryBeforeRead.dev === identity.device
-      && entryBeforeRead.ino === identity.inode
-      && targetBeforeRead.dev === identity.device
-      && targetBeforeRead.ino === identity.inode
-      && entryAfterRead.dev === identity.device
-      && entryAfterRead.ino === identity.inode
-      && targetAfterRead.dev === identity.device
-      && targetAfterRead.ino === identity.inode
-      && isExpectedOwnership(
-        actualBytes,
-        identity.bytes,
-        identity.operationId,
-        identity.owner,
-      )
-      ? 'owned'
-      : 'foreign';
+    return readPathOwnership(candidate, descriptor, identity, operations);
   } catch (error) {
     return errno(error) === 'ENOENT' ? 'missing' : 'unknown';
   }
@@ -187,19 +211,16 @@ function validateAcquiredLock(
   operations: CooperativeLockOperations,
 ): CooperativeLockState {
   const opened = operations.fstatSync(descriptor);
-  const entry = operations.lstatSync(lockPath);
-  const target = operations.statSync(lockPath);
-  const actualBytes = operations.readFileSync(lockPath);
+  const identity: CooperativeLockIdentity = {
+    bytes,
+    device: opened.dev,
+    inode: opened.ino,
+    operationId: request.operationId,
+    owner: request.owner,
+  };
   if (
     !opened.isFile()
-    || !entry.isFile()
-    || entry.isSymbolicLink()
-    || !target.isFile()
-    || opened.dev !== entry.dev
-    || opened.ino !== entry.ino
-    || opened.dev !== target.dev
-    || opened.ino !== target.ino
-    || !isExpectedOwnership(actualBytes, bytes, request.operationId, request.owner)
+    || readPathOwnership(lockPath, descriptor, identity, operations) !== 'owned'
   ) {
     throw new CooperativeLockError('RECOVERY_REQUIRED');
   }
@@ -297,10 +318,10 @@ function quarantineAndRemoveOwnedLock(
     const quarantineState = inspect(quarantinePath);
     if (
       quarantineState === 'missing'
-      && (sourceState === 'missing' || sourceState === 'foreign')
+      && (sourceState === 'missing' || sourceState === 'replacement')
     ) {
       /*
-       * The owned inode is no longer reachable. A foreign source is a new
+       * The owned inode is no longer reachable. A replacement source is a new
        * owner and must be preserved, but the previous owner is fully released.
        */
       return 'removed';
