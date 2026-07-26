@@ -10,3 +10,7 @@ package-lock.json
 
 # Internal GSD planning artifacts — not published
 .planning/
+
+# Local isolated execution workspaces and Subagent-Driven Development ledgers
+.worktrees/
+.superpowers/

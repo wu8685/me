@@ -25,7 +25,7 @@ codex plugin marketplace add https://github.com/wu8685/me.git
 codex plugin add me@me-marketplace
 ```
 
-Codex 支持 `codex plugin marketplace add <SOURCE>` 和 `codex plugin add me@me-marketplace`。本仓库提供 Codex 原生 marketplace：`.agents/plugins/marketplace.json`，其中 `source.path: "./"` 指向仓库根目录的插件本体；插件能力由 `.codex-plugin/plugin.json` 暴露，`skills: "./skills/"` 会加载 7 个 `me:*` skills。
+Codex 支持 `codex plugin marketplace add <SOURCE>` 和 `codex plugin add me@me-marketplace`。本仓库提供 Codex 原生 marketplace：`.agents/plugins/marketplace.json`，其中 `source.path: "./"` 指向仓库根目录的插件本体；插件能力由 `.codex-plugin/plugin.json` 暴露，`skills: "./skills/"` 会自动加载包括 `me:decision-brief` 在内的 `me:*` skills。
 
 本指南后续命令默认写成 Claude Code 的 `/me:*` slash command。Codex 中对应的 skill 名称是 `me:*`：运行 `/skills` 选择 `me:setup`，或在 prompt 中显式写 `$me:setup`、`$me:ingest https://example.com/article`。
 
@@ -55,26 +55,128 @@ Next steps:
   Run `/me:ingest <url>` to add your first research note.
 ```
 
-## 摄入第一篇文章
+## 摄入文章、PDF 与公开视频
 
 ```bash
+# HTML 文章
 /me:ingest https://example.com/article-about-ai
+
+# PDF（也支持由响应类型识别的无后缀 PDF）
+/me:ingest https://example.com/research/report.pdf
+
+# 公开 X 文章或视频
+/me:ingest https://x.com/example/status/1234567890
+
+# Bilibili 公共视频
+/me:ingest https://www.bilibili.com/video/BV1Example
 ```
 
 Codex 等价调用：`$me:ingest https://example.com/article-about-ai`。
 
-**输出：**
-```
-Detected: English article.
-Mode: translate-cn
-Override? (press Enter to accept, or type: summarize | raw)
+`/me:ingest` 会先预览来源类型、处理模式和可用能力，再确认 topic 并写入。英文文章默认 `translate-cn`，中文文章默认 `summarize`；视频或课程默认生成 `handout` 讲义。也可以显式指定：
 
-[Processing...]
-
-Created: raw/2026-04-06-ai-agents.md
-Auto-linked: 3 wikilinks
-Related notes: 2 suggestions
+```bash
+/me:ingest https://www.bilibili.com/video/BV1Example --mode handout
+/me:ingest https://x.com/example/status/1234567890 --mode transcribe
 ```
+
+讲义不是十条摘要。ME 会保留完整的时间戳 transcript：有稳定、带时间戳的页面时生成 Slide-driven 讲义；访谈、talking head 或没有稳定页面的视频生成 Topic-driven 讲义。
+
+### 导入 Source Bundle
+
+Source Bundle v1 是静态交换目录，适合导入用户已有合法访问权、但公开 URL 无法直接读取的材料：
+
+```text
+my-bundle/
+├── source-bundle.json
+└── assets/
+    └── slide-001.jpg
+```
+
+```bash
+/me:ingest --bundle ./my-bundle
+```
+
+Bundle 内容是静态数据。素材既可使用目录内相对路径，也可只提供公开 HTTP(S) URL；
+后者会先下载到一次性的运行 workspace，经扩展名、响应内容类型和大小校验后再写入。
+非正文元数据不能包含 URL userinfo、敏感 query、登录状态、凭据或本机绝对路径；
+正文和逐字稿中原本引用的这些文字仍按材料内容保留。ME 不会执行 Bundle 中的脚本或
+指令，非法 Bundle 不会留下部分文件。
+
+### 依赖探测与 degraded 结果
+
+不同来源依赖 PATH 中可用的外部命令。CLI 会按来源调用或探测这些命令，缺少必要命令时会报告失败或 warning：
+
+- HTML 与 X Article 正文提取：需要 PATH 中可用的 `defuddle`（CLI 调用 `defuddle parse --md`）。
+- PDF：需要 `curl`、`pdftotext`、`pdftohtml`、`pdfinfo`。
+- X 视频：需要 `yt-dlp`。
+- 缺少现成字幕而需要本地转写时：使用配置中可用的 `mlx-whisper` 或 `whisper.cpp` provider。
+
+预览 JSON 中的 `capabilities` 表示实际可用内容，`degradation` 与 `warnings` 表示缺失或
+失败的资源。PDF 另有 `completeness`：文档页数与提取页数一致才是 `complete`，页数
+不足是 `partial`，证据缺失或冲突是 `unknown`。`partial`/`unknown` 都不能描述为
+全文完成。CLI 已实现的 blocked cases 包括 X auth wall 和 encrypted/DRM PDF；普通
+HTML 错误页没有统一的自动识别，Agent 仍需检查正文是否真实、完整，不能把只有标题
+或错误提示的页面写成成功结果。只有输出包含 `writeResult` 才表示 artifact 已写入，
+失败时不会留下半篇笔记。
+
+成功写入后，一篇材料位于独立目录中：
+
+```text
+raw/<topic>/YYYY-MM-DD-slug/
+├── YYYY-MM-DD-slug.md
+├── images/
+└── slides/
+```
+
+只有实际存在的素材目录才会创建。输出还会给出 warnings 与 link suggestions，便于后续补充连接。
+
+## 生成决策简报
+
+### 不使用本地 Profile
+
+直接描述待决问题即可。ME 会先建立决策条件，再检索 vault 中真正相关的材料：
+
+```text
+/me:decision-brief 团队是否应该在下个季度采用新的发布流程？
+```
+
+Codex 等价调用：
+
+```text
+$me:decision-brief 团队是否应该在下个季度采用新的发布流程？
+```
+
+结果默认只返回到对话中，不会写入知识库。信息不足且会改变方向时，简报会给出“暂不决策”和需要补充的最小信息。
+
+### 使用本地 Profile
+
+如果某类决策有长期稳定的检索入口或判断纪律，可以在 vault 内创建 Profile，并在 `.me/config.yaml` 中引用：
+
+```yaml
+layers:
+  raw: sources
+  practices: field-notes
+  cognition: insights
+decision:
+  profile: .me/profiles/decision-brief.md
+```
+
+例如 `.me/profiles/decision-brief.md` 可以列出团队决策优先查看的本地索引，以及何时应优先选择可逆实验。Profile 只是当前 vault 的本地补充；缺少 Profile 时通用流程仍然可用，Profile 也不能放宽项目规则、授权边界或证据要求。
+
+```text
+/me:decision-brief 我们应该先扩展现有服务，还是启动替代方案试点？
+```
+
+### 明确保存到 Practices
+
+先生成并审阅简报，再在同一对话中明确授权：
+
+```text
+请把这份决策简报保存到 Practices。
+```
+
+保存要求至少有一篇实际影响本次建议、已经存在于 vault 的本地来源。ME 会先预览目标路径和索引动作，再尝试写入配置中的 Practices 目录；按上面的示例会写入 `field-notes/decisions/`。只有写入结果明确 committed 才会报告已保存；没有合格来源、路径冲突、校验失败或环境不支持时会说明 `not written`，不会改用另一个文件名，也不会自动提升到 Cognition。
 
 ## 搜索笔记
 

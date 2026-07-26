@@ -1,16 +1,35 @@
 {
   "name": "me",
-  "version": "1.4.0",
-  "description": "A Claude Code / Codex plugin that gives any workspace knowledge management capabilities",
+  "version": "1.5.0",
+  "description": "A Claude Code / Codex plugin for knowledge management and evidence-backed decision briefs",
   "scripts": {
-    "test": "bash test/vault-test.sh"
+    "test": "bash test/vault-test.sh",
+    "test:ingest": "bun test test/ingest-*.test.ts"
   },
+  "files": [
+    ".agents/",
+    ".claude-plugin/",
+    ".codex-plugin/",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "DEVELOPMENT.md",
+    "LEGAL.md",
+    "bin/",
+    "docs/development.md",
+    "docs/features.md",
+    "docs/philosophy.md",
+    "docs/user-guide.md",
+    "references/",
+    "skills/",
+    "templates/"
+  ],
   "bin": {
     "checklinks": "bun run bin/checklinks.ts",
     "autolinks": "bun run bin/autolinks.ts",
     "backlinks": "bun run bin/backlinks.ts",
     "move": "bun run bin/move.ts",
-    "ingest": "bun run bin/ingest.ts"
+    "ingest": "bun run bin/ingest.ts",
+    "vault-write": "bin/vault-write.ts"
   },
   "keywords": [
     "knowledge-management",

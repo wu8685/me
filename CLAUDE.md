@@ -83,7 +83,7 @@ A Claude Code plugin that gives any workspace knowledge management capabilities.
 |-----------|------------|-------|
 | Claude Code Skills (SKILL.md spec) | HIGH | Official docs fetched from `code.claude.com/docs/en/skills` |
 | Obsidian CLI command surface | HIGH | Official docs at `help.obsidian.md/cli`; existing `obsidian-cli` skill verified |
-| Git + Markdown storage | HIGH | Proven by existing `translate-research-doc` workflow; vault at `/Users/wuke/workspace/brain-spark/` confirmed |
+| Git + Markdown storage | HIGH | Proven by an existing `translate-research-doc` workflow in a generic local vault at `<vault-root>` |
 | YAML frontmatter as search layer | HIGH | Existing templates in vault (`文章摘录模版.md`) confirm the convention; grep patterns are POSIX-standard |
 | Frontmatter schema (proposed) | MEDIUM | Schema is new design, not yet validated against actual usage patterns. Fields derived from PROJECT.md requirements. Will evolve. |
 | `obsidian property:set` for programmatic updates | MEDIUM | Command verified in skill doc; not yet battle-tested for bulk transitions |
@@ -93,7 +93,7 @@ A Claude Code plugin that gives any workspace knowledge management capabilities.
 - [Agent Skills open standard](https://agentskills.io)
 - [Skill authoring best practices — Anthropic](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices)
 - Existing skills: `~/.claude/skills/translate-research-doc/SKILL.md`, `~/.claude/skills/obsidian-cli/SKILL.md`, `~/.claude/skills/obsidian-markdown/SKILL.md` (read directly)
-- Existing vault: `/Users/wuke/workspace/brain-spark/模版/` templates (read directly)
+- Generic local vault templates: `<vault-root>/templates/` (read directly)
 - [obsidian-claude-pkm starter kit](https://github.com/ballred/obsidian-claude-pkm) (referenced for auto-commit pattern)
 - [fmd — Find Markdown by metadata](https://github.com/zhouer/fmd) (deferred to L2)
 <!-- GSD:stack-end -->

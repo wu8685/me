@@ -1,7 +1,7 @@
 {
   "name": "me",
-  "version": "1.4.0",
-  "description": "ME — a personal knowledge base plugin: a three-layer knowledge flywheel (raw → practices → cognition) with free wikilink cross-references.",
+  "version": "1.5.0",
+  "description": "ME — a personal knowledge base plugin for a three-layer knowledge flywheel and evidence-backed decision briefs.",
   "author": {
     "name": "wuke",
     "email": "optimuswu8685@gmail.com"

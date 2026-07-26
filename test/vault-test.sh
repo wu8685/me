@@ -166,12 +166,364 @@ test_plugin_manifest() {
   assert_file_contains "$codex_marketplace" '"installation": "AVAILABLE"' || return 1
 }
 
+test_vault_writer_public_binary() {
+  assert_file_exists "$PLUGIN_ROOT/bin/vault-write.ts" || return 1
+  node -e '
+    const p=require(process.argv[1]);
+    if (p.bin["vault-write"] !== "bin/vault-write.ts") process.exit(1)
+  ' "$PLUGIN_ROOT/package.json" || return 1
+  if [ ! -x "$PLUGIN_ROOT/bin/vault-write.ts" ]; then
+    echo -e "    ${RED}FAIL${NC}: vault-write entrypoint is not executable"
+    return 1
+  fi
+
+  local pack_dir install_dir tarball binary result
+  pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-pack.XXXXXX")
+  install_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-install.XXXXXX")
+  tarball=$(npm pack --silent --pack-destination "$pack_dir" "$PLUGIN_ROOT") || return 1
+  npm install --silent --ignore-scripts --prefix "$install_dir" \
+    "$pack_dir/$tarball" || return 1
+  binary="$install_dir/node_modules/.bin/vault-write"
+  if [ ! -x "$binary" ]; then
+    echo -e "    ${RED}FAIL${NC}: packed vault-write binary is not executable"
+    return 1
+  fi
+
+  mkdir -p "$MOCK_VAULT/.me" "$MOCK_VAULT/raw" \
+    "$MOCK_VAULT/practices" "$MOCK_VAULT/cognition"
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+  echo '# Source' > "$MOCK_VAULT/raw/source.md"
+  result=$(node -e '
+    process.stdout.write(JSON.stringify({
+      version: 1,
+      layer: "practices",
+      relativePath: "decisions/2026-07-26-packed-preview.md",
+      markdown: [
+        "---",
+        "title: Packed Preview",
+        "created: 2026-07-26",
+        "tags: [decision]",
+        "type: reflection",
+        "source: \"[[raw/source]]\"",
+        "project: \"\"",
+        "---",
+        "",
+        "# Preview",
+        ""
+      ].join("\n"),
+      index: { mode: "auto" }
+    }));
+  ' | "$binary" preview --vault-dir "$MOCK_VAULT") || return 1
+  node -e '
+    const result=JSON.parse(process.argv[1]);
+    if (result.status !== "preview") process.exit(1);
+  ' "$result" || return 1
+  rm -rf "$pack_dir" "$install_dir"
+
+  local public_writer_paths=(
+    "$PLUGIN_ROOT/bin/vault-write.ts"
+    "$PLUGIN_ROOT/bin/vault-write"
+    "$PLUGIN_ROOT/test/vault-write-cli.test.ts"
+    "$PLUGIN_ROOT/package.json"
+  )
+  local private_product="xiao""etong"
+  local private_product_zh="小鹅""通"
+  local private_vault="brain""-spark"
+  local user_root="/""Users/"
+  local machine_user_path="${user_root}wu8685/"
+  if rg -n -i \
+    "$private_product|$private_product_zh|$private_vault|$machine_user_path" \
+    "${public_writer_paths[@]}"; then
+    echo -e "    ${RED}FAIL${NC}: public vault writer artifacts contain private or machine-specific data"
+    return 1
+  fi
+}
+
 test_codex_public_docs() {
   assert_file_contains "$PLUGIN_ROOT/README.md" 'codex plugin marketplace add /path/to/me' || return 1
   assert_file_contains "$PLUGIN_ROOT/README.md" '\$me:setup' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" '.agents/plugins/marketplace.json' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'me:setup' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/features.md" 'Codex skill' || return 1
+}
+
+test_decision_brief_documented() {
+  assert_file_contains "$PLUGIN_ROOT/README.md" 'decision-brief' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/features.md" '决策简报\|Decision Brief' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'me:decision-brief' || return 1
+}
+
+test_decision_brief_discovery_and_release_version() {
+  assert_file_exists "$PLUGIN_ROOT/skills/decision-brief/SKILL.md" || return 1
+  assert_file_contains "$PLUGIN_ROOT/.codex-plugin/plugin.json" '"skills": "./skills/"' || return 1
+
+  local versions
+  versions=$(bun -e "
+    const fs = require('fs');
+    const files = [
+      'package.json',
+      '.codex-plugin/plugin.json',
+      '.claude-plugin/plugin.json',
+    ];
+    console.log(files.map(file => {
+      const data = JSON.parse(fs.readFileSync('$PLUGIN_ROOT/' + file, 'utf8'));
+      return data.version;
+    }).join('\\n'));
+  ")
+  [ "$(echo "$versions" | sort -u | wc -l | tr -d ' ')" -eq 1 ] || {
+    echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
+    return 1
+  }
+  [ "$(echo "$versions" | head -n 1)" = "1.5.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected current release version 1.5.0"
+    return 1
+  }
+}
+
+test_packed_release_has_no_private_paths() {
+  local pack_dir extract_dir pack_json tarball scan_output
+  pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-public-pack.XXXXXX")
+  extract_dir="$pack_dir/extracted"
+  mkdir -p "$extract_dir"
+
+  pack_json=$(npm pack --json --pack-destination "$pack_dir" "$PLUGIN_ROOT") || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  tarball=$(node -e '
+    const entries = JSON.parse(process.argv[1]);
+    if (!Array.isArray(entries) || entries.length !== 1 || !entries[0].filename) process.exit(1);
+    process.stdout.write(entries[0].filename);
+  ' "$pack_json") || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  tar -xzf "$pack_dir/$tarball" -C "$extract_dir" || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+
+  scan_output=$(node - "$extract_dir/package" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const root = process.argv[2];
+const forbidden = [
+  { label: 'absolute user path', value: '/' + 'Users/' },
+  { label: 'private vault name', value: ['brain', 'spark'].join('-') },
+  { label: 'private product', value: ['小鹅', '通'].join('') },
+  { label: 'private product alias', value: ['xiao', 'etong'].join('') },
+];
+const decoder = new TextDecoder('utf-8', { fatal: true });
+const findings = [];
+
+function walk(directory) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      walk(absolute);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const bytes = fs.readFileSync(absolute);
+    if (bytes.includes(0)) continue;
+    let text;
+    try {
+      text = decoder.decode(bytes);
+    } catch {
+      continue;
+    }
+    for (const rule of forbidden) {
+      if (text.toLowerCase().includes(rule.value.toLowerCase())) {
+        findings.push(`${path.relative(root, absolute)}: ${rule.label}`);
+      }
+    }
+  }
+}
+
+walk(root);
+process.stdout.write(findings.join('\n'));
+NODE
+  ) || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  rm -rf "$pack_dir"
+
+  if [ -n "$scan_output" ]; then
+    echo "$scan_output"
+    echo -e "    ${RED}FAIL${NC}: packed release contains private or machine-specific text"
+    return 1
+  fi
+}
+
+test_decision_brief_profile_example_uses_real_layer_contract() {
+  mkdir -p "$MOCK_VAULT/.me" \
+    "$MOCK_VAULT/sources" \
+    "$MOCK_VAULT/field-notes" \
+    "$MOCK_VAULT/insights"
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+
+  node - "$PLUGIN_ROOT/docs/user-guide.md" "$MOCK_VAULT/.me/config.yaml" <<'NODE'
+const fs = require('fs');
+const guide = fs.readFileSync(process.argv[2], 'utf8');
+const section = guide.match(/### 使用本地 Profile[\s\S]*?```yaml\n([\s\S]*?)```/);
+if (!section) process.exit(1);
+fs.writeFileSync(process.argv[3], section[1], 'utf8');
+NODE
+
+  local resolved
+  resolved=$(bun -e "
+    import { resolveVaultLayout } from '$PLUGIN_ROOT/bin/vault-write/path-safety.ts';
+    import path from 'path';
+    const layout = resolveVaultLayout('$MOCK_VAULT');
+    console.log(JSON.stringify({
+      raw: path.relative('$MOCK_VAULT', layout.layers.raw),
+      practices: path.relative('$MOCK_VAULT', layout.layers.practices),
+      cognition: path.relative('$MOCK_VAULT', layout.layers.cognition),
+    }));
+  ") || return 1
+
+  [ "$resolved" = '{"raw":"sources","practices":"field-notes","cognition":"insights"}' ] || {
+    echo -e "    ${RED}FAIL${NC}: documented Profile config did not resolve custom layers: $resolved"
+    return 1
+  }
+  assert_file_contains "$MOCK_VAULT/.me/config.yaml" '^decision:' || return 1
+  assert_file_contains "$MOCK_VAULT/.me/config.yaml" 'profile: .me/profiles/decision-brief.md' || return 1
+}
+
+test_ingest_docs_rich_media() {
+  local readme="$PLUGIN_ROOT/README.md"
+  local features="$PLUGIN_ROOT/docs/features.md"
+  local guide="$PLUGIN_ROOT/docs/user-guide.md"
+
+  for term in HTML PDF X Bilibili "Source Bundle" handout degraded; do
+    assert_file_contains "$features" "$term" || return 1
+  done
+
+  for term in "https://example.com/article" ".pdf" "x.com/" "bilibili.com/" handout degraded "依赖"; do
+    assert_file_contains "$guide" "$term" || return 1
+  done
+  assert_file_contains "$guide" "defuddle" || return 1
+  assert_file_contains "$guide" "PATH" || return 1
+  assert_file_not_contains "$guide" "基础 HTML 摄入只需插件运行环境" || return 1
+  grep -q -- "--bundle" "$guide" || {
+    echo -e "    ${RED}FAIL${NC}: '$guide' does not document --bundle"
+    return 1
+  }
+
+  local bundle_reference="$PLUGIN_ROOT/skills/ingest/references/source-bundle-v1.md"
+  assert_file_contains "$guide" "静态数据" || return 1
+  assert_file_contains "$guide" "不会执行" || return 1
+  assert_file_not_contains "$guide" "可执行指令" || return 1
+  assert_file_contains "$bundle_reference" "static data" || return 1
+  assert_file_contains "$bundle_reference" "does not execute" || return 1
+  assert_file_not_contains "$bundle_reference" "executable instruction" || return 1
+
+  assert_file_contains "$features" "X auth wall" || return 1
+  assert_file_contains "$features" "encrypted/DRM PDF" || return 1
+  assert_file_not_contains "$features" "不可读取的错误页" || return 1
+
+  assert_file_contains "$readme" "PDF" || return 1
+  assert_file_contains "$readme" "公开视频" || return 1
+  assert_file_contains "$readme" "讲义" || return 1
+  assert_file_not_contains "$readme" "rich-ingest" || return 1
+  assert_file_not_contains "$features" "rich-ingest" || return 1
+  assert_file_not_contains "$guide" "rich-ingest" || return 1
+
+  local versions
+  versions=$(bun -e "
+    const fs = require('fs');
+    const files = [
+      'package.json',
+      '.codex-plugin/plugin.json',
+      '.claude-plugin/plugin.json',
+      '.claude-plugin/marketplace.json',
+    ];
+    console.log(files.map(file => {
+      const data = JSON.parse(fs.readFileSync('$PLUGIN_ROOT/' + file, 'utf8'));
+      return data.version ?? data.plugins?.[0]?.version;
+    }).join('\\n'));
+  ")
+  [ "$(echo "$versions" | sort -u | wc -l | tr -d ' ')" -eq 1 ] || {
+    echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
+    return 1
+  }
+  [ "$(echo "$versions" | head -n 1)" = "1.5.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.5.0"
+    return 1
+  }
+
+  local private_product private_product_zh private_vault user_root machine_user_path
+  private_product="xiao""etong"
+  private_product_zh="小鹅""通"
+  private_vault="brain""-spark"
+  user_root="/""Users/"
+  machine_user_path="${user_root}wu8685/"
+  local public_paths=(
+    "$PLUGIN_ROOT/bin"
+    "$PLUGIN_ROOT/skills"
+    "$PLUGIN_ROOT/test"
+    "$readme"
+    "$features"
+    "$guide"
+    "$PLUGIN_ROOT/package.json"
+    "$PLUGIN_ROOT/.codex-plugin"
+    "$PLUGIN_ROOT/.claude-plugin"
+  )
+
+  if rg -n -i "$private_product|$private_product_zh|$private_vault|$machine_user_path" "${public_paths[@]}"; then
+    echo -e "    ${RED}FAIL${NC}: public ingest artifacts contain private product or machine-specific data"
+    return 1
+  fi
+
+  local absolute_path_matches unexpected_paths
+  absolute_path_matches=$(rg -n "$user_root" "$PLUGIN_ROOT/test" || true)
+  unexpected_paths=$(echo "$absolute_path_matches" \
+    | grep -vE '/test/ingest-bundle\.test\.ts:[0-9]+:.*[/]Users/name/private' \
+    | grep -vE '/test/skills/ingest/scenarios\.md:[0-9]+:.*[/]Users/me/Downloads/private-slide\.jpg' \
+    || true)
+  if [ -n "$unexpected_paths" ]; then
+    echo "$unexpected_paths"
+    echo -e "    ${RED}FAIL${NC}: public tests contain a non-allowlisted absolute user path"
+    return 1
+  fi
+
+  # PRIVACY_SELF_PROBE Authorization: Bearer test-runner-self-probe
+  local credential_matches unexpected_credentials credential_pattern
+  local runner_probe_value redaction_auth_value redaction_cookie_value redaction_token_value
+  local self_probe_matches credential_match
+  runner_probe_value="Authoriza""tion: Bearer test-runner-self-probe"
+  redaction_auth_value="Authoriza""tion: Bearer top-secret"
+  redaction_cookie_value="Coo""kie: sid=super-secret"
+  redaction_token_value="X-To""ken: token-secret"
+  credential_pattern='Authoriza''tion:[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9_./+=-]+|Coo''kie:[[:space:]]*sid=[A-Za-z0-9_./+=-]+|X-To''ken:[[:space:]]*[A-Za-z0-9_./+=-]+|(?:coo''kie|authoriza''tion|to''ken|api[_-]?key)[[:space:]]*[:=][[:space:]]*[^[:space:],;]{12,}|(?:sk-|gh[pousr]_)[A-Za-z0-9_-]{12,}'
+  credential_matches=$(rg -n -o -i \
+    "$credential_pattern" \
+    "${public_paths[@]}" || true)
+  self_probe_matches=$(echo "$credential_matches" \
+    | grep -F "$PLUGIN_ROOT/test/vault-test.sh:" \
+    | grep -F ":$runner_probe_value" \
+    || true)
+  if [ "$(echo "$self_probe_matches" | grep -c .)" -ne 1 ]; then
+    echo -e "    ${RED}FAIL${NC}: privacy runner did not scan its own credential self-probe"
+    return 1
+  fi
+  unexpected_credentials=""
+  while IFS= read -r credential_match; do
+    [ -z "$credential_match" ] && continue
+    case "$credential_match" in
+      "$PLUGIN_ROOT/test/ingest-command.test.ts:"*":$redaction_auth_value") ;;
+      "$PLUGIN_ROOT/test/ingest-command.test.ts:"*":$redaction_cookie_value") ;;
+      "$PLUGIN_ROOT/test/ingest-command.test.ts:"*":$redaction_token_value") ;;
+      "$PLUGIN_ROOT/test/vault-test.sh:"*":$runner_probe_value") ;;
+      *) unexpected_credentials+="${unexpected_credentials:+$'\n'}$credential_match" ;;
+    esac
+  done <<< "$credential_matches"
+  if [ -n "$unexpected_credentials" ]; then
+    echo "$unexpected_credentials"
+    echo -e "    ${RED}FAIL${NC}: public artifacts contain a non-allowlisted credential-shaped value"
+    return 1
+  fi
 }
 
 test_schema_fields() {
@@ -2605,13 +2957,11 @@ test_ingest_skill_topic_confirmation() {
   assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "kebab-case" || return 1
 }
 
-test_ingest_skill_frontmatter_template() {
+test_ingest_skill_processed_markdown_body_only() {
   assert_file_exists "$PLUGIN_ROOT/skills/ingest/SKILL.md" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "title:" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "created:" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "tags:" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "type: article" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "source:" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "UTF-8 body-only Markdown" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "Do not include frontmatter" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "finalizer generates" || return 1
 }
 
 test_ingest_skill_no_forbidden_fields() {
@@ -2626,10 +2976,11 @@ test_ingest_skill_filename_convention() {
   assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "YYYY-MM-DD" || return 1
 }
 
-test_ingest_skill_image_download() {
+test_ingest_skill_image_localization_reporting() {
   assert_file_exists "$PLUGIN_ROOT/skills/ingest/SKILL.md" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "download\|Download" || return 1
-  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "retry\|retries\|fallback" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "localizes available assets" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "warnings" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "not written" || return 1
 }
 
 test_ingest_skill_under_500_lines() {
@@ -2640,6 +2991,25 @@ test_ingest_skill_under_500_lines() {
     echo -e "    ${RED}FAIL${NC}: SKILL.md has $line_count lines (must be under 500)"
     return 1
   fi
+}
+
+test_ingest_skill_rich_contract() {
+  local f="$PLUGIN_ROOT/skills/ingest/SKILL.md"
+  local handout="$PLUGIN_ROOT/skills/ingest/references/handout-contract.md"
+  assert_file_contains "$f" "Source Bundle" || return 1
+  assert_file_contains "$f" "handout" || return 1
+  assert_file_contains "$f" "Slide-driven" || return 1
+  assert_file_contains "$f" "Topic-driven" || return 1
+  assert_file_contains "$f" "不得报告完成" || return 1
+  assert_file_contains "$f" "UTF-8 body-only Markdown" || return 1
+  assert_file_contains "$f" 'Translation (`translate-cn`)' || return 1
+  assert_file_contains "$f" 'Summary (`summarize`)' || return 1
+  assert_file_contains "$f" "writeResult" || return 1
+  assert_file_not_contains "$f" "retry/fallback behavior" || return 1
+  assert_file_not_contains "$f" "downloaded versus failed" || return 1
+  assert_file_not_contains "$f" "transcript coverage" || return 1
+  assert_file_not_contains "$handout" "transcript coverage" || return 1
+  assert_file_not_contains "$f" "^title:" || return 1
 }
 
 # ── Quick 260517-fs2: Bilibili source adapter ──
@@ -2997,6 +3367,17 @@ test_ingest_script_cli_help() {
   fi
 }
 
+test_ingest_help_lists_bundle_and_handout() {
+  output=$(bun run "$PLUGIN_ROOT/bin/ingest.ts" --help 2>&1) || return 1
+  echo "$output" | grep -q -- "--bundle" || return 1
+  echo "$output" | grep -q "handout" || return 1
+}
+
+test_ingest_rejects_url_and_bundle_together() {
+  bun run "$PLUGIN_ROOT/bin/ingest.ts" "https://example.com" --bundle "$PLUGIN_ROOT/test/fixtures/ingest/bundle-valid" >/dev/null 2>&1
+  [ "$?" -ne 0 ]
+}
+
 test_ingest_skill_calls_script() {
   # SKILL.md must reference bin/ingest.ts (thin orchestrator pattern)
   assert_file_exists "$PLUGIN_ROOT/skills/ingest/SKILL.md" || return 1
@@ -3022,6 +3403,370 @@ test_ingest_skill_llm_only_for_translate_summarize() {
   assert_file_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "summarize" || return 1
   # Must NOT reference mcp__web_reader__webReader (defuddle replaces it)
   assert_file_not_contains "$PLUGIN_ROOT/skills/ingest/SKILL.md" "mcp__web_reader__webReader" || return 1
+}
+
+# ── Decision Brief Skill Contract ──────────────────────────────────
+
+decision_brief_has_structure_contract() {
+  local f="$1"
+  [ -f "$f" ] &&
+    grep -Fxq 'name: decision-brief' "$f" &&
+    grep -Eq '^description:.*Use when' "$f" &&
+    grep -Fq 'Decision Contract' "$f" &&
+    grep -Fxq 'Search order: cognition -> practices -> raw -> current external facts' "$f" &&
+    grep -Fq 'references/evidence-contract.md' "$f" &&
+    grep -Fq 'references/output-contract.md' "$f"
+}
+
+decision_brief_public_is_clean() {
+  local dir="$1"
+  local forbidden
+  forbidden="brain""-spark|/""Users/|optimus""wu8685|小鹅""通"
+
+  [ -d "$dir" ] &&
+    ! grep -RIlE -- "$forbidden" "$dir" >/dev/null 2>&1
+}
+
+decision_brief_has_profile_contract() {
+  local f="$1"
+  [ -f "$f" ] &&
+    grep -Fq '.me/profiles/decision-brief.md' "$f" &&
+    grep -Fxq 'Profile path must remain inside the current vault' "$f" &&
+    grep -Fxq 'Containment requires paired lexical and canonical vault roots' "$f" &&
+    grep -Fxq 'Canonicalize the deepest existing ancestor when the Profile target is missing' "$f" &&
+    grep -Fxq 'Reject dangling symlinks and realpath errors as unsafe' "$f" &&
+    grep -Fxq 'Only a genuinely missing Profile whose ancestors are contained may use the generic flow' "$f" &&
+    grep -Fxq 'Default output: chat only; do not write the vault without explicit authorization' "$f" &&
+    grep -Fxq 'Never promote a decision directly to cognition' "$f"
+}
+
+test_decision_brief_skill_structure() {
+  local f="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
+  local valid="$MOCK_VAULT/valid-structure.md"
+  local reversed="$MOCK_VAULT/reversed-structure.md"
+
+  cat > "$valid" <<'EOF'
+name: decision-brief
+description: Use when a decision requires research.
+# Decision Contract
+Search order: cognition -> practices -> raw -> current external facts
+Read references/evidence-contract.md and references/output-contract.md.
+EOF
+  sed 's/cognition -> practices -> raw/raw -> practices -> cognition/' "$valid" > "$reversed"
+
+  if ! decision_brief_has_structure_contract "$valid"; then
+    echo -e "    ${RED}FAIL${NC}: structure validator rejected its canonical fixture"
+    return 1
+  fi
+  if decision_brief_has_structure_contract "$reversed"; then
+    echo -e "    ${RED}FAIL${NC}: structure validator accepted a reversed search order"
+    return 1
+  fi
+
+  if ! decision_brief_has_structure_contract "$f"; then
+    echo -e "    ${RED}FAIL${NC}: decision brief Skill is missing its canonical structure contract"
+    return 1
+  fi
+}
+
+test_decision_brief_public_privacy() {
+  local dir="$PLUGIN_ROOT/skills/decision-brief"
+  local safe="$MOCK_VAULT/safe-skill"
+  local private="$MOCK_VAULT/private-skill"
+  local scan_output
+
+  mkdir -p "$safe" "$private"
+  printf '%s\n' 'Portable public decision guidance.' > "$safe/SKILL.md"
+  printf '%s\n' 'Private profile: /''Users/example/private-profile.md' > "$private/SKILL.md"
+
+  if ! decision_brief_public_is_clean "$safe"; then
+    echo -e "    ${RED}FAIL${NC}: privacy validator rejected a public fixture"
+    return 1
+  fi
+  if scan_output=$(decision_brief_public_is_clean "$private" 2>&1); then
+    echo -e "    ${RED}FAIL${NC}: privacy validator accepted a private fixture"
+    return 1
+  fi
+  if [ -n "$scan_output" ]; then
+    echo -e "    ${RED}FAIL${NC}: privacy validator leaked matched content"
+    return 1
+  fi
+
+  if ! decision_brief_public_is_clean "$dir"; then
+    echo -e "    ${RED}FAIL${NC}: decision brief public files are missing or contain private data"
+    return 1
+  fi
+}
+
+test_decision_brief_profile_contract() {
+  local f="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
+  local valid="$MOCK_VAULT/valid-profile.md"
+  local counterexample="$MOCK_VAULT/counterexample-profile.md"
+
+  cat > "$valid" <<'EOF'
+Optional profile: .me/profiles/decision-brief.md
+Profile path must remain inside the current vault
+Containment requires paired lexical and canonical vault roots
+Canonicalize the deepest existing ancestor when the Profile target is missing
+Reject dangling symlinks and realpath errors as unsafe
+Only a genuinely missing Profile whose ancestors are contained may use the generic flow
+Default output: chat only; do not write the vault without explicit authorization
+Never promote a decision directly to cognition
+EOF
+  cat > "$counterexample" <<'EOF'
+Optional profile: .me/profiles/decision-brief.md
+The Profile may remain outside the current vault.
+Only check the lexical path and ignore symlinks.
+Treat realpath errors as a missing optional Profile.
+Default output may write the vault without explicit authorization.
+Promote every decision directly to cognition.
+EOF
+
+  if ! decision_brief_has_profile_contract "$valid"; then
+    echo -e "    ${RED}FAIL${NC}: profile validator rejected its canonical fixture"
+    return 1
+  fi
+  if decision_brief_has_profile_contract "$counterexample"; then
+    echo -e "    ${RED}FAIL${NC}: profile validator accepted contradictory guidance"
+    return 1
+  fi
+
+  if ! decision_brief_has_profile_contract "$f"; then
+    echo -e "    ${RED}FAIL${NC}: decision brief Skill is missing its canonical Profile/write contract"
+    return 1
+  fi
+}
+
+test_decision_brief_profile_behavior_evidence() {
+  local f="$PLUGIN_ROOT/test/skills/decision-brief/profile-boundary-results.md"
+  local block
+  local id
+  local pair
+
+  assert_file_exists "$f" || return 1
+  grep -Fq 'Six samples ran through separate `codex exec --ephemeral` processes.' "$f" || return 1
+  grep -Fq 'actual shell inspection' "$f" || return 1
+
+  for pair in \
+    'PB1 | Existing contained Profile | ACCEPT | ACCEPT | PASS' \
+    'PB2 | Symlinked vault root, contained Profile | ACCEPT | ACCEPT | PASS' \
+    'PB3 | Existing prefix escapes and target returns inside | REJECT_UNSAFE | REJECT_UNSAFE | PASS' \
+    'PB4 | Missing target, all existing ancestors contained | GENERIC | GENERIC | PASS' \
+    'PB5 | Dangling Profile symlink | REJECT_UNSAFE | REJECT_UNSAFE | PASS' \
+    'PB6 | Existing ancestor and target escape | REJECT_UNSAFE | REJECT_UNSAFE | PASS'
+  do
+    grep -Fq "| $pair |" "$f" || return 1
+  done
+
+  [ "$(grep -Fc '**Evidence mode:** Exact excerpt' "$f")" -eq 5 ] || return 1
+  [ "$(grep -Fc '**Evidence mode:** Portable substitution' "$f")" -eq 1 ] || return 1
+
+  for id in PB1 PB2 PB3 PB4 PB5 PB6; do
+    block="$(
+      awk -v heading="### $id" '
+        $0 == heading { in_sample = 1; next }
+        in_sample && /^### PB[1-6]$/ { exit }
+        in_sample { print }
+      ' "$f"
+    )"
+    echo "$block" | grep -Eq '^\*\*Evidence mode:\*\* (Exact excerpt|Portable substitution)$' || return 1
+    echo "$block" | grep -Eq '^> “.+' || return 1
+    echo "$block" | grep -Eq '.”$' || return 1
+  done
+
+  block="$(
+    awk '
+      $0 == "### PB1" { in_sample = 1; next }
+      in_sample && /^### PB[1-6]$/ { exit }
+      in_sample { print }
+    ' "$f"
+  )"
+  echo "$block" | grep -Fq '**Evidence mode:** Portable substitution' || return 1
+  echo "$block" | grep -Fq '[portableized from raw temp path]' || return 1
+}
+
+test_decision_brief_write_transaction_contract() {
+  local skill="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
+  local evidence="$PLUGIN_ROOT/test/skills/decision-brief/write-transaction-results.md"
+  local id
+  local block
+
+  assert_file_exists "$skill" || return 1
+  grep -Fq 'bin/vault-write.ts preview' "$skill" || return 1
+  grep -Fq 'bin/vault-write.ts write' "$skill" || return 1
+  grep -Fq 'Do not invoke the CLI' "$skill" || return 1
+  grep -Fq 'with empty, placeholder, or' "$skill" || return 1
+  grep -Fq 'The first invocation must be `bin/vault-write.ts preview`' "$skill" || return 1
+  grep -Fq 'Never use `apply_patch`, shell redirect, `mv`, or' "$skill" || return 1
+  grep -Fq 'generic file operation to write a vault target.' "$skill" || return 1
+  grep -Fq '`commitModel: journaled-cooperative`' "$skill" || return 1
+  grep -Fq 'say `not written`' "$skill" || return 1
+
+  assert_file_exists "$evidence" || return 1
+  grep -Fq 'These checks validate evidence structure, not agent behavior.' "$evidence" || return 1
+  grep -Fq '| WT1 | FAIL |' "$evidence" || return 1
+  grep -Fq '| WT2 | FAIL |' "$evidence" || return 1
+  grep -Fq '| WT3 | PASS |' "$evidence" || return 1
+  grep -Fq '| WT4 | FAIL |' "$evidence" || return 1
+  grep -Fq 'ctime and historical metadata are not restorable' "$evidence" || return 1
+
+  for id in WT1 WT2 WT3 WT4; do
+    [ "$(grep -Fc "### $id" "$evidence")" -eq 1 ] || return 1
+    block="$(
+      awk -v heading="### $id" '
+        $0 == heading { in_probe = 1; next }
+        in_probe && /^### WT[1-4]$/ { exit }
+        in_probe { print }
+      ' "$evidence"
+    )"
+    echo "$block" | grep -Fq '**Fresh context:**' || return 1
+    echo "$block" | grep -Fq '**Fixture:**' || return 1
+    echo "$block" | grep -Fq '**Operation:**' || return 1
+    echo "$block" | grep -Fq '**Before hashes:**' || return 1
+    echo "$block" | grep -Fq '**After hashes:**' || return 1
+    echo "$block" | grep -Fq '**Exact excerpt:**' || return 1
+    echo "$block" | grep -Fq '**Filesystem verdict:**' || return 1
+  done
+
+  for id in NW1 NW2 NW3 NW4 NW5; do
+    [ "$(grep -Fc "### $id" "$evidence")" -eq 1 ] || return 1
+    block="$(
+      awk -v heading="### $id" '
+        $0 == heading { in_probe = 1; next }
+        in_probe && /^### NW[1-5]$/ { exit }
+        in_probe { print }
+      ' "$evidence"
+    )"
+    echo "$block" | grep -Fq '**Fresh context:**' || return 1
+    echo "$block" | grep -Fq '**Before hashes:**' || return 1
+    echo "$block" | grep -Fq '**After hashes:**' || return 1
+    echo "$block" | grep -Fq '**Exact excerpt:**' || return 1
+    echo "$block" | grep -Fq '**Filesystem verdict:**' || return 1
+  done
+}
+
+test_decision_brief_writer_contract() {
+  local skill="$PLUGIN_ROOT/skills/decision-brief/SKILL.md"
+  local output="$PLUGIN_ROOT/skills/decision-brief/references/output-contract.md"
+  local evidence="$PLUGIN_ROOT/test/skills/decision-brief/writer-results.md"
+  local id
+  local block
+  local locale_slug_c
+  local locale_slug_tr
+
+  assert_file_exists "$skill" || return 1
+  assert_file_exists "$output" || return 1
+
+  grep -Fq 'bin/vault-write.ts preview' "$skill" || return 1
+  grep -Fq 'bin/vault-write.ts write' "$skill" || return 1
+  grep -Fq 'commitModel: journaled-cooperative' "$skill" || return 1
+  grep -Fq 'status: committed' "$skill" || return 1
+  grep -Fq 'status: validation_failed' "$skill" || return 1
+  grep -Fq 'status: conflict' "$skill" || return 1
+  grep -Fq 'status: unsupported' "$skill" || return 1
+  grep -Fq 'status: manual_recovery' "$skill" || return 1
+  grep -Fq 'recoveryState' "$skill" || return 1
+  grep -Fq 'preservedPaths' "$skill" || return 1
+  grep -Fq 'remainingMutations' "$skill" || return 1
+  grep -Fq 'actions' "$skill" || return 1
+  grep -Fq 'Do not set `acknowledgeCognition`' "$skill" || return 1
+  grep -Fq 'type: reflection' "$skill" || return 1
+  grep -Fq 'decisions/YYYY-MM-DD-<slug>.md' "$skill" || return 1
+  grep -Fq 'existing path-qualified local wikilink' "$skill" || return 1
+  grep -Fq 'Do not use `type: experiment`' "$skill" || return 1
+  grep -Fq 'Markdown request through stdin' "$skill" || return 1
+  grep -Fq '.me/tmp' "$skill" || return 1
+  grep -Fq 'Do not add a numeric suffix' "$skill" || return 1
+  grep -Fq "decision.normalize('NFKC').trim()" "$skill" || return 1
+  grep -Fq "replace(/\\p{White_Space}+/gu, ' ').toLowerCase()" "$skill" || return 1
+  grep -Fq "normalizedDecision.replace(/[^a-z0-9]+/g, '-')" "$skill" || return 1
+  grep -Fq ".update(Buffer.from(normalizedDecision, 'utf8'))" "$skill" || return 1
+  grep -Fq ".slice(0, 12)" "$skill" || return 1
+  if grep -Fq 'requestDigest' "$skill"; then
+    echo -e "    ${RED}FAIL${NC}: decision slug must not derive from requestDigest"
+    return 1
+  fi
+  if grep -Fq 'atomic commit' "$skill"; then
+    echo -e "    ${RED}FAIL${NC}: Skill must not claim a cross-file atomic commit"
+    return 1
+  fi
+  grep -Fq 'Never use `apply_patch`, shell redirect, `mv`, or' "$skill" || return 1
+  grep -Fq 'generic file operation to write a vault target.' "$skill" || return 1
+
+  LC_ALL=C bun run - <<'EOF' || return 1
+const { createHash } = require('crypto');
+function slug(decision) {
+  const normalizedDecision = decision.normalize('NFKC').trim()
+    .replace(/\p{White_Space}+/gu, ' ').toLowerCase();
+  const ascii = normalizedDecision.replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, '');
+  return ascii || `decision-${
+    createHash('sha256')
+      .update(Buffer.from(normalizedDecision, 'utf8'))
+      .digest('hex')
+      .slice(0, 12)
+  }`;
+}
+const cases = [
+  ['Build Orchid Relay', 'build-orchid-relay'],
+  ['Ｂｕｉｌｄ　ＯＲＣＨＩＤ', 'build-orchid'],
+  ['one\u00a0two\u2003three', 'one-two-three'],
+  ['MiXeD CaSe', 'mixed-case'],
+  ['全中文决策', 'decision-d0fc28be7e6e'],
+  ['***', 'decision-596f4162a52f'],
+  ['', 'decision-e3b0c44298fc'],
+  ['a'.repeat(61), 'a'.repeat(60)],
+  [`${'a'.repeat(59)} b`, 'a'.repeat(59)],
+];
+for (const [input, want] of cases) {
+  const got = slug(input);
+  if (got !== want) throw new Error(`${JSON.stringify(input)}: ${got} != ${want}`);
+}
+EOF
+  locale_slug_c="$(
+    LC_ALL=C bun -e "console.log('INDIGO'.normalize('NFKC').trim().replace(/\\p{White_Space}+/gu, ' ').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, ''))"
+  )" || return 1
+  locale_slug_tr="$(
+    LC_ALL=tr_TR.UTF-8 bun -e "console.log('INDIGO'.normalize('NFKC').trim().replace(/\\p{White_Space}+/gu, ' ').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60).replace(/-+$/g, ''))"
+  )" || return 1
+  [ "$locale_slug_c" = "indigo" ] || return 1
+  [ "$locale_slug_tr" = "$locale_slug_c" ] || return 1
+
+  grep -Fq 'Only `status: committed` with `commitModel: journaled-cooperative` means saved.' "$output" || return 1
+  grep -Fq '`not written`' "$output" || return 1
+
+  assert_file_exists "$evidence" || return 1
+  grep -Fq 'Each sample ran twice in a separate fresh context.' "$evidence" || return 1
+  grep -Fq 'Verdicts are based on human semantic review' "$evidence" || return 1
+  for id in DW1 DW2 DW3 DW4 DW5 DW6 DW7; do
+    [ "$(grep -Fc "### $id run " "$evidence")" -eq 2 ] || return 1
+    for run in 1 2; do
+      block="$(
+        awk -v heading="### $id run $run" '
+          $0 == heading { in_probe = 1; next }
+          in_probe && /^### DW[1-7] run [12]$/ { exit }
+          in_probe { print }
+        ' "$evidence"
+      )"
+      echo "$block" | grep -Fq '**Exact prompt:**' || return 1
+      echo "$block" | grep -Fq '**Fresh-context metadata:**' || return 1
+      echo "$block" | grep -Fq '**Writer fixture result:**' || return 1
+      echo "$block" | grep -Fq '**Before hash:**' || return 1
+      echo "$block" | grep -Fq '**After hash:**' || return 1
+      echo "$block" | grep -Fq '**Agent exact excerpt:**' || return 1
+      echo "$block" | grep -Fq '**Human semantic verdict:** PASS' || return 1
+    done
+  done
+
+  block="$(
+    awk '
+      /^### DW5 run 1$/ { in_probe = 1; next }
+      in_probe && /^### DW[1-7] run [12]$/ { exit }
+      in_probe { print }
+    ' "$evidence"
+  )"
+  [ "$(echo "$block" | grep -Fc 'operationId:')" -eq 2 ] || return 1
+  echo "$block" | grep -Fq 'recoveryState: incomplete' || return 1
 }
 
 # ── Quick Task 260406-e00: Convert Commands to Skills Tests ─────────────────
@@ -4308,7 +5053,9 @@ main() {
     # Run all tests
     run_test test_plugin_structure
     run_test test_plugin_manifest
+    run_test test_vault_writer_public_binary
     run_test test_codex_public_docs
+    run_test test_ingest_docs_rich_media
     run_test test_schema_fields
     run_test test_templates_match_schema
     run_test test_no_forbidden_fields_in_templates
@@ -4384,11 +5131,12 @@ main() {
     run_test test_ingest_skill_three_modes
     run_test test_ingest_skill_auto_detect_mode
     run_test test_ingest_skill_topic_confirmation
-    run_test test_ingest_skill_frontmatter_template
+    run_test test_ingest_skill_processed_markdown_body_only
     run_test test_ingest_skill_no_forbidden_fields
     run_test test_ingest_skill_filename_convention
-    run_test test_ingest_skill_image_download
+    run_test test_ingest_skill_image_localization_reporting
     run_test test_ingest_skill_under_500_lines
+    run_test test_ingest_skill_rich_contract
 
     # ── Quick 260517-fs2: Bilibili source adapter ──
     run_test test_ingest_skill_bilibili_source_adapter
@@ -4404,9 +5152,23 @@ main() {
     # Quick 260406-bxt: Ingest Script Integration
     run_test test_ingest_script_exists
     run_test test_ingest_script_cli_help
+    run_test test_ingest_help_lists_bundle_and_handout
+    run_test test_ingest_rejects_url_and_bundle_together
     run_test test_ingest_skill_calls_script
     run_test test_ingest_skill_thin_orchestrator
     run_test test_ingest_skill_llm_only_for_translate_summarize
+
+    # Decision Brief Skill Contract
+    run_test test_decision_brief_skill_structure
+    run_test test_decision_brief_public_privacy
+    run_test test_decision_brief_profile_contract
+    run_test test_decision_brief_profile_behavior_evidence
+    run_test test_decision_brief_write_transaction_contract
+    run_test test_decision_brief_writer_contract
+    run_test test_decision_brief_documented
+    run_test test_decision_brief_discovery_and_release_version
+    run_test test_packed_release_has_no_private_paths
+    run_test test_decision_brief_profile_example_uses_real_layer_contract
 
     # E2E tests (require claude CLI)
     run_test test_e2e_me_setup

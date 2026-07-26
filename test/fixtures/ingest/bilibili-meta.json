@@ -1,0 +1,13 @@
+{
+  "code": 0,
+  "data": {
+    "bvid": "BV1fixture",
+    "title": "带 CC 的测试视频",
+    "desc": "用于适配器迁移的元数据 fixture。",
+    "pubdate": 1721865600,
+    "duration": 42,
+    "owner": { "name": "测试作者" },
+    "stat": { "view": 10, "danmaku": 2, "like": 3, "coin": 4, "favorite": 5, "share": 6 },
+    "pages": [{ "cid": 123, "page": 1, "part": "P1", "duration": 42 }]
+  }
+}

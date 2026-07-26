@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "source": {
+    "url": "https://example.com/source",
+    "kind": "course",
+    "title": "Valid source bundle"
+  },
+  "blocks": [
+    {
+      "id": "slide-1",
+      "kind": "image",
+      "markdown": "![Slide](assets/slide-001.txt)",
+      "mediaId": "slide-001"
+    }
+  ],
+  "media": [
+    {
+      "id": "slide-001",
+      "kind": "slide",
+      "path": "assets/slide-001.txt",
+      "alt": "Example slide"
+    }
+  ],
+  "provenance": {
+    "extractor": "fixture",
+    "extractedAt": "2026-07-25T00:00:00Z",
+    "methods": ["fixture"]
+  },
+  "warnings": []
+}

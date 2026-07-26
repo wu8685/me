@@ -1,0 +1,49 @@
+{
+  "id": "me-schema-v1",
+  "revision": 1,
+  "schemaDocumentSha256": [
+    "9894ec60c4c7e583a215938ec71186e8a12d24eaedc6dc96a42e2a4aa24480b5"
+  ],
+  "templateSha256": {
+    "raw": "28e24f3e835c3a34a123c4ef8082abfcef8cfdcce3a913371869dbc9e6f2a4d4",
+    "practices": "ad169bbe8a74d5be0fa615eeae436380e8eb75dc8f4a3342df50482d7608323b",
+    "cognition": "a8084f5b1a601cdcdf1460247fa82bdb9fc2b24281ecca5fc48a0e3d32338a7b"
+  },
+  "core": {
+    "title": { "type": "string", "required": true, "minLength": 1 },
+    "created": { "type": "date", "required": true, "format": "YYYY-MM-DD" },
+    "tags": {
+      "type": "string-list",
+      "required": true,
+      "unique": true,
+      "itemPattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "type": { "type": "enum", "required": true },
+    "source": { "type": "string", "required": true, "minLength": 1 }
+  },
+  "layers": {
+    "raw": {
+      "types": ["article", "concept"],
+      "source": { "kind": "http-url", "schemes": ["http", "https"] },
+      "extensions": {}
+    },
+    "practices": {
+      "types": ["experiment", "reflection"],
+      "source": { "kind": "existing-path-qualified-wikilink" },
+      "extensions": {
+        "project": { "type": "string", "required": false, "allowEmpty": true }
+      }
+    },
+    "cognition": {
+      "types": ["insight"],
+      "source": { "kind": "existing-path-qualified-wikilink" },
+      "extensions": {
+        "confidence": {
+          "type": "enum",
+          "required": true,
+          "values": ["low", "medium", "high"]
+        }
+      }
+    }
+  }
+}

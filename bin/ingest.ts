@@ -4,7 +4,8 @@
 // Exports pure functions for all deterministic ingest steps.
 // LLM reasoning is only used for translate-cn and summarize modes in SKILL.md.
 //
-// CLI usage: bun run bin/ingest.ts <url> [--mode translate-cn|summarize|raw] [--vault-dir DIR]
+// CLI usage: bun run bin/ingest.ts <url> [--mode MODE] [--vault-dir DIR] [--write]
+//            bun run bin/ingest.ts --bundle DIR [--mode MODE] [--vault-dir DIR] [--write]
 //            bun run bin/ingest.ts --download-images --vault-dir DIR --target-dir DIR --urls url1,url2,...
 //            bun run bin/ingest.ts --help
 
@@ -14,6 +15,53 @@ import * as os from 'os';
 import * as https from 'https';
 import * as http from 'http';
 import { execSync } from 'child_process';
+import { defaultCommandRunner, type CommandRunner } from './ingest/command.ts';
+import { extractHtmlSource } from './ingest/adapters/html.ts';
+import { createHtmlAdapter } from './ingest/adapters/html.ts';
+import { createPdfAdapter } from './ingest/adapters/pdf.ts';
+import { createXAdapter } from './ingest/adapters/x.ts';
+import {
+  createBilibiliAdapter,
+  extractBilibiliSource,
+  fetchBilibiliMeta as fetchBilibiliMetaFromAdapter,
+  fetchBilibiliSubtitleBody as fetchBilibiliSubtitleBodyFromAdapter,
+  fetchBilibiliSubtitleList as fetchBilibiliSubtitleListFromAdapter,
+  isBilibiliUrl as isBilibiliUrlFromAdapter,
+  parseBilibiliBvid as parseBilibiliBvidFromAdapter,
+} from './ingest/adapters/bilibili.ts';
+import { loadSourceBundle } from './ingest/bundle.ts';
+import { resolveIngestConfig } from './ingest/config.ts';
+import type {
+  CapabilityReport,
+  ExtractMode,
+  ExtractedSource,
+  SourceAdapter,
+  SourceKind,
+} from './ingest/contracts.ts';
+import { finalizeIngest, type FinalizeResult } from './ingest/finalize.ts';
+import { formatHandout, type HandoutResult } from './ingest/handout.ts';
+import { createAdapterRegistry } from './ingest/registry.ts';
+import { discoverTranscriptionProvider } from './ingest/media/transcription.ts';
+
+export type {
+  Capability,
+  CapabilityReport,
+  ExtractContext,
+  ExtractMode,
+  ExtractedSource,
+  MediaAsset,
+  SourceAdapter,
+  SourceBlock,
+  SourceKind,
+  TranscriptSegment,
+} from './ingest/contracts.ts';
+export {
+  finalizeIngest,
+  type BacklinkSuggestion,
+  type FinalizeFileOperations,
+  type FinalizeInput,
+  type FinalizeResult,
+} from './ingest/finalize.ts';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -89,6 +137,14 @@ export interface IngestPipelineResult {
   relatedNotes: RelatedNote[];
   needsTranscription?: boolean;
   transcriptionAvailable?: boolean;
+  sourceKind?: SourceKind;
+  adapterId?: string;
+  capabilities?: CapabilityReport['capabilities'];
+  degradation?: CapabilityReport['degradation'];
+  completeness?: CapabilityReport['completeness'];
+  warnings?: string[];
+  handoutKind?: HandoutResult['kind'];
+  writeResult?: FinalizeResult;
 }
 
 // ── resolveConfig ─────────────────────────────────────────────────────────────
@@ -463,132 +519,28 @@ export function extractWikilinkCandidates(
   return Array.from(candidates.values()).sort((a, b) => b.count - a.count);
 }
 
-// ── Bilibili source adapter ───────────────────────────────────────────────────
+// ── HTML / Bilibili compatibility wrappers ──────────────────────────────────
 
-const BILI_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-
-/**
- * Returns true if the URL is a Bilibili video URL we can route to the dedicated
- * extractor. Currently supports `bilibili.com/video/BV...` and `b23.tv/...`.
- * Returns false for empty/malformed input — never throws.
- */
+/** Retained for callers while the CLI is migrated to adapter registry in Task 8. */
 export function isBilibiliUrl(url: string): boolean {
-  if (!url || typeof url !== 'string') return false;
-  if (/^(https?:\/\/)?(www\.)?bilibili\.com\/video\/BV[A-Za-z0-9]+/.test(url)) return true;
-  if (/^(https?:\/\/)?b23\.tv\/[A-Za-z0-9]+/.test(url)) return true;
-  return false;
+  return isBilibiliUrlFromAdapter(url);
 }
 
-/**
- * Extract the BV identifier from a Bilibili URL.
- * - bilibili.com/video/BVxxx → 'BVxxx' (strips query/trailing-slash/?p=N)
- * - b23.tv/xxx → follows redirect via curl and re-parses the resolved URL
- * - Anything else → null (no throw)
- */
+/** Retained for callers while redirect resolution now uses the safe command runner. */
 export function parseBilibiliBvid(url: string): string | null {
-  if (!url || typeof url !== 'string') return null;
-
-  // Fast path: direct /video/BVxxx match
-  const direct = url.match(/\/video\/(BV[A-Za-z0-9]+)/);
-  if (direct) return direct[1];
-
-  // b23.tv short link → follow redirect
-  if (/^(https?:\/\/)?b23\.tv\//.test(url)) {
-    try {
-      const resolved = execSync(
-        `curl -sIL -o /dev/null -w "%{url_effective}" --max-time 10 -A "${BILI_UA}" "${url}"`,
-        { encoding: 'utf8', timeout: 12000 },
-      ).trim();
-      const m = resolved.match(/\/video\/(BV[A-Za-z0-9]+)/);
-      return m ? m[1] : null;
-    } catch {
-      return null;
-    }
-  }
-
-  return null;
+  return parseBilibiliBvidFromAdapter(defaultCommandRunner, url);
 }
 
-/**
- * Fetch Bilibili video metadata via the public web-interface/view API.
- * Throws on non-zero API code so callers see the message.
- */
 export function fetchBilibiliMeta(bvid: string): BilibiliMeta {
-  const cmd = `curl -s --max-time 15 -A "${BILI_UA}" -H "Referer: https://www.bilibili.com/" "https://api.bilibili.com/x/web-interface/view?bvid=${bvid}"`;
-  const raw = execSync(cmd, { encoding: 'utf8', timeout: 18000 });
-  let json: any;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    throw new Error(`Bilibili API returned non-JSON for bvid=${bvid}`);
-  }
-  if (!json || json.code !== 0) {
-    throw new Error(`Bilibili API error: ${json?.message ?? json?.code ?? 'unknown'}`);
-  }
-  return json.data as BilibiliMeta;
+  return fetchBilibiliMetaFromAdapter(defaultCommandRunner, bvid);
 }
 
-/**
- * Fetch the per-page subtitle list via player/v2. Returns [] on any error
- * (subtitles are best-effort; missing/blocked → caller will trigger whisper).
- */
 export function fetchBilibiliSubtitleList(bvid: string, cid: number): BilibiliSubtitleEntry[] {
-  try {
-    const cmd = `curl -s --max-time 15 -A "${BILI_UA}" -H "Referer: https://www.bilibili.com/" "https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}"`;
-    const raw = execSync(cmd, { encoding: 'utf8', timeout: 18000 });
-    const json = JSON.parse(raw);
-    const list = json?.data?.subtitle?.subtitles;
-    return Array.isArray(list) ? (list as BilibiliSubtitleEntry[]) : [];
-  } catch {
-    return [];
-  }
+  return fetchBilibiliSubtitleListFromAdapter(defaultCommandRunner, bvid, cid);
 }
 
-/**
- * Fetch a subtitle body JSON from a (possibly protocol-relative) URL and
- * concatenate the per-line content. Returns '' on any failure.
- */
 export function fetchBilibiliSubtitleBody(subtitleUrl: string): string {
-  try {
-    if (!subtitleUrl) return '';
-    const abs = subtitleUrl.startsWith('//') ? `https:${subtitleUrl}` : subtitleUrl;
-    const cmd = `curl -s --max-time 15 -A "${BILI_UA}" -H "Referer: https://www.bilibili.com/" "${abs}"`;
-    const raw = execSync(cmd, { encoding: 'utf8', timeout: 18000 });
-    const json = JSON.parse(raw);
-    const body = json?.body;
-    if (!Array.isArray(body)) return '';
-    return body.map((b: any) => String(b?.content ?? '')).filter(Boolean).join('\n');
-  } catch {
-    return '';
-  }
-}
-
-/**
- * Pick the best subtitle from a candidate list.
- * Preference: non-AI (ai_type === 0) > AI; then zh-CN > others.
- * Returns null if list is empty.
- */
-function pickPreferredSubtitle(list: BilibiliSubtitleEntry[]): BilibiliSubtitleEntry | null {
-  if (!list || list.length === 0) return null;
-  const sorted = [...list].sort((a, b) => {
-    const aiDiff = (a.ai_type === 0 ? 0 : 1) - (b.ai_type === 0 ? 0 : 1);
-    if (aiDiff !== 0) return aiDiff;
-    const langDiff = (a.lan === 'zh-CN' ? 0 : 1) - (b.lan === 'zh-CN' ? 0 : 1);
-    return langDiff;
-  });
-  return sorted[0] ?? null;
-}
-
-/** Format duration in seconds as HH:MM:SS or MM:SS. */
-function formatDuration(seconds: number): string {
-  const s = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  const pad = (n: number) => String(n).padStart(2, '0');
-  if (h > 0) return `${h}:${pad(m)}:${pad(sec)}`;
-  return `${m}:${pad(sec)}`;
+  return fetchBilibiliSubtitleBodyFromAdapter(defaultCommandRunner, subtitleUrl);
 }
 
 /**
@@ -596,9 +548,9 @@ function formatDuration(seconds: number): string {
  * (Defined here so extractBilibili can compute transcriptionAvailable; the
  * actual transcribe pipeline lives further down.)
  */
-export function whichYtDlp(): string | null {
+export function whichYtDlp(runner: CommandRunner = defaultCommandRunner): string | null {
   try {
-    const out = execSync('which yt-dlp', { encoding: 'utf8', timeout: 5000 }).trim();
+    const out = runner.run('which', ['yt-dlp'], { timeoutMs: 5000 }).stdout.trim();
     return out || null;
   } catch {
     return null;
@@ -609,9 +561,9 @@ export function whichYtDlp(): string | null {
  * Check if whisper-cli is available. Tries `which`, then the homebrew
  * whisper-cpp keg location. Returns the resolved path or null.
  */
-export function whichWhisperCli(): string | null {
+export function whichWhisperCli(runner: CommandRunner = defaultCommandRunner): string | null {
   try {
-    const out = execSync('which whisper-cli', { encoding: 'utf8', timeout: 5000 }).trim();
+    const out = runner.run('which', ['whisper-cli'], { timeoutMs: 5000 }).stdout.trim();
     if (out) return out;
   } catch {
     // fall through to keg check
@@ -635,89 +587,25 @@ export function whichWhisperCli(): string | null {
  */
 export function extractBilibili(
   url: string,
-  opts?: { mode?: 'metadata' | 'transcribe' },
+  opts?: { mode?: 'metadata' | 'transcribe'; runner?: CommandRunner },
 ): ExtractedContent & { needsTranscription?: boolean; transcriptionAvailable?: boolean } {
-  const bvid = parseBilibiliBvid(url);
-  if (!bvid) throw new Error(`Not a Bilibili video URL: ${url}`);
-
-  const meta = fetchBilibiliMeta(bvid);
-
-  const pubdateIso = meta.pubdate
-    ? new Date(meta.pubdate * 1000).toISOString().split('T')[0]
-    : '';
-  const durationFmt = formatDuration(meta.duration ?? 0);
-
-  const lines: string[] = [];
-  lines.push(`# ${meta.title}`);
-  lines.push('');
-  lines.push(
-    `> 作者: ${meta.owner?.name ?? '未知'} · 时长: ${durationFmt} · 发布: ${pubdateIso}`,
-  );
-  const stat = meta.stat ?? ({} as BilibiliMeta['stat']);
-  lines.push(
-    `> 播放: ${stat.view ?? 0} · 弹幕: ${stat.danmaku ?? 0} · 点赞: ${stat.like ?? 0} · 投币: ${stat.coin ?? 0} · 收藏: ${stat.favorite ?? 0}`,
-  );
-  lines.push('');
-  lines.push('## 视频简介');
-  lines.push('');
-  lines.push(meta.desc || '*（无简介）*');
-  lines.push('');
-
-  const pages = Array.isArray(meta.pages) && meta.pages.length > 0
-    ? meta.pages
-    : [{ cid: 0, page: 1, part: meta.title, duration: meta.duration ?? 0 }];
-
-  let anyMissing = false;
   const mode = opts?.mode ?? 'metadata';
-
-  for (const page of pages) {
-    if (pages.length > 1) {
-      lines.push(`## P${page.page}: ${page.part}`);
-      lines.push('');
-    }
-
-    const subs = fetchBilibiliSubtitleList(bvid, page.cid);
-    const chosen = pickPreferredSubtitle(subs);
-    const body = chosen ? fetchBilibiliSubtitleBody(chosen.subtitle_url) : '';
-
-    if (body) {
-      lines.push(`### 字幕转录（${chosen?.lan ?? 'unknown'}）`);
-      lines.push('');
-      lines.push(body);
-      lines.push('');
-    } else if (mode === 'transcribe') {
-      // Whisper fallback — calls into transcribeBilibili (defined below).
+  const runner = opts?.runner ?? defaultCommandRunner;
+  const source = extractBilibiliSource(runner, url, mode, {
+    transcribe: (sourceUrl, cid) => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bili-whisper-'));
       try {
-        const transcript = transcribeBilibili(url, page.cid, tmpDir);
-        lines.push('### 字幕转录（whisper-auto）');
-        lines.push('');
-        lines.push(transcript);
-        lines.push('');
+        return transcribeBilibili(sourceUrl, cid, tmpDir, runner);
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
-    } else {
-      lines.push('<!-- 无 CC 字幕 -->');
-      lines.push('');
-      anyMissing = true;
-    }
-  }
-
-  const content = lines.join('\n');
-  const transcriptionAvailable = whichYtDlp() !== null && whichWhisperCli() !== null;
-
-  const result: ExtractedContent & {
-    needsTranscription?: boolean;
-    transcriptionAvailable?: boolean;
-  } = {
-    title: meta.title,
-    content,
-    images: [],
-  };
-  if (anyMissing && mode !== 'transcribe') {
+    },
+    transcriptionAvailable: () => whichYtDlp(runner) !== null && whichWhisperCli(runner) !== null,
+  });
+  const result = projectExtractedSource(source);
+  if (source.warnings.includes('needs-transcription')) {
     result.needsTranscription = true;
-    result.transcriptionAvailable = transcriptionAvailable;
+    result.transcriptionAvailable = whichYtDlp(runner) !== null && whichWhisperCli(runner) !== null;
   }
   return result;
 }
@@ -731,29 +619,23 @@ export function extractBilibili(
  */
 export function extractContent(
   url: string,
-  opts?: { mode?: 'metadata' | 'transcribe' },
+  opts?: { mode?: 'metadata' | 'transcribe'; runner?: CommandRunner },
+  runner: CommandRunner = opts?.runner ?? defaultCommandRunner,
 ): ExtractedContent & { needsTranscription?: boolean; transcriptionAvailable?: boolean } {
   if (isBilibiliUrl(url)) {
-    return extractBilibili(url, opts);
+    return extractBilibili(url, { ...opts, runner });
   }
+  return projectExtractedSource(extractHtmlSource(runner, new URL(url), url));
+}
 
-  const output = execSync(`defuddle parse "${url}" --md`, {
-    encoding: 'utf8',
-    timeout: 30000,
-  });
-
-  // Extract title from first # heading or <title>
-  const titleMatch = output.match(/^#\s+(.+)/m) || output.match(/^title:\s*["']?(.+?)["']?\s*$/m);
-  const title = titleMatch ? titleMatch[1].trim() : 'Untitled';
-
-  // Extract image URLs
-  const imageMatches = output.matchAll(/!\[.*?\]\((https?:\/\/[^)]+)\)/g);
-  const images: string[] = [];
-  for (const match of imageMatches) {
-    images.push(match[1]);
-  }
-
-  return { title, content: output, images };
+function projectExtractedSource(
+  source: import('./ingest/contracts.ts').ExtractedSource,
+): ExtractedContent & { needsTranscription?: boolean; transcriptionAvailable?: boolean } {
+  return {
+    title: source.source.title,
+    content: source.blocks.map((block) => block.markdown).join('\n\n'),
+    images: source.media.flatMap((media) => media.kind === 'image' && media.url ? [media.url] : []),
+  };
 }
 
 /**
@@ -765,7 +647,7 @@ export function extractContent(
  * mirror (large file — caller pays the network cost only when transcribe mode
  * is actually used). Creates parent directory as needed.
  */
-export function getWhisperModelPath(): string {
+export function getWhisperModelPath(runner: CommandRunner = defaultCommandRunner): string {
   const envPath = process.env.ME_WHISPER_MODEL;
   const modelPath =
     envPath || path.join(os.homedir(), '.cache/me/whisper-models/ggml-large-v3-turbo.bin');
@@ -780,10 +662,7 @@ export function getWhisperModelPath(): string {
   const modelUrl =
     'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin';
   try {
-    execSync(`curl -L --max-time 600 -o "${modelPath}" "${modelUrl}"`, {
-      stdio: 'inherit',
-      timeout: 620000,
-    });
+    runner.run('curl', ['-L', '--max-time', '600', '-o', modelPath, modelUrl], { timeoutMs: 620000 });
   } catch {
     throw new Error(
       `Failed to download whisper model — manually place at ${modelPath} (source: ${modelUrl})`,
@@ -809,22 +688,24 @@ export function getWhisperModelPath(): string {
  *
  * Throws with a `brew install ...` hint if either binary is missing.
  */
-export function transcribeBilibili(url: string, cid: number, tmpDir: string): string {
-  const ytdlp = whichYtDlp();
+export function transcribeBilibili(
+  url: string,
+  cid: number,
+  tmpDir: string,
+  runner: CommandRunner = defaultCommandRunner,
+): string {
+  const ytdlp = whichYtDlp(runner);
   if (!ytdlp) {
     throw new Error('yt-dlp not installed. brew install yt-dlp');
   }
-  const wcli = whichWhisperCli();
+  const wcli = whichWhisperCli(runner);
   if (!wcli) {
     throw new Error('whisper-cli not installed. brew install whisper-cpp');
   }
 
   // Step 1: extract audio with yt-dlp → tmpDir/audio-<cid>.<ext>
   const audioOutTpl = path.join(tmpDir, `audio-${cid}.%(ext)s`);
-  execSync(`${ytdlp} -x --audio-format wav -o "${audioOutTpl}" "${url}"`, {
-    stdio: 'inherit',
-    timeout: 600000,
-  });
+  runner.run(ytdlp, ['-x', '--audio-format', 'wav', '-o', audioOutTpl, url], { timeoutMs: 600000 });
 
   const wavName = fs
     .readdirSync(tmpDir)
@@ -836,18 +717,12 @@ export function transcribeBilibili(url: string, cid: number, tmpDir: string): st
   const wav16k = path.join(tmpDir, `audio-${cid}-16k.wav`);
 
   // Step 2: ffmpeg resample to 16kHz mono PCM
-  execSync(`ffmpeg -y -i "${wavIn}" -ar 16000 -ac 1 -c:a pcm_s16le "${wav16k}"`, {
-    stdio: 'inherit',
-    timeout: 300000,
-  });
+  runner.run('ffmpeg', ['-y', '-i', wavIn, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wav16k], { timeoutMs: 300000 });
 
   // Step 3: whisper-cli → transcript-<cid>.txt
-  const model = getWhisperModelPath();
+  const model = getWhisperModelPath(runner);
   const transcriptBase = path.join(tmpDir, `transcript-${cid}`);
-  execSync(
-    `${wcli} -m "${model}" -f "${wav16k}" -l auto -otxt -of "${transcriptBase}"`,
-    { stdio: 'inherit', timeout: 1800000 },
-  );
+  runner.run(wcli, ['-m', model, '-f', wav16k, '-l', 'auto', '-otxt', '-of', transcriptBase], { timeoutMs: 1800000 });
 
   const transcriptFile = `${transcriptBase}.txt`;
   const transcript = fs.existsSync(transcriptFile)
@@ -965,19 +840,560 @@ export function downloadImage(url: string, targetDir: string, filename: string):
   return false;
 }
 
+// ── Rich ingest orchestration ─────────────────────────────────────────────────
+
+export interface IngestCliOptions {
+  url?: URL;
+  bundleDir?: string;
+  mode?: ExtractMode;
+  vaultDir: string;
+  topic?: string;
+  processedMarkdown?: string;
+  write: boolean;
+}
+
+export class SourceBlockedError extends Error {
+  readonly code = 'source-blocked' as const;
+
+  constructor(
+    readonly adapterId: string,
+    readonly warnings: string[],
+  ) {
+    super(`Source is blocked for adapter ${adapterId}`);
+    this.name = 'SourceBlockedError';
+  }
+}
+
+export type IngestErrorPayload =
+  | { code: 'source-blocked'; adapterId: string; warnings: string[] }
+  | { error: string };
+
+export function ingestErrorPayload(error: unknown): IngestErrorPayload {
+  if (error instanceof SourceBlockedError) {
+    return {
+      code: error.code,
+      adapterId: error.adapterId,
+      warnings: [...error.warnings],
+    };
+  }
+  return { error: error instanceof Error ? error.message : String(error) };
+}
+
+const INGEST_MODES = new Set<ExtractMode>(['raw', 'translate-cn', 'summarize', 'transcribe', 'handout']);
+const TOPIC_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\/[a-z0-9]+(?:-[a-z0-9]+)*)*$/;
+
+export function parseIngestCliOptions(args: string[], cwd = process.cwd()): IngestCliOptions {
+  let url: URL | undefined;
+  let bundleDir: string | undefined;
+  let mode: ExtractMode | undefined;
+  let vaultDir = cwd;
+  let topic: string | undefined;
+  let processedMarkdown: string | undefined;
+  let write = false;
+
+  const takeValue = (index: number, flag: string): string => {
+    const value = args[index + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    return value;
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (!argument.startsWith('--')) {
+      if (url) throw new Error('exactly one URL or --bundle is required');
+      try {
+        const parsed = new URL(argument);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error();
+        url = parsed;
+      } catch {
+        throw new Error('URL must be an http(s) URL');
+      }
+      continue;
+    }
+    if (argument === '--write') {
+      write = true;
+      continue;
+    }
+    if (argument === '--bundle') {
+      bundleDir = takeValue(index, argument);
+      index += 1;
+      continue;
+    }
+    if (argument === '--mode') {
+      const value = takeValue(index, argument);
+      if (!INGEST_MODES.has(value as ExtractMode)) throw new Error(`unknown ingest mode: ${value}`);
+      mode = value as ExtractMode;
+      index += 1;
+      continue;
+    }
+    if (argument === '--vault-dir') {
+      vaultDir = takeValue(index, argument);
+      index += 1;
+      continue;
+    }
+    if (argument === '--topic') {
+      topic = takeValue(index, argument);
+      if (!TOPIC_PATTERN.test(topic)) throw new Error('topic must be an ASCII kebab slug');
+      index += 1;
+      continue;
+    }
+    if (argument === '--processed-markdown') {
+      processedMarkdown = takeValue(index, argument);
+      index += 1;
+      continue;
+    }
+    throw new Error(`unknown option: ${argument}`);
+  }
+
+  if (Boolean(url) === Boolean(bundleDir)) throw new Error('exactly one URL or --bundle is required');
+  if (processedMarkdown && !write) throw new Error('--processed-markdown requires --write');
+  return {
+    ...(url ? { url } : {}),
+    ...(bundleDir ? { bundleDir: path.resolve(bundleDir) } : {}),
+    ...(mode ? { mode } : {}),
+    vaultDir: path.resolve(vaultDir),
+    ...(topic ? { topic } : {}),
+    ...(processedMarkdown ? { processedMarkdown: path.resolve(processedMarkdown) } : {}),
+    write,
+  };
+}
+
+export function resolveIngestMode(
+  explicitMode: ExtractMode | undefined,
+  sourceKind: SourceKind,
+  language: 'en' | 'zh',
+  defaultVideoMode: ExtractMode,
+): ExtractMode {
+  if (explicitMode) return explicitMode;
+  if (sourceKind === 'video' || sourceKind === 'course') return defaultVideoMode;
+  return language === 'en' ? 'translate-cn' : 'summarize';
+}
+
+export function createRichIngestRegistry(runner: CommandRunner = defaultCommandRunner): {
+  adapters: SourceAdapter[];
+  registry: ReturnType<typeof createAdapterRegistry>;
+} {
+  // Rich ingest deliberately routes every source through the configured generic
+  // transcription providers. The legacy Bilibili whisper-cpp callback remains
+  // available only through the compatibility wrapper above.
+  const bili = createBilibiliAdapter(runner);
+  const adapters = [bili, createXAdapter(runner), createPdfAdapter(runner), createHtmlAdapter(runner)];
+  const registry = createAdapterRegistry(adapters, {
+    async resolveContentType(url) {
+      const result = runner.run('curl', [
+        '-sS', '-L', '--fail', '--max-time', '15', '-I', '-o', '/dev/null',
+        '-w', '%{content_type}', url.toString(),
+      ], { timeoutMs: 18000 });
+      return result.stdout.trim() || undefined;
+    },
+  });
+  return { adapters, registry };
+}
+
+function isInside(root: string, candidate: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function readProcessedMarkdown(vaultDir: string, filename: string | undefined): string | undefined {
+  if (!filename) return undefined;
+  const tmpRoot = path.resolve(vaultDir, '.me', 'tmp');
+  const candidate = path.resolve(filename);
+  if (!isInside(tmpRoot, candidate) || !fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
+    throw new Error('--processed-markdown must be a file inside <vault>/.me/tmp/');
+  }
+  const realVault = fs.realpathSync(vaultDir);
+  const realTmp = fs.realpathSync(tmpRoot);
+  const realCandidate = fs.realpathSync(candidate);
+  if (!isInside(realVault, realTmp) || !isInside(realTmp, realCandidate)) {
+    throw new Error('--processed-markdown must be a file inside <vault>/.me/tmp/');
+  }
+  return fs.readFileSync(realCandidate, 'utf8');
+}
+
+const REMOTE_MEDIA_EXTENSIONS = {
+  visual: new Set(['.avif', '.bmp', '.gif', '.jpeg', '.jpg', '.png', '.tif', '.tiff', '.webp']),
+  audio: new Set(['.aac', '.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav']),
+  video: new Set(['.m4v', '.mkv', '.mov', '.mp4', '.webm']),
+};
+const MAX_REMOTE_MEDIA_BYTES = 256 * 1024 * 1024;
+
+function safeRemoteMediaExtension(asset: import('./ingest/contracts.ts').MediaAsset): string {
+  const pathname = asset.url ? new URL(asset.url).pathname : '';
+  const extension = path.extname(pathname).toLowerCase();
+  if (['image', 'figure', 'slide', 'frame'].includes(asset.kind)) {
+    if (!extension) return '.jpg';
+    if (REMOTE_MEDIA_EXTENSIONS.visual.has(extension)) return extension;
+  } else if (asset.kind === 'audio' && REMOTE_MEDIA_EXTENSIONS.audio.has(extension)) {
+    return extension;
+  } else if (asset.kind === 'video' && REMOTE_MEDIA_EXTENSIONS.video.has(extension)) {
+    return extension;
+  }
+  throw new Error(`remote media has an incompatible extension for ${asset.kind}`);
+}
+
+function requireCompatibleRemoteContentType(
+  asset: import('./ingest/contracts.ts').MediaAsset,
+  contentTypeOutput: string,
+): void {
+  const contentType = contentTypeOutput.trim().split(';', 1)[0].toLowerCase();
+  const compatible = ['image', 'figure', 'slide', 'frame'].includes(asset.kind)
+    ? contentType.startsWith('image/')
+    : asset.kind === 'audio'
+      ? contentType.startsWith('audio/') || contentType === 'application/octet-stream'
+      : contentType.startsWith('video/') || contentType === 'application/octet-stream';
+  if (!compatible) throw new Error(`remote media content type is incompatible with ${asset.kind}`);
+}
+
+function prepareSourceMedia(
+  source: ExtractedSource,
+  workspace: string,
+  runner: CommandRunner,
+  downloadRemote: boolean,
+  includePlayableRemote = false,
+): ExtractedSource {
+  const mediaDirectory = path.join(workspace, 'media');
+  fs.mkdirSync(mediaDirectory, { recursive: true });
+  const media = source.media.map((asset, index) => {
+    if (asset.path) {
+      const sourcePath = path.resolve(asset.path);
+      if (isInside(path.resolve(workspace), sourcePath)) return asset;
+      if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) return asset;
+      const extension = path.extname(sourcePath).toLowerCase();
+      const destination = path.join(mediaDirectory, `asset-${String(index + 1).padStart(3, '0')}${extension}`);
+      fs.copyFileSync(sourcePath, destination);
+      return { ...asset, path: destination };
+    }
+    const isVisual = ['image', 'figure', 'slide', 'frame'].includes(asset.kind);
+    if (!downloadRemote || !asset.url || (!isVisual && !includePlayableRemote)) {
+      return asset;
+    }
+    const extension = safeRemoteMediaExtension(asset);
+    const destination = path.join(
+      mediaDirectory,
+      `asset-${String(index + 1).padStart(3, '0')}${extension}`,
+    );
+    const staging = `${destination}.part`;
+    const result = runner.run('curl', [
+      '-sS', '-L', '--fail', '--max-time', '30',
+      '--max-filesize', String(MAX_REMOTE_MEDIA_BYTES),
+      '-o', staging, '-w', '%{content_type}', asset.url,
+    ], { timeoutMs: 35000 });
+    if (result.status !== 0) throw new Error('failed to stage media asset');
+    requireCompatibleRemoteContentType(asset, result.stdout);
+    if (
+      !fs.existsSync(staging)
+      || !fs.statSync(staging).isFile()
+      || fs.statSync(staging).size === 0
+      || fs.statSync(staging).size > MAX_REMOTE_MEDIA_BYTES
+    ) {
+      fs.rmSync(staging, { force: true });
+      throw new Error('failed to stage media asset');
+    }
+    fs.renameSync(staging, destination);
+    return { ...asset, path: destination };
+  });
+  return { ...source, media };
+}
+
+function stageBilibiliAudio(
+  source: ExtractedSource,
+  workspace: string,
+  runner: CommandRunner,
+): ExtractedSource {
+  if (source.transcript?.length || source.media.some(asset => asset.kind === 'audio' && asset.path)) {
+    return source;
+  }
+  const ytdlp = whichYtDlp(runner);
+  if (!ytdlp) {
+    return { ...source, warnings: [...new Set([...source.warnings, 'transcription-unavailable'])] };
+  }
+  const directory = path.join(workspace, 'bilibili-audio');
+  fs.mkdirSync(directory, { recursive: true });
+  const template = path.join(directory, 'audio.%(ext)s');
+  const result = runner.run(ytdlp, ['-x', '--audio-format', 'wav', '-o', template, source.source.url], {
+    timeoutMs: 600000,
+  });
+  if (result.status !== 0) throw new Error('yt-dlp failed to stage Bilibili audio');
+  const audioPath = fs.readdirSync(directory)
+    .map(name => path.join(directory, name))
+    .find(candidate =>
+      path.extname(candidate).toLowerCase() === '.wav'
+      && fs.statSync(candidate).isFile()
+      && fs.statSync(candidate).size > 0);
+  if (!audioPath || !isInside(path.resolve(directory), path.resolve(audioPath))) {
+    throw new Error('yt-dlp did not produce a usable Bilibili audio file');
+  }
+  return {
+    ...source,
+    media: [
+      ...source.media,
+      {
+        id: 'audio-001',
+        kind: 'audio',
+        path: audioPath,
+        url: source.source.url,
+        ...(source.source.durationSec === undefined ? {} : { durationSec: source.source.durationSec }),
+      },
+    ],
+  };
+}
+
+function mediaDuration(asset: import('./ingest/contracts.ts').MediaAsset, runner: CommandRunner): number {
+  if (asset.durationSec !== undefined) {
+    if (Number.isFinite(asset.durationSec) && asset.durationSec > 0) return asset.durationSec;
+    throw new Error('media duration is invalid');
+  }
+  const result = runner.run('ffprobe', [
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    asset.path as string,
+  ], { timeoutMs: 30000 });
+  const duration = Number.parseFloat(result.stdout.trim());
+  if (result.status !== 0 || !Number.isFinite(duration) || duration <= 0) {
+    throw new Error('media duration is unavailable');
+  }
+  return duration;
+}
+
+function transcribeLocalMedia(
+  source: ExtractedSource,
+  workspace: string,
+  config: ReturnType<typeof resolveIngestConfig>,
+  runner: CommandRunner,
+): ExtractedSource {
+  if (source.transcript?.length) return source;
+  const inputs = source.media.filter(asset =>
+    (asset.kind === 'audio' || asset.kind === 'video') && asset.path);
+  if (inputs.length === 0) return source;
+  const provider = discoverTranscriptionProvider(config.transcriptionPreference, runner, config);
+  if (!provider) {
+    return { ...source, warnings: [...source.warnings, 'transcription-unavailable'] };
+  }
+  let offset = 0;
+  const transcript = inputs.flatMap((asset, index) => {
+    const duration = mediaDuration(asset, runner);
+    const output = path.join(workspace, `transcript-${String(index + 1).padStart(3, '0')}`);
+    const localSegments = provider.transcribe(asset.path as string, output);
+    if (localSegments.some(segment =>
+      segment.start < 0
+      || segment.start >= segment.end
+      || segment.end > duration)) {
+      throw new Error('transcript exceeds media duration bound');
+    }
+    const segments = localSegments
+      .map(segment => ({ ...segment, start: segment.start + offset, end: segment.end + offset }));
+    offset += duration;
+    return segments;
+  });
+  if (
+    source.source.durationSec !== undefined
+    && (!Number.isFinite(source.source.durationSec)
+      || source.source.durationSec <= 0
+      || offset > source.source.durationSec)
+  ) {
+    throw new Error('cumulative media duration exceeds source duration bound');
+  }
+  return transcript.length > 0
+    ? {
+      ...source,
+      transcript,
+      warnings: source.warnings.filter(warning =>
+        warning !== 'needs-transcription'
+        && warning !== 'transcription-unavailable'
+        && warning !== 'transcription-empty'),
+    }
+    : { ...source, warnings: [...source.warnings, 'transcription-empty'] };
+}
+
+function sourceCapabilities(source: ExtractedSource, probed: CapabilityReport['capabilities']): CapabilityReport['capabilities'] {
+  const capabilities = new Set(probed);
+  if (source.blocks.length > 0) capabilities.add('body');
+  if (source.transcript?.length) capabilities.add('transcript');
+  if (source.media.some(asset => asset.kind === 'image' || asset.kind === 'figure')) capabilities.add('images');
+  if (source.media.some(asset => asset.kind === 'slide')) capabilities.add('slides');
+  if (source.media.some(asset => asset.kind === 'audio')) capabilities.add('audio');
+  if (source.media.some(asset => asset.kind === 'video')) capabilities.add('video');
+  return [...capabilities];
+}
+
+function transcriptBody(source: ExtractedSource): string | undefined {
+  const transcript = source.transcript ?? [];
+  if (transcript.length === 0) return undefined;
+  const timestamp = (seconds: number): string => {
+    const value = Math.max(0, Math.floor(seconds));
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.floor((value % 3600) / 60);
+    const remainder = value % 60;
+    const pad = (part: number) => String(part).padStart(2, '0');
+    return hours > 0
+      ? `${hours}:${pad(minutes)}:${pad(remainder)}`
+      : `${pad(minutes)}:${pad(remainder)}`;
+  };
+  return [
+    `# ${source.source.title}（转写）`,
+    '',
+    '## 完整转写',
+    '',
+    ...transcript.flatMap(segment => [
+      `**${timestamp(segment.start)}–${timestamp(segment.end)}**${segment.speaker ? ` · ${segment.speaker}` : ''}`,
+      '',
+      segment.text.trim(),
+      '',
+    ]),
+  ].join('\n').trimEnd() + '\n';
+}
+
+export async function runRichIngest(
+  options: IngestCliOptions,
+  runner: CommandRunner = defaultCommandRunner,
+): Promise<IngestPipelineResult> {
+  if (!fs.existsSync(options.vaultDir) || !fs.statSync(options.vaultDir).isDirectory()) {
+    throw new Error('vault directory does not exist');
+  }
+  const config = resolveIngestConfig(options.vaultDir);
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-run-'));
+  let processedMarkdown: string | undefined;
+  let processedPath: string | undefined;
+
+  try {
+    processedMarkdown = readProcessedMarkdown(options.vaultDir, options.processedMarkdown);
+    processedPath = options.processedMarkdown ? fs.realpathSync(options.processedMarkdown) : undefined;
+
+    let source: ExtractedSource;
+    let adapterId: string;
+    let capabilityReport: CapabilityReport;
+    let trustedResourceRoots: string[];
+    if (options.bundleDir) {
+      source = loadSourceBundle(options.bundleDir);
+      adapterId = 'source-bundle-v1';
+      capabilityReport = {
+        adapterId,
+        readable: true,
+        capabilities: sourceCapabilities(source, []),
+        degradation: source.warnings.length > 0 ? 'partial' : 'none',
+        warnings: [...source.warnings],
+      };
+      const shouldStageRemote = options.write
+        || options.mode === 'transcribe'
+        || options.mode === 'handout'
+        || (
+          !options.mode
+          && (source.source.kind === 'video' || source.source.kind === 'course')
+          && (config.defaultVideoMode === 'transcribe' || config.defaultVideoMode === 'handout')
+        );
+      source = prepareSourceMedia(source, workspace, runner, shouldStageRemote, true);
+      trustedResourceRoots = [workspace];
+    } else {
+      const url = options.url as URL;
+      const { registry } = createRichIngestRegistry(runner);
+      const session = await registry.resolveSession(url);
+      capabilityReport = await session.probe({ vaultDir: options.vaultDir, tempDir: workspace });
+      if (capabilityReport.degradation === 'blocked') {
+        throw new SourceBlockedError(session.adapter.id, capabilityReport.warnings);
+      }
+      const guessedMode = options.mode
+        ?? (session.adapter.id === 'bilibili' || session.adapter.id === 'x' ? config.defaultVideoMode : undefined);
+      const extractionMode = guessedMode === 'handout' ? 'transcribe' : guessedMode;
+      source = await session.extract({
+        vaultDir: options.vaultDir,
+        tempDir: workspace,
+        ...(extractionMode ? { mode: extractionMode } : {}),
+      });
+      adapterId = session.adapter.id;
+      source = prepareSourceMedia(source, workspace, runner, options.write);
+      trustedResourceRoots = [workspace];
+    }
+
+    const body = source.blocks.map(block => block.markdown).join('\n\n');
+    const language = detectLanguage(`${source.source.title}\n${body}`);
+    const mode = resolveIngestMode(options.mode, source.source.kind, language, config.defaultVideoMode);
+    if (mode === 'handout' || mode === 'transcribe') {
+      if (adapterId === 'bilibili') source = stageBilibiliAudio(source, workspace, runner);
+      source = transcribeLocalMedia(source, workspace, config, runner);
+    }
+    const handout = mode === 'handout'
+      ? formatHandout(source, { topicHeadings: [] })
+      : undefined;
+    const generatedTranscript = mode === 'transcribe' ? transcriptBody(source) : undefined;
+    const finalizedMarkdown = processedMarkdown ?? generatedTranscript;
+    const previewBody = finalizedMarkdown ?? handout?.markdown ?? body;
+    const slug = deriveSlug(source.source.title) || 'ingest';
+    const today = new Date().toISOString().slice(0, 10);
+    const stem = `${today}-${slug}`;
+    const frontmatter = generateFrontmatter(source.source.title, today, [], source.source.url);
+    const vaultIndex = buildVaultIndex(options.vaultDir);
+    const autoLinkResult = autoLink(`${frontmatter}\n\n${previewBody}`, vaultIndex);
+    const relatedNotes = scoreRelatedNotes([], source.source.title, vaultIndex, options.vaultDir).slice(0, 5);
+    const capabilities = sourceCapabilities(source, capabilityReport.capabilities);
+    const probeWarnings = source.transcript?.length
+      ? capabilityReport.warnings.filter(warning =>
+        warning !== 'needs-transcription'
+        && warning !== 'transcription-unavailable'
+        && warning !== 'transcription-empty')
+      : capabilityReport.warnings;
+    const warnings = [...new Set([...probeWarnings, ...source.warnings, ...(handout?.warnings ?? [])])];
+
+    let writeResult: FinalizeResult | undefined;
+    if (options.write) {
+      writeResult = finalizeIngest({
+        vaultDir: options.vaultDir,
+        source,
+        ...(handout ? { handout } : {}),
+        ...(finalizedMarkdown ? { processedMarkdown: finalizedMarkdown } : {}),
+        ...(options.topic ? { topic: options.topic } : {}),
+        stem,
+        created: today,
+        trustedResourceRoots,
+      });
+      if (processedPath) fs.rmSync(processedPath, { force: true });
+    }
+
+    return {
+      title: source.source.title,
+      slug,
+      language,
+      mode,
+      frontmatter,
+      content: autoLinkResult.linkedBody,
+      images: source.media.flatMap(asset => asset.kind === 'image' && asset.url ? [asset.url] : []),
+      autoLinks: autoLinkResult.links,
+      relatedNotes,
+      sourceKind: source.source.kind,
+      adapterId,
+      capabilities,
+      degradation: warnings.length > 0 ? 'partial' : 'none',
+      ...(capabilityReport.completeness ? { completeness: capabilityReport.completeness } : {}),
+      warnings,
+      ...(handout ? { handoutKind: handout.kind } : {}),
+      ...(writeResult ? { writeResult } : {}),
+      ...(source.warnings.includes('needs-transcription') ? { needsTranscription: true } : {}),
+      ...(capabilities.includes('transcript') ? { transcriptionAvailable: true } : {}),
+    };
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
 // ── CLI Entry Point ───────────────────────────────────────────────────────────
 
 if (import.meta.main) {
   const args = process.argv.slice(2);
 
   if (args.length === 0 || args.includes('--help')) {
-    console.log(`Usage: bun run bin/ingest.ts <url> [--mode translate-cn|summarize|raw|transcribe] [--vault-dir DIR]
+    console.log(`Usage: bun run bin/ingest.ts <url> [--mode translate-cn|summarize|raw|transcribe|handout] [--vault-dir DIR] [--topic SLUG] [--processed-markdown FILE] [--write]
+       bun run bin/ingest.ts --bundle <directory> [--mode translate-cn|summarize|raw|transcribe|handout] [--vault-dir DIR] [--topic SLUG] [--processed-markdown FILE] [--write]
        bun run bin/ingest.ts --download-images --vault-dir DIR --target-dir DIR --urls url1,url2,...
 
 Options:
   --mode       Processing mode: translate-cn (default for English), summarize (default for Chinese),
-               raw, or transcribe (Bilibili only — run whisper when CC subtitles are absent)
+               raw, transcribe, or handout (default for video/course)
+  --bundle     Load a validated Source Bundle v1 directory instead of a URL
   --vault-dir  Vault directory (default: current directory)
+  --topic      Optional ASCII kebab topic path under the configured raw layer
+  --processed-markdown
+               Agent-edited Markdown inside <vault>/.me/tmp/ (requires --write)
+  --write      Atomically finalize the note and assets; otherwise emit JSON preview only
   --help       Show this help
 
 Download mode:
@@ -985,8 +1401,8 @@ Download mode:
   --target-dir       Target directory for images
   --urls             Comma-separated list of image URLs
 
-Output: JSON with { title, slug, language, mode, frontmatter, content, images, autoLinks,
-        relatedNotes, needsTranscription?, transcriptionAvailable? }
+Output: JSON preview with legacy fields plus { sourceKind, adapterId, capabilities, warnings,
+        handoutKind?, writeResult? }
 `);
     process.exit(0);
   }
@@ -1012,72 +1428,11 @@ Output: JSON with { title, slug, language, mode, frontmatter, content, images, a
     process.exit(0);
   }
 
-  // Standard pipeline mode
-  const url = args[0];
-  const modeIdx = args.indexOf('--mode');
-  const vaultDirIdx = args.indexOf('--vault-dir');
-
-  const vaultDir = vaultDirIdx !== -1 ? args[vaultDirIdx + 1] : process.cwd();
-  const explicitMode = modeIdx !== -1 ? args[modeIdx + 1] : null;
-
   try {
-    // Step 1: Extract content. For Bilibili URLs, plumb --mode transcribe through
-    // to the source adapter; HTML path ignores opts.
-    const extractOpts: { mode?: 'metadata' | 'transcribe' } | undefined =
-      isBilibiliUrl(url)
-        ? { mode: explicitMode === 'transcribe' ? 'transcribe' : 'metadata' }
-        : undefined;
-    const extracted = extractContent(url, extractOpts);
-
-    // Step 2: Detect language and mode
-    const language = detectLanguage(extracted.content);
-    // 'transcribe' is a Bilibili adapter mode, not a content-transformation mode.
-    // Fall back to language-based default for the IngestPipelineResult.mode field.
-    const contentMode = explicitMode && explicitMode !== 'transcribe'
-      ? explicitMode
-      : (language === 'en' ? 'translate-cn' : 'summarize');
-
-    // Step 3: Derive slug
-    const slug = deriveSlug(extracted.title);
-
-    // Step 4: Generate frontmatter
-    const today = new Date().toISOString().split('T')[0];
-    const frontmatter = generateFrontmatter(extracted.title, today, [], url);
-
-    // Step 5: Build vault index
-    const vaultIndex = buildVaultIndex(vaultDir);
-
-    // Step 6: Auto-link
-    const fullContent = frontmatter + '\n\n' + extracted.content;
-    const autoLinkResult = autoLink(fullContent, vaultIndex);
-
-    // Step 7: Score related notes
-    const relatedNotes = scoreRelatedNotes([], extracted.title, vaultIndex, vaultDir);
-
-    const result: IngestPipelineResult = {
-      title: extracted.title,
-      slug,
-      language,
-      mode: contentMode,
-      frontmatter,
-      content: autoLinkResult.linkedBody,
-      images: extracted.images,
-      autoLinks: autoLinkResult.links,
-      relatedNotes: relatedNotes.slice(0, 5),
-    };
-
-    // Attach Bilibili-only optional fields (non-Bilibili → keys omitted from JSON).
-    if (extracted.needsTranscription !== undefined) {
-      result.needsTranscription = extracted.needsTranscription;
-    }
-    if (extracted.transcriptionAvailable !== undefined) {
-      result.transcriptionAvailable = extracted.transcriptionAvailable;
-    }
-
-    console.log(JSON.stringify(result, null, 2));
+    const options = parseIngestCliOptions(args);
+    console.log(JSON.stringify(await runRichIngest(options), null, 2));
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(JSON.stringify({ error: message }));
+    console.error(JSON.stringify(ingestErrorPayload(error)));
     process.exit(1);
   }
 }
