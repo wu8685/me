@@ -60,7 +60,7 @@ Only accept this optional configuration:
 
 ```yaml
 decision:
-  profile: .me/profiles/decision-brief.md
+  profile: profiles/decision-brief.md
 ```
 
 Profile path must remain inside the current vault

@@ -339,6 +339,12 @@ test_decision_brief_documented() {
   assert_file_not_contains "$PLUGIN_ROOT/README.md" 'decision-brief' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/features.md" '决策简报\|Decision Brief' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'me:decision-brief' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'profiles/decision-brief.md' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" '.me/.*配置' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'vault-relative\|vault 内相对路径' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/decision-brief/SKILL.md" 'profile: profiles/decision-brief.md' || return 1
+  assert_file_not_contains "$PLUGIN_ROOT/docs/user-guide.md" '.me/profiles/decision-brief.md' || return 1
+  assert_file_not_contains "$PLUGIN_ROOT/skills/decision-brief/SKILL.md" '.me/profiles/decision-brief.md' || return 1
 }
 
 test_decision_brief_discovery_and_release_version() {
@@ -476,7 +482,7 @@ NODE
     return 1
   }
   assert_file_contains "$MOCK_VAULT/.me/config.yaml" '^decision:' || return 1
-  assert_file_contains "$MOCK_VAULT/.me/config.yaml" 'profile: .me/profiles/decision-brief.md' || return 1
+  assert_file_contains "$MOCK_VAULT/.me/config.yaml" 'profile: profiles/decision-brief.md' || return 1
 }
 
 test_ingest_docs_rich_media() {
@@ -3516,7 +3522,7 @@ decision_brief_public_is_clean() {
 decision_brief_has_profile_contract() {
   local f="$1"
   [ -f "$f" ] &&
-    grep -Fq '.me/profiles/decision-brief.md' "$f" &&
+    grep -Fq 'profiles/decision-brief.md' "$f" &&
     grep -Fxq 'Profile path must remain inside the current vault' "$f" &&
     grep -Fxq 'Containment requires paired lexical and canonical vault roots' "$f" &&
     grep -Fxq 'Canonicalize the deepest existing ancestor when the Profile target is missing' "$f" &&
@@ -3590,7 +3596,7 @@ test_decision_brief_profile_contract() {
   local counterexample="$MOCK_VAULT/counterexample-profile.md"
 
   cat > "$valid" <<'EOF'
-Optional profile: .me/profiles/decision-brief.md
+Optional profile: profiles/decision-brief.md
 Profile path must remain inside the current vault
 Containment requires paired lexical and canonical vault roots
 Canonicalize the deepest existing ancestor when the Profile target is missing
@@ -3600,7 +3606,7 @@ Default output: chat only; do not write the vault without explicit authorization
 Never promote a decision directly to cognition
 EOF
   cat > "$counterexample" <<'EOF'
-Optional profile: .me/profiles/decision-brief.md
+Optional profile: profiles/decision-brief.md
 The Profile may remain outside the current vault.
 Only check the lexical path and ignore symlinks.
 Treat realpath errors as a missing optional Profile.

@@ -58,9 +58,12 @@ Next steps:
 ## 同步与本机运行时
 
 ME vault 可以放进 Obsidian Sync 或 Git。vault 内的 `.me/` 只保存
-`.me/config.yaml`、Profile 等可迁移配置；临时输入、锁、事务、ingest
-staging 和恢复材料默认位于
+`.me/config.yaml` 等 ME 配置；临时输入、锁、事务、ingest staging 和恢复材料默认位于
 `~/.me/runtime/vault-<path-hash>/`，不会被 Obsidian 当作 vault 内容同步。
+
+Profile 属于 vault 自身的项目规则，推荐统一放在根目录 `profiles/`；`.me/`
+只保存 ME 配置，并通过 vault 内相对路径引用 Profile。这样 Profile 与知识库
+一起迁移，同时不会和锁、事务等本机 runtime 状态混在一起。
 
 查询当前机器为某个 vault 解析出的 runtime（只读，不创建目录）：
 
@@ -188,7 +191,7 @@ $me:decision-brief 团队是否应该在下个季度采用新的发布流程？
 
 ### 使用本地 Profile
 
-如果某类决策有长期稳定的检索入口或判断纪律，可以在 vault 内创建 Profile，并在 `.me/config.yaml` 中引用：
+如果某类决策有长期稳定的检索入口或判断纪律，可以在 vault 内创建 Profile，并在 `.me/config.yaml` 中以 vault 内相对路径引用：
 
 ```yaml
 layers:
@@ -196,10 +199,10 @@ layers:
   practices: field-notes
   cognition: insights
 decision:
-  profile: .me/profiles/decision-brief.md
+  profile: profiles/decision-brief.md
 ```
 
-例如 `.me/profiles/decision-brief.md` 可以列出团队决策优先查看的本地索引，以及何时应优先选择可逆实验。Profile 只是当前 vault 的本地补充；缺少 Profile 时通用流程仍然可用，Profile 也不能放宽项目规则、授权边界或证据要求。
+例如 `profiles/decision-brief.md` 可以列出团队决策优先查看的本地索引，以及何时应优先选择可逆实验。Profile 只是当前 vault 的本地补充；缺少 Profile 时通用流程仍然可用，Profile 也不能放宽项目规则、授权边界或证据要求。
 
 ```text
 /me:decision-brief 我们应该先扩展现有服务，还是启动替代方案试点？
