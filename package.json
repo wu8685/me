@@ -7,7 +7,7 @@
     "test:ingest": "bun test test/ingest-*.test.ts"
   },
   "files": [
-    ".agents/",
+    ".agents/plugins/marketplace.json",
     ".claude-plugin/",
     ".codex-plugin/",
     "AGENTS.md",
