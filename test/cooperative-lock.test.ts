@@ -173,4 +173,233 @@ describe('vault-wide cooperative lock', () => {
     })).toThrow(/RECOVERY_REQUIRED/);
     expect(fs.existsSync(lock.path)).toBeTrue();
   });
+
+  test('never reaches a deletable post-close quarantine ownership read', () => {
+    const layout = preparedRuntime();
+    let descriptorClosed = false;
+    let replacementInserted = false;
+    let replacementPath = '';
+    const hooks = {
+      __operations: {
+        closeSync(descriptor: number) {
+          fs.closeSync(descriptor);
+          descriptorClosed = true;
+        },
+        readFileSync(candidate: string) {
+          const bytes = fs.readFileSync(candidate);
+          if (
+            descriptorClosed
+            && candidate.includes(`${path.sep}.vault-lock-release-`)
+            && !replacementInserted
+          ) {
+            replacementInserted = true;
+            replacementPath = candidate;
+            fs.unlinkSync(candidate);
+            fs.writeFileSync(candidate, 'post-close foreign replacement');
+          }
+          return bytes;
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        closeSync(descriptor: number): void;
+        readFileSync(candidate: string): Buffer;
+      };
+    };
+    const lock = acquireVaultLock(layout, {
+      operationId: 'owned',
+      owner: 'vault-write',
+    }, hooks);
+
+    expect(() => releaseVaultLock(layout, lock, hooks)).not.toThrow();
+    expect(replacementInserted).toBeFalse();
+    expect(replacementPath).toBe('');
+    expect(fs.existsSync(lock.path)).toBeFalse();
+  });
+
+  test('restores vault.lock when rename succeeds before its wrapper throws', () => {
+    const layout = preparedRuntime();
+    let quarantinePath = '';
+    const hooks = {
+      __operations: {
+        renameSync(source: string, destination: string) {
+          fs.renameSync(source, destination);
+          quarantinePath = destination;
+          throw new Error('injected post-success rename error');
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        renameSync(source: string, destination: string): void;
+      };
+    };
+    const lock = acquireVaultLock(layout, {
+      operationId: 'owned',
+      owner: 'ingest',
+    }, hooks);
+    const ownedBytes = fs.readFileSync(lock.path);
+
+    expect(() => releaseVaultLock(layout, lock, hooks)).toThrow(/RECOVERY_REQUIRED/);
+    expect(fs.readFileSync(lock.path)).toEqual(ownedBytes);
+    expect(fs.readFileSync(quarantinePath)).toEqual(ownedBytes);
+    expect(() => acquireVaultLock(layout, {
+      operationId: 'next',
+      owner: 'me-update',
+    })).toThrow(/LOCK_HELD/);
+  });
+
+  test('completes release when unlink succeeds before its wrapper throws', () => {
+    const layout = preparedRuntime();
+    let postSuccessErrorInjected = false;
+    const hooks = {
+      __operations: {
+        unlinkSync(candidate: string) {
+          fs.unlinkSync(candidate);
+          if (candidate.includes(`${path.sep}.vault-lock-release-`)) {
+            postSuccessErrorInjected = true;
+            throw new Error('injected post-success unlink error');
+          }
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        unlinkSync(candidate: string): void;
+      };
+    };
+    const lock = acquireVaultLock(layout, {
+      operationId: 'owned',
+      owner: 'vault-write',
+    }, hooks);
+
+    expect(() => releaseVaultLock(layout, lock, hooks)).not.toThrow();
+    expect(postSuccessErrorInjected).toBeTrue();
+    expect(fs.existsSync(lock.path)).toBeFalse();
+
+    const next = acquireVaultLock(layout, {
+      operationId: 'next',
+      owner: 'me-update',
+    });
+    releaseVaultLock(layout, next);
+  });
+
+  test('failed acquisition preserves a quarantine replacement inserted during ownership read', () => {
+    const layout = preparedRuntime();
+    let cleanupStarted = false;
+    let replacementInserted = false;
+    let replacementPath = '';
+    let descriptor = -1;
+    const hooks = {
+      __operations: {
+        fsyncSync() {
+          cleanupStarted = true;
+          throw new Error('injected acquisition fsync failure');
+        },
+        readFileSync(candidate: string) {
+          const bytes = fs.readFileSync(candidate);
+          if (
+            cleanupStarted
+            && candidate.includes(`${path.sep}.vault-lock-release-`)
+            && !replacementInserted
+          ) {
+            replacementInserted = true;
+            replacementPath = candidate;
+            fs.unlinkSync(candidate);
+            fs.writeFileSync(candidate, 'failed-acquisition foreign replacement');
+          }
+          return bytes;
+        },
+        closeSync(candidate: number) {
+          descriptor = candidate;
+          fs.closeSync(candidate);
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        fsyncSync(descriptor: number): void;
+        readFileSync(candidate: string): Buffer;
+        closeSync(descriptor: number): void;
+      };
+    };
+
+    expect(() => acquireVaultLock(layout, {
+      operationId: 'failed',
+      owner: 'vault-write',
+    }, hooks)).toThrow(/RECOVERY_REQUIRED/);
+    expect(replacementInserted).toBeTrue();
+    expect(fs.readFileSync(replacementPath, 'utf8'))
+      .toBe('failed-acquisition foreign replacement');
+    expect(fs.readFileSync(path.join(layout.lockDir, 'vault.lock'), 'utf8'))
+      .toBe('failed-acquisition foreign replacement');
+    expect(() => fs.fstatSync(descriptor)).toThrow();
+  });
+
+  test('failed acquisition restores vault.lock after post-success rename error', () => {
+    const layout = preparedRuntime();
+    let quarantinePath = '';
+    const hooks = {
+      __operations: {
+        fsyncSync() {
+          throw new Error('injected acquisition fsync failure');
+        },
+        renameSync(source: string, destination: string) {
+          fs.renameSync(source, destination);
+          quarantinePath = destination;
+          throw new Error('injected acquisition post-success rename error');
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        fsyncSync(descriptor: number): void;
+        renameSync(source: string, destination: string): void;
+      };
+    };
+
+    expect(() => acquireVaultLock(layout, {
+      operationId: 'failed',
+      owner: 'ingest',
+    }, hooks)).toThrow(/RECOVERY_REQUIRED/);
+    expect(fs.existsSync(path.join(layout.lockDir, 'vault.lock'))).toBeTrue();
+    expect(fs.existsSync(quarantinePath)).toBeTrue();
+    expect(() => acquireVaultLock(layout, {
+      operationId: 'next',
+      owner: 'me-update',
+    })).toThrow(/LOCK_HELD/);
+  });
+
+  test('failed acquisition surfaces its original error after post-success unlink error', () => {
+    const layout = preparedRuntime();
+    let postSuccessErrorInjected = false;
+    const hooks = {
+      __operations: {
+        fsyncSync() {
+          throw new Error('injected acquisition fsync failure');
+        },
+        unlinkSync(candidate: string) {
+          fs.unlinkSync(candidate);
+          if (candidate.includes(`${path.sep}.vault-lock-release-`)) {
+            postSuccessErrorInjected = true;
+            throw new Error('injected acquisition post-success unlink error');
+          }
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        fsyncSync(descriptor: number): void;
+        unlinkSync(candidate: string): void;
+      };
+    };
+
+    expect(() => acquireVaultLock(layout, {
+      operationId: 'failed',
+      owner: 'vault-write',
+    }, hooks)).toThrow(/injected acquisition fsync failure/);
+    expect(postSuccessErrorInjected).toBeTrue();
+    expect(fs.existsSync(path.join(layout.lockDir, 'vault.lock'))).toBeFalse();
+
+    const next = acquireVaultLock(layout, {
+      operationId: 'next',
+      owner: 'me-update',
+    });
+    releaseVaultLock(layout, next);
+  });
 });

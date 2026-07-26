@@ -588,7 +588,7 @@ describe('lock precedence and operation discovery', () => {
       .toBe('foreign lock bytes');
   });
 
-  test('a final lock descriptor close failure preserves the lock after entering release mutation', () => {
+  test('a post-success descriptor close error does not invent lock recovery', () => {
     const vault = makeVault();
     const lockPath = writerLockPath(vault);
     const unlinks: string[] = [];
@@ -613,12 +613,11 @@ describe('lock precedence and operation discovery', () => {
     });
 
     expect(closes).toBe(1);
-    expect(result.status).toBe('manual_recovery');
-    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
-    expect(fs.existsSync(lockPath)).toBeTrue();
+    expect(result.status).toBe('committed');
+    expect(result.error).toBeUndefined();
+    expect(result.recoveries).toEqual([]);
+    expect(fs.existsSync(lockPath)).toBeFalse();
     expect(unlinks).toContain(lockPath);
-    expect(result.recoveries.flatMap(item => item.preservedPaths))
-      .toContain('<ME_RUNTIME>/locks/vault.lock');
   });
 
   test('a nested cooperative writer observes LOCK_HELD while the owner completes', () => {

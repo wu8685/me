@@ -63,10 +63,18 @@ interface CooperativeLockState {
   bytes: Buffer;
   descriptorDevice: bigint;
   descriptorInode: bigint;
-  pathDevice: bigint;
-  pathInode: bigint;
   operations: CooperativeLockOperations;
 }
+
+interface CooperativeLockIdentity {
+  bytes: Buffer;
+  device: bigint;
+  inode: bigint;
+  operationId: string;
+  owner: CooperativeLockOwner;
+}
+
+type PathOwnershipState = 'owned' | 'foreign' | 'missing' | 'unknown';
 
 const lockStates = new WeakMap<OwnedCooperativeLock, CooperativeLockState>();
 
@@ -123,28 +131,51 @@ function isExpectedOwnership(
     && parsed.owner === owner;
 }
 
-function nativePathStillOwned(
-  lockPath: string,
+function inspectPathOwnership(
+  candidate: string,
   descriptor: number,
-  bytes: Buffer,
-  request: CooperativeLockRequest,
-): boolean {
+  identity: CooperativeLockIdentity,
+  operations: CooperativeLockOperations,
+): PathOwnershipState {
   try {
-    const opened = fs.fstatSync(descriptor, { bigint: true });
-    const entry = fs.lstatSync(lockPath, { bigint: true });
-    const target = fs.statSync(lockPath, { bigint: true });
-    const actualBytes = fs.readFileSync(lockPath);
+    const opened = operations.fstatSync(descriptor);
+    const entryBeforeRead = operations.lstatSync(candidate);
+    const targetBeforeRead = operations.statSync(candidate);
+    const actualBytes = operations.readFileSync(candidate);
+    /*
+     * Reading bytes is not an identity-stable operation. Re-read both path
+     * identities afterwards so a replacement made during readFileSync can
+     * never inherit the ownership proof for the previous inode.
+     */
+    const entryAfterRead = operations.lstatSync(candidate);
+    const targetAfterRead = operations.statSync(candidate);
     return opened.isFile()
-      && entry.isFile()
-      && !entry.isSymbolicLink()
-      && target.isFile()
-      && opened.dev === entry.dev
-      && opened.ino === entry.ino
-      && opened.dev === target.dev
-      && opened.ino === target.ino
-      && isExpectedOwnership(actualBytes, bytes, request.operationId, request.owner);
-  } catch {
-    return false;
+      && entryBeforeRead.isFile()
+      && !entryBeforeRead.isSymbolicLink()
+      && targetBeforeRead.isFile()
+      && entryAfterRead.isFile()
+      && !entryAfterRead.isSymbolicLink()
+      && targetAfterRead.isFile()
+      && opened.dev === identity.device
+      && opened.ino === identity.inode
+      && entryBeforeRead.dev === identity.device
+      && entryBeforeRead.ino === identity.inode
+      && targetBeforeRead.dev === identity.device
+      && targetBeforeRead.ino === identity.inode
+      && entryAfterRead.dev === identity.device
+      && entryAfterRead.ino === identity.inode
+      && targetAfterRead.dev === identity.device
+      && targetAfterRead.ino === identity.inode
+      && isExpectedOwnership(
+        actualBytes,
+        identity.bytes,
+        identity.operationId,
+        identity.owner,
+      )
+      ? 'owned'
+      : 'foreign';
+  } catch (error) {
+    return errno(error) === 'ENOENT' ? 'missing' : 'unknown';
   }
 }
 
@@ -176,70 +207,8 @@ function validateAcquiredLock(
     bytes,
     descriptorDevice: opened.dev,
     descriptorInode: opened.ino,
-    pathDevice: entry.dev,
-    pathInode: entry.ino,
     operations,
   };
-}
-
-function assertReleaseOwnership(
-  lock: OwnedCooperativeLock,
-  state: CooperativeLockState,
-  candidate: string = lock.path,
-): boolean {
-  try {
-    const opened = state.operations.fstatSync(lock.descriptor);
-    const entry = state.operations.lstatSync(candidate);
-    const target = state.operations.statSync(candidate);
-    const actualBytes = state.operations.readFileSync(candidate);
-    return opened.isFile()
-      && entry.isFile()
-      && !entry.isSymbolicLink()
-      && target.isFile()
-      && opened.dev === state.descriptorDevice
-      && opened.ino === state.descriptorInode
-      && entry.dev === state.pathDevice
-      && entry.ino === state.pathInode
-      && opened.dev === entry.dev
-      && opened.ino === entry.ino
-      && opened.dev === target.dev
-      && opened.ino === target.ino
-      && isExpectedOwnership(
-        actualBytes,
-        state.bytes,
-        lock.operationId,
-        lock.owner,
-      );
-  } catch {
-    return false;
-  }
-}
-
-function assertPathOwnershipAfterClose(
-  lock: OwnedCooperativeLock,
-  state: CooperativeLockState,
-  candidate: string = lock.path,
-): boolean {
-  try {
-    const entry = state.operations.lstatSync(candidate);
-    const target = state.operations.statSync(candidate);
-    const actualBytes = state.operations.readFileSync(candidate);
-    return entry.isFile()
-      && !entry.isSymbolicLink()
-      && target.isFile()
-      && entry.dev === state.pathDevice
-      && entry.ino === state.pathInode
-      && entry.dev === target.dev
-      && entry.ino === target.ino
-      && isExpectedOwnership(
-        actualBytes,
-        state.bytes,
-        lock.operationId,
-        lock.owner,
-      );
-  } catch {
-    return false;
-  }
 }
 
 function safeRuntimeMutation(layout: RuntimeLayout, candidate: string): void {
@@ -247,6 +216,174 @@ function safeRuntimeMutation(layout: RuntimeLayout, candidate: string): void {
     assertSafeRuntimePath(layout, candidate);
   } catch {
     throw new CooperativeLockError('UNSAFE_PATH');
+  }
+}
+
+function nativeInspectionOperations(
+  operations: CooperativeLockOperations,
+): CooperativeLockOperations {
+  return {
+    ...operations,
+    fstatSync: descriptor => fs.fstatSync(descriptor, { bigint: true }),
+    lstatSync: candidate => fs.lstatSync(candidate, { bigint: true }),
+    statSync: candidate => fs.statSync(candidate, { bigint: true }),
+    readFileSync: candidate => fs.readFileSync(candidate),
+  };
+}
+
+function inspectWithOptionalNativeFallback(
+  candidate: string,
+  descriptor: number,
+  identity: CooperativeLockIdentity,
+  operations: CooperativeLockOperations,
+  nativeFallback: boolean,
+): PathOwnershipState {
+  const observed = inspectPathOwnership(candidate, descriptor, identity, operations);
+  return observed === 'unknown' && nativeFallback
+    ? inspectPathOwnership(
+      candidate,
+      descriptor,
+      identity,
+      nativeInspectionOperations(operations),
+    )
+    : observed;
+}
+
+function closeDescriptorStateAware(
+  descriptor: number,
+  operations: CooperativeLockOperations,
+): void {
+  try {
+    operations.closeSync(descriptor);
+    return;
+  } catch {
+    try {
+      fs.fstatSync(descriptor);
+    } catch (error) {
+      if (errno(error) === 'EBADF') return;
+    }
+    try {
+      fs.closeSync(descriptor);
+    } catch {
+      // Namespace recovery state is authoritative even if descriptor close fails.
+    }
+  }
+}
+
+function quarantineAndRemoveOwnedLock(
+  layout: RuntimeLayout,
+  lockPath: string,
+  descriptor: number,
+  identity: CooperativeLockIdentity,
+  operations: CooperativeLockOperations,
+  hooks: CooperativeLockHooks | undefined,
+  nativeInspectionFallback: boolean,
+): boolean {
+  let quarantineDirectory: string | undefined;
+  let quarantinePath: string | undefined;
+
+  const inspect = (candidate: string): PathOwnershipState =>
+    inspectWithOptionalNativeFallback(
+      candidate,
+      descriptor,
+      identity,
+      operations,
+      nativeInspectionFallback,
+    );
+
+  const reconcileActualState = (): 'removed' | 'recovery' => {
+    if (!quarantinePath) return 'recovery';
+    const sourceState = inspect(lockPath);
+    const quarantineState = inspect(quarantinePath);
+    if (
+      quarantineState === 'missing'
+      && (sourceState === 'missing' || sourceState === 'foreign')
+    ) {
+      /*
+       * The owned inode is no longer reachable. A foreign source is a new
+       * owner and must be preserved, but the previous owner is fully released.
+       */
+      return 'removed';
+    }
+    if (quarantineState !== 'missing') {
+      try {
+        /*
+         * linkSync is no-clobber: an existing new owner wins, while an empty
+         * cooperative namespace is restored from the actual quarantine inode.
+         */
+        operations.linkSync(quarantinePath, lockPath);
+      } catch {
+        // Existing source or unknown quarantine remains untouched.
+      }
+    }
+    return 'recovery';
+  };
+
+  try {
+    if (inspect(lockPath) !== 'owned') return false;
+
+    hooks?.beforeMutation?.('unlink', lockPath);
+    safeRuntimeMutation(layout, lockPath);
+    quarantineDirectory = operations.mkdtempSync(
+      path.join(layout.lockDir, '.vault-lock-release-'),
+    );
+    quarantinePath = path.join(quarantineDirectory, 'vault.lock');
+    safeRuntimeMutation(layout, quarantineDirectory);
+    safeRuntimeMutation(layout, quarantinePath);
+
+    try {
+      operations.renameSync(lockPath, quarantinePath);
+    } catch {
+      return reconcileActualState() === 'removed';
+    }
+
+    if (inspect(quarantinePath) !== 'owned') {
+      reconcileActualState();
+      return false;
+    }
+
+    try {
+      operations.unlinkSync(quarantinePath);
+    } catch {
+      return reconcileActualState() === 'removed';
+    }
+    /*
+     * Do not trust a successful wrapper return either. Derive the namespace
+     * state after every mutation so post-success wrapper behavior cannot make
+     * stale booleans authoritative.
+     */
+    return reconcileActualState() === 'removed';
+  } catch {
+    return reconcileActualState() === 'removed';
+  } finally {
+    /*
+     * Keep the owned descriptor live through rename, final byte+identity
+     * verification, unlink, and state reconciliation.
+     */
+    closeDescriptorStateAware(descriptor, operations);
+    if (
+      quarantineDirectory
+      && quarantinePath
+      && pathIsMissing(quarantinePath, operations)
+    ) {
+      try {
+        operations.rmdirSync(quarantineDirectory);
+      } catch {
+        // An empty private quarantine directory is harmless.
+      }
+    }
+  }
+}
+
+function pathIsMissing(
+  candidate: string,
+  operations: CooperativeLockOperations,
+): boolean {
+  try {
+    operations.lstatSync(candidate);
+    return false;
+  } catch (error) {
+    return errno(error) === 'ENOENT';
   }
 }
 
@@ -296,27 +433,29 @@ export function acquireVaultLock(
     lockStates.set(lock, state);
     return lock;
   } catch (error) {
-    let removed = false;
-    if (nativePathStillOwned(lockPath, descriptor, bytes, request)) {
-      try {
-        hooks?.beforeMutation?.('unlink', lockPath);
-        safeRuntimeMutation(layout, lockPath);
-        if (nativePathStillOwned(lockPath, descriptor, bytes, request)) {
-          operations.unlinkSync(lockPath);
-          removed = true;
-        }
-      } catch {
-        removed = false;
-      }
-    }
-    let closed = false;
+    let opened: fs.BigIntStats;
     try {
-      operations.closeSync(descriptor);
-      closed = true;
+      opened = fs.fstatSync(descriptor, { bigint: true });
     } catch {
-      closed = false;
+      closeDescriptorStateAware(descriptor, operations);
+      throw new CooperativeLockError('RECOVERY_REQUIRED');
     }
-    if (!removed || !closed) throw new CooperativeLockError('RECOVERY_REQUIRED');
+    const removed = quarantineAndRemoveOwnedLock(
+      layout,
+      lockPath,
+      descriptor,
+      {
+        bytes,
+        device: opened.dev,
+        inode: opened.ino,
+        operationId: request.operationId,
+        owner: request.owner,
+      },
+      operations,
+      hooks,
+      true,
+    );
+    if (!removed) throw new CooperativeLockError('RECOVERY_REQUIRED');
     throw error;
   }
 }
@@ -329,79 +468,25 @@ export function releaseVaultLock(
   const expectedPath = path.join(layout.lockDir, 'vault.lock');
   const state = lockStates.get(lock);
   if (!state) throw new CooperativeLockError('RECOVERY_REQUIRED');
-
-  let quarantineDirectory: string | undefined;
-  let quarantinePath: string | undefined;
-  let movedToQuarantine = false;
-  let quarantineUnlinked = false;
-  let descriptorCloseAttempted = false;
-  try {
-    if (
-      path.resolve(lock.path) !== path.resolve(expectedPath)
-      || !assertReleaseOwnership(lock, state)
-    ) {
-      throw new CooperativeLockError('RECOVERY_REQUIRED');
-    }
-
-    hooks?.beforeMutation?.('unlink', lock.path);
-    safeRuntimeMutation(layout, lock.path);
-    quarantineDirectory = state.operations.mkdtempSync(
-      path.join(layout.lockDir, '.vault-lock-release-'),
-    );
-    quarantinePath = path.join(quarantineDirectory, 'vault.lock');
-    safeRuntimeMutation(layout, quarantineDirectory);
-    safeRuntimeMutation(layout, quarantinePath);
-
-    /*
-     * Move the pathname out of the cooperative namespace atomically before
-     * inspecting it again. A replacement raced into vault.lock is moved, not
-     * deleted, and is retained in the private quarantine on mismatch.
-     */
-    state.operations.renameSync(lock.path, quarantinePath);
-    movedToQuarantine = true;
-    if (!assertReleaseOwnership(lock, state, quarantinePath)) {
-      throw new CooperativeLockError('RECOVERY_REQUIRED');
-    }
-
-    /*
-     * The descriptor remains open through the pathname mutation. It can be
-     * closed after the rename while the quarantined inode is still available
-     * as recovery material if close or final verification fails.
-     */
-    descriptorCloseAttempted = true;
-    state.operations.closeSync(lock.descriptor);
-    if (!assertPathOwnershipAfterClose(lock, state, quarantinePath)) {
-      throw new CooperativeLockError('RECOVERY_REQUIRED');
-    }
-    state.operations.unlinkSync(quarantinePath);
-    quarantineUnlinked = true;
-    try {
-      state.operations.rmdirSync(quarantineDirectory);
-    } catch {
-      // The lock is fully released; an empty private directory is harmless.
-    }
-  } catch {
-    if (!descriptorCloseAttempted) {
-      descriptorCloseAttempted = true;
-      try {
-        state.operations.closeSync(lock.descriptor);
-      } catch {
-        // Preserve the path or quarantine as recovery material.
-      }
-    }
-    if (movedToQuarantine && !quarantineUnlinked && quarantinePath) {
-      try {
-        /*
-         * linkSync is no-clobber. Keeping both names makes the raced inode
-         * discoverable at vault.lock without risking deletion of quarantine.
-         */
-        state.operations.linkSync(quarantinePath, lock.path);
-      } catch {
-        // The quarantine path remains the recovery artifact.
-      }
-    }
-    lockStates.delete(lock);
+  lockStates.delete(lock);
+  if (path.resolve(lock.path) !== path.resolve(expectedPath)) {
+    closeDescriptorStateAware(lock.descriptor, state.operations);
     throw new CooperativeLockError('RECOVERY_REQUIRED');
   }
-  lockStates.delete(lock);
+  const removed = quarantineAndRemoveOwnedLock(
+    layout,
+    lock.path,
+    lock.descriptor,
+    {
+      bytes: state.bytes,
+      device: state.descriptorDevice,
+      inode: state.descriptorInode,
+      operationId: lock.operationId,
+      owner: lock.owner,
+    },
+    state.operations,
+    hooks,
+    false,
+  );
+  if (!removed) throw new CooperativeLockError('RECOVERY_REQUIRED');
 }
