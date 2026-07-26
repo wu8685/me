@@ -8,7 +8,14 @@ import {
   finalizeIngest,
   type FinalizeInput,
 } from '../bin/ingest/finalize.ts';
-import { resolveRuntimeLayout } from '../bin/runtime-paths.ts';
+import {
+  acquireVaultLock,
+  releaseVaultLock,
+} from '../bin/cooperative-lock.ts';
+import {
+  bootstrapRuntimeDirectories,
+  resolveRuntimeLayout,
+} from '../bin/runtime-paths.ts';
 
 const temporaryDirectories: string[] = [];
 
@@ -434,6 +441,24 @@ describe('finalizeIngest', () => {
     expect(nestedAttempted).toBeTrue();
     expect(fs.existsSync(first.notePath)).toBeTrue();
     expect(fs.existsSync(path.dirname(first.notePath))).toBeTrue();
+  });
+
+  test('a me-update owner blocks ingest without publishing content', () => {
+    const vault = makeVault();
+    const runtime = resolveRuntimeLayout(vault);
+    bootstrapRuntimeDirectories(runtime, [runtime.lockDir]);
+    const lock = acquireVaultLock(runtime, {
+      operationId: 'update-in-progress',
+      owner: 'me-update',
+    });
+
+    try {
+      expect(() => finalizeIngest(validArticleInput(vault)))
+        .toThrow(/locked|in progress/i);
+      expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+    } finally {
+      releaseVaultLock(runtime, lock);
+    }
   });
 
   test('reserves a stem vault-wide across concurrent topics', () => {

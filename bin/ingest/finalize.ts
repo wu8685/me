@@ -17,6 +17,12 @@ import {
   bootstrapRuntimeDirectories,
   resolveRuntimeLayout,
 } from '../runtime-paths.ts';
+import {
+  acquireVaultLock,
+  CooperativeLockError,
+  releaseVaultLock,
+  type OwnedCooperativeLock,
+} from '../cooperative-lock.ts';
 
 export interface FinalizeInput {
   vaultDir: string;
@@ -896,7 +902,9 @@ function artifactManifest(root: string): Map<string, string> {
         ].join(':'));
         walk(absolute, relative);
       } else if (stat.isFile()) {
-        const digest = createHash('sha256').update(fs.readFileSync(absolute)).digest('hex');
+        const digest = createHash('sha256')
+          .update(Uint8Array.from(fs.readFileSync(absolute)))
+          .digest('hex');
         entries.set(relative, [
           'file', stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs, digest,
         ].join(':'));
@@ -989,6 +997,7 @@ export function finalizeIngest(
   const createdDirectories: string[] = [];
   try {
     bootstrapRuntimeDirectories(runtime, [
+      runtime.lockDir,
       runtime.ingestLockDir,
       runtime.ingestStagingDir,
     ]);
@@ -998,7 +1007,6 @@ export function finalizeIngest(
     }
     throw error;
   }
-  createDirectoryTracked(finalParent, createdDirectories);
   const digest = (value: string): string =>
     createHash('sha256').update(value).digest('hex').slice(0, 24);
   const lockPaths = [
@@ -1006,19 +1014,22 @@ export function finalizeIngest(
     path.join(runtime.ingestLockDir, `topic-${digest(finalParent)}.lock`),
   ];
   lockPaths.forEach(lockPath => assertSafeRuntimePath(runtime, lockPath));
-  const locks: Array<{ path: string; handle: number }> = [];
+  let vaultLock: OwnedCooperativeLock;
   try {
-    for (const lockPath of lockPaths) {
-      locks.push({ path: lockPath, handle: fs.openSync(lockPath, 'wx', 0o600) });
+    vaultLock = acquireVaultLock(runtime, {
+      operationId: `ingest-${randomUUID()}`,
+      owner: 'ingest',
+    });
+  } catch (error) {
+    if (error instanceof CooperativeLockError && error.code === 'LOCK_HELD') {
+      throw new Error('ingest finalizer is locked or stem is reserved by another operation');
     }
-  } catch {
-    for (const acquired of locks.reverse()) {
-      fs.closeSync(acquired.handle);
-      fs.rmSync(acquired.path, { force: true });
+    if (error instanceof CooperativeLockError && error.code === 'UNSAFE_PATH') {
+      throw new Error(`ME runtime path is unsafe: ${error.code}`);
     }
-    cleanupCreatedDirectories(createdDirectories);
-    throw new Error('ingest finalizer is locked or stem is reserved by another operation');
+    throw error;
   }
+  const locks: Array<{ path: string; handle: number }> = [];
 
   let staging: string | undefined;
   let readmeTemp: string | undefined;
@@ -1028,6 +1039,15 @@ export function finalizeIngest(
   let readmeAttempted = false;
 
   try {
+    createDirectoryTracked(finalParent, createdDirectories);
+    try {
+      for (const lockPath of lockPaths) {
+        locks.push({ path: lockPath, handle: fs.openSync(lockPath, 'wx', 0o600) });
+      }
+    } catch {
+      throw new Error('ingest finalizer is locked or stem is reserved by another operation');
+    }
+
     const files = noteFiles(vaultDir, configuredLayers);
     if (files.some(file => path.basename(file, '.md').toLowerCase() === stem.toLowerCase())) {
       throw new Error(`duplicate stem already exists in vault: ${stem}`);
@@ -1121,12 +1141,16 @@ export function finalizeIngest(
     }
     throw cause;
   } finally {
-    if (readmeTemp) fs.rmSync(readmeTemp, { force: true });
-    if (staging) fs.rmSync(staging, { recursive: true, force: true });
-    for (const acquired of locks.reverse()) {
-      fs.closeSync(acquired.handle);
-      fs.rmSync(acquired.path, { force: true });
+    try {
+      if (readmeTemp) fs.rmSync(readmeTemp, { force: true });
+      if (staging) fs.rmSync(staging, { recursive: true, force: true });
+      for (const acquired of locks.reverse()) {
+        fs.closeSync(acquired.handle);
+        fs.rmSync(acquired.path, { force: true });
+      }
+      cleanupCreatedDirectories(createdDirectories);
+    } finally {
+      releaseVaultLock(runtime, vaultLock);
     }
-    cleanupCreatedDirectories(createdDirectories);
   }
 }

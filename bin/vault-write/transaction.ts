@@ -37,6 +37,13 @@ import {
   RuntimePathError,
   runtimeLexicalDisplayPath,
 } from '../runtime-paths';
+import {
+  acquireVaultLock,
+  CooperativeLockError,
+  releaseVaultLock,
+  type CooperativeLockHooks,
+  type OwnedCooperativeLock,
+} from '../cooperative-lock';
 
 export interface VaultWriteHooks {
   beforeFsMutation?(
@@ -126,12 +133,6 @@ interface OwnedDirectory {
   identity: string;
 }
 
-interface OwnedLock {
-  file: OwnedFile;
-  descriptor: number;
-  closeDescriptor(descriptor: number): void;
-}
-
 interface LockOperations {
   openSync(file: string, flags: string, mode: number): number;
   writeFileSync(descriptor: number, bytes: Buffer): void;
@@ -140,7 +141,6 @@ interface LockOperations {
   fstatSync(descriptor: number): fs.BigIntStats;
   lstatSync(file: string): fs.BigIntStats;
   statSync(file: string): fs.BigIntStats;
-  realpathSync(file: string): string;
   readFileSync(file: string): Buffer;
   closeSync(descriptor: number): void;
 }
@@ -449,7 +449,7 @@ function makeFingerprint(
     layout.meDir,
     layout.transactionDir,
     layout.lockDir,
-    path.join(layout.lockDir, 'vault-write.lock'),
+    path.join(layout.lockDir, 'vault.lock'),
     path.dirname(target.notePath),
     target.notePath,
     target.indexPath,
@@ -1257,163 +1257,6 @@ function lockExists(
   }
 }
 
-function makeLockOperations(options: VaultWriterOptions): LockOperations {
-  return {
-    openSync: options.lockOps?.openSync ?? ((file, flags, mode) => fs.openSync(file, flags, mode)),
-    writeFileSync: options.lockOps?.writeFileSync
-      ?? ((descriptor, bytes) => fs.writeFileSync(descriptor, bytes)),
-    fsyncSync: options.lockOps?.fsyncSync ?? fs.fsyncSync,
-    fchmodSync: options.lockOps?.fchmodSync ?? fs.fchmodSync,
-    fstatSync: options.lockOps?.fstatSync
-      ?? (descriptor => fs.fstatSync(descriptor, { bigint: true })),
-    lstatSync: options.lockOps?.lstatSync ?? (file => fs.lstatSync(file, { bigint: true })),
-    statSync: options.lockOps?.statSync ?? (file => fs.statSync(file, { bigint: true })),
-    realpathSync: options.lockOps?.realpathSync ?? fs.realpathSync,
-    readFileSync: options.lockOps?.readFileSync ?? (file => fs.readFileSync(file)),
-    closeSync: options.lockOps?.closeSync ?? fs.closeSync,
-  };
-}
-
-function captureAcquiredLock(
-  lockPath: string,
-  descriptor: number,
-  expectedBytes: Buffer,
-  operationId: string,
-  lockOps: LockOperations,
-): OwnedFile {
-  const opened = lockOps.fstatSync(descriptor);
-  const entry = lockOps.lstatSync(lockPath);
-  const target = lockOps.statSync(lockPath);
-  const actualBytes = lockOps.readFileSync(lockPath);
-  const parsed = JSON.parse(actualBytes.toString('utf8')) as { operationId?: unknown };
-  if (
-    !opened.isFile()
-    || !entry.isFile()
-    || entry.isSymbolicLink()
-    || !target.isFile()
-    || opened.dev !== entry.dev
-    || opened.ino !== entry.ino
-    || opened.dev !== target.dev
-    || opened.ino !== target.ino
-    || !actualBytes.equals(expectedBytes)
-    || parsed.operationId !== operationId
-  ) {
-    throw new VaultWriterError('RECOVERY_REQUIRED');
-  }
-  return {
-    path: lockPath,
-    identity: JSON.stringify({
-      entry: ownedStatFingerprint(entry),
-      target: ownedStatFingerprint(target),
-      lexicalPath: path.resolve(lockPath),
-    }),
-    sha256: sha256(expectedBytes),
-  };
-}
-
-function failedAcquisitionStillOwned(
-  lockPath: string,
-  descriptor: number,
-  expectedBytes: Buffer,
-  operationId: string,
-): boolean {
-  try {
-    const opened = fs.fstatSync(descriptor, { bigint: true });
-    const entry = fs.lstatSync(lockPath, { bigint: true });
-    const actualBytes = fs.readFileSync(lockPath);
-    const parsed = JSON.parse(actualBytes.toString('utf8')) as { operationId?: unknown };
-    return opened.isFile()
-      && entry.isFile()
-      && !entry.isSymbolicLink()
-      && opened.dev === entry.dev
-      && opened.ino === entry.ino
-      && actualBytes.equals(expectedBytes)
-      && parsed.operationId === operationId;
-  } catch {
-    return false;
-  }
-}
-
-type LockAcquisition =
-  | { lock: OwnedLock }
-  | {
-    error: unknown;
-    opened: boolean;
-    recovery?: VaultWriteRecovery;
-  };
-
-function acquireLock(
-  layout: ResolvedVaultLayout,
-  lockPath: string,
-  operationId: string,
-  options: VaultWriterOptions,
-  operations: FileOperations,
-): LockAcquisition {
-  const bytes = Buffer.from(`${JSON.stringify({
-    version: 1,
-    operationId,
-    startedAt: new Date().toISOString(),
-  })}\n`);
-  const lockOps = makeLockOperations(options);
-  let descriptor: number | undefined;
-  let acquired = false;
-  let failure: unknown;
-  let removed = false;
-  let closed = false;
-  try {
-    descriptor = lockOps.openSync(lockPath, 'wx', 0o600);
-  } catch (error) {
-    return {
-      error: errno(error) === 'EEXIST' ? new VaultWriterError('LOCK_HELD') : error,
-      opened: false,
-    };
-  }
-  try {
-    lockOps.writeFileSync(descriptor, bytes);
-    lockOps.fsyncSync(descriptor);
-    lockOps.fchmodSync(descriptor, 0o600);
-    const file = captureAcquiredLock(lockPath, descriptor, bytes, operationId, lockOps);
-    acquired = true;
-    return { lock: { file, descriptor, closeDescriptor: lockOps.closeSync } };
-  } catch (error) {
-    failure = error;
-    if (failedAcquisitionStillOwned(lockPath, descriptor, bytes, operationId)) {
-      try {
-        options.hooks?.beforeFsMutation?.('unlink', [lockPath]);
-        assertSafeMutationPath(layout, lockPath, 'failed lock acquisition cleanup');
-        if (failedAcquisitionStillOwned(lockPath, descriptor, bytes, operationId)) {
-          operations.unlinkSync(lockPath);
-          removed = true;
-        }
-      } catch {
-        removed = false;
-      }
-    }
-  } finally {
-    if (!acquired && descriptor !== undefined) {
-      try {
-        lockOps.closeSync(descriptor);
-        closed = true;
-      } catch {
-        closed = false;
-      }
-    }
-  }
-  return {
-    error: failure,
-    opened: true,
-    ...(!removed || !closed ? {
-      recovery: recoveryAction(
-        operationId,
-        '<ME_RUNTIME>/locks',
-        'ownership-conflict',
-        ['<ME_RUNTIME>/locks/vault-write.lock'],
-        ['Inspect the failed cooperative-lock acquisition and remove only owned content.'],
-      ),
-    } : {}),
-  };
-}
-
 function makeFileOperations(options: VaultWriterOptions): FileOperations {
   return {
     readdirSync: options.fileOps?.readdirSync ?? fs.readdirSync,
@@ -1467,24 +1310,30 @@ function bootstrapRuntimeRoot(layout: ResolvedVaultLayout): void {
   }
 }
 
+function cooperativeLockHooks(
+  options: VaultWriterOptions,
+  operations: FileOperations,
+): CooperativeLockHooks {
+  return {
+    beforeMutation(kind, lockPath) {
+      if (kind === 'unlink') options.hooks?.beforeFsMutation?.('unlink', [lockPath]);
+    },
+    __operations: {
+      ...options.lockOps,
+      unlinkSync: operations.unlinkSync,
+    },
+  } as CooperativeLockHooks;
+}
+
 function releaseOwnedLockEarly(
   layout: ResolvedVaultLayout,
-  lock: OwnedLock,
+  lock: OwnedCooperativeLock,
   options: VaultWriterOptions,
   operations: FileOperations,
 ): boolean {
-  options.hooks?.beforeLockRelease?.(lock.file.path);
-  try { lock.closeDescriptor(lock.descriptor); } catch { return false; }
-  if (!sameOwnedFile(lock.file)) return false;
-  options.hooks?.beforeFsMutation?.('unlink', [lock.file.path]);
+  options.hooks?.beforeLockRelease?.(lock.path);
   try {
-    assertSafeMutationPath(layout, lock.file.path, 'lock release');
-  } catch {
-    return false;
-  }
-  if (!sameOwnedFile(lock.file)) return false;
-  try {
-    operations.unlinkSync(lock.file.path);
+    releaseVaultLock(layout, lock, cooperativeLockHooks(options, operations));
     return true;
   } catch {
     return false;
@@ -1589,8 +1438,8 @@ export function executeVaultWrite(
 
   const operations = makeFileOperations(options);
   const layout = minimalLayout;
-  const lockPath = path.join(layout.lockDir, 'vault-write.lock');
-  let lockOwned: OwnedLock | undefined;
+  const lockPath = path.join(layout.lockDir, 'vault.lock');
+  let lockOwned: OwnedCooperativeLock | undefined;
   try {
     bootstrapRuntimeRoot(layout);
     bootstrapDirectory(layout, layout.lockDir, options, operations);
@@ -1609,31 +1458,45 @@ export function executeVaultWrite(
         startupRecoveries,
       );
     }
-    const acquisition = acquireLock(layout, lockPath, operationId, options, operations);
-    if ('error' in acquisition) {
-      if (acquisition.error instanceof VaultWriterError
-        && acquisition.error.code === 'LOCK_HELD') {
-        return codeResult(operationId, digest, 'LOCK_HELD');
-      }
-      const racedRecoveries = acquisition.opened ? scanRecoveries(layout, operations) : [];
-      const recoveries = [
-        ...racedRecoveries,
-        ...(acquisition.recovery ? [acquisition.recovery] : []),
-      ];
-      if (recoveries.length > 0) {
-        return codeResult(
-          operationId,
-          digest,
-          acquisition.recovery ? 'RECOVERY_REQUIRED' : 'INCOMPLETE_OPERATION',
-          'none',
-          recoveries,
-        );
-      }
-      return codeResult(operationId, digest, errorCode(acquisition.error, false));
-    }
-    lockOwned = acquisition.lock;
+    lockOwned = acquireVaultLock(
+      layout,
+      { operationId, owner: 'vault-write' },
+      cooperativeLockHooks(options, operations),
+    );
   } catch (error) {
     if (lockOwned) releaseOwnedLockEarly(layout, lockOwned, options, operations);
+    if (error instanceof CooperativeLockError && error.code === 'LOCK_HELD') {
+      return codeResult(operationId, digest, 'LOCK_HELD');
+    }
+    const racedRecoveries = scanRecoveries(layout, operations);
+    if (error instanceof CooperativeLockError && error.code === 'RECOVERY_REQUIRED') {
+      const recovery = recoveryAction(
+        operationId,
+        '<ME_RUNTIME>/locks',
+        'ownership-conflict',
+        ['<ME_RUNTIME>/locks/vault.lock'],
+        ['Inspect the failed cooperative-lock acquisition and remove only owned content.'],
+      );
+      return codeResult(
+        operationId,
+        digest,
+        'RECOVERY_REQUIRED',
+        'none',
+        [...racedRecoveries, recovery],
+      );
+    }
+    if (racedRecoveries.length > 0) {
+      return codeResult(
+        operationId,
+        digest,
+        'INCOMPLETE_OPERATION',
+        'none',
+        racedRecoveries,
+      );
+    }
+    if (error instanceof CooperativeLockError && error.code === 'UNSAFE_PATH') {
+      return codeResult(operationId, digest, 'UNSAFE_PATH');
+    }
     return codeResult(operationId, digest, errorCode(error, false));
   }
 
@@ -1648,7 +1511,7 @@ export function executeVaultWrite(
         operationId,
         '<ME_RUNTIME>/transactions',
         'ownership-conflict',
-        ['<ME_RUNTIME>/locks/vault-write.lock'],
+        ['<ME_RUNTIME>/locks/vault.lock'],
         ['Inspect the changed cooperative lock.'],
       );
       return codeResult(
@@ -2126,20 +1989,9 @@ export function executeVaultWrite(
         }
         tx.closeJournal();
       }
-      let lockDescriptorClosed = false;
       try {
-        lockOwned.closeDescriptor(lockOwned.descriptor);
-        lockDescriptorClosed = true;
+        releaseVaultLock(layout, lockOwned, cooperativeLockHooks(options, operations));
       } catch {
-        lockReleaseConflict = true;
-        markPreserved(lockPath, 'Inspect the lock whose acquisition descriptor could not close.');
-      }
-      if (lockDescriptorClosed && sameOwnedFile(lockOwned.file)) {
-        try { tx.unlink(lockOwned.file); } catch {
-          lockReleaseConflict = true;
-          markPreserved(lockPath, 'Remove the lock only if it still belongs to this operation.');
-        }
-      } else if (lockDescriptorClosed) {
         lockReleaseConflict = true;
         markPreserved(lockPath, 'Inspect the changed lock before removing it.');
       }

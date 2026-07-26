@@ -524,7 +524,7 @@ describe('vault-write CLI JSON boundary', () => {
     expect(fs.existsSync(journalPath!)).toBeTrue();
 
     const layout = resolveVaultLayout(vault);
-    const staleLock = path.join(layout.lockDir, 'vault-write.lock');
+    const staleLock = path.join(layout.lockDir, 'vault.lock');
     if (fs.existsSync(staleLock)) fs.unlinkSync(staleLock);
     const recovery = invoke(['write', '--vault-dir', vault], JSON.stringify(request()));
     const body = expectPublicFailure(recovery, 'INCOMPLETE_OPERATION');
@@ -595,7 +595,7 @@ describe('vault-write CLI JSON boundary', () => {
     expect(fs.existsSync(path.join(operationDirectory!, 'journal.json'))).toBeFalse();
 
     const layout = resolveVaultLayout(vault);
-    const staleLock = path.join(layout.lockDir, 'vault-write.lock');
+    const staleLock = path.join(layout.lockDir, 'vault.lock');
     if (fs.existsSync(staleLock)) fs.unlinkSync(staleLock);
     const recovery = invoke(['write', '--vault-dir', vault], JSON.stringify(request()));
     const body = expectPublicFailure(recovery, 'INCOMPLETE_OPERATION');

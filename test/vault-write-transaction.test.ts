@@ -7,6 +7,10 @@ import {
   executeVaultWrite,
   type VaultWriteHooks,
 } from '../bin/vault-write/transaction.ts';
+import {
+  acquireVaultLock,
+  releaseVaultLock,
+} from '../bin/cooperative-lock.ts';
 import type { VaultWriteRequestV1 } from '../bin/vault-write/contracts.ts';
 import { resolveVaultLayout } from '../bin/vault-write/path-safety.ts';
 import { bootstrapRuntimeDirectories } from '../bin/runtime-paths.ts';
@@ -47,7 +51,7 @@ function transactionRoot(vault: string): string {
 }
 
 function writerLockPath(vault: string): string {
-  return path.join(resolveVaultLayout(vault).lockDir, 'vault-write.lock');
+  return path.join(resolveVaultLayout(vault).lockDir, 'vault.lock');
 }
 
 function prepareRuntime(vault: string): ReturnType<typeof resolveVaultLayout> {
@@ -233,7 +237,7 @@ describe('lock precedence and operation discovery', () => {
     const vault = makeVault();
     const layout = prepareRuntime(vault);
     fs.mkdirSync(path.join(layout.transactionDir, 'vault-write-old'), { recursive: true });
-    fs.writeFileSync(path.join(layout.lockDir, 'vault-write.lock'), 'foreign');
+    fs.writeFileSync(path.join(layout.lockDir, 'vault.lock'), 'foreign');
     fs.writeFileSync(path.join(layout.transactionDir, 'vault-write-old/journal.json'), '{bad');
 
     const result = write(vault);
@@ -614,7 +618,7 @@ describe('lock precedence and operation discovery', () => {
     expect(fs.existsSync(lockPath)).toBeTrue();
     expect(unlinks).not.toContain(lockPath);
     expect(result.recoveries.flatMap(item => item.preservedPaths))
-      .toContain('<ME_RUNTIME>/locks/vault-write.lock');
+      .toContain('<ME_RUNTIME>/locks/vault.lock');
   });
 
   test('a nested cooperative writer observes LOCK_HELD while the owner completes', () => {
@@ -630,12 +634,33 @@ describe('lock precedence and operation discovery', () => {
     expect(outer.status).toBe('committed');
   });
 
+  test('a me-update owner blocks vault-write without publishing content', () => {
+    const vault = makeVault();
+    const layout = prepareRuntime(vault);
+    const lock = acquireVaultLock(layout, {
+      operationId: 'update-in-progress',
+      owner: 'me-update',
+    });
+
+    try {
+      const result = write(vault);
+      expect(result.status).toBe('conflict');
+      expect(result.error?.code).toBe('LOCK_HELD');
+      expect(fs.existsSync(path.join(
+        vault,
+        'practices/decisions/2026-07-26-orchid-choice.md',
+      ))).toBeFalse();
+    } finally {
+      releaseVaultLock(layout, lock);
+    }
+  });
+
   test('LOCK_HELD precedes schema, target, graph, and recovery planning failures', () => {
     const vault = makeVault();
     const layout = prepareRuntime(vault);
     fs.mkdirSync(path.join(layout.transactionDir, 'vault-write-bad'), { recursive: true });
     fs.writeFileSync(path.join(layout.transactionDir, 'vault-write-bad/journal.json'), '{bad');
-    fs.writeFileSync(path.join(layout.lockDir, 'vault-write.lock'), 'foreign lock');
+    fs.writeFileSync(path.join(layout.lockDir, 'vault.lock'), 'foreign lock');
     fs.writeFileSync(path.join(vault, 'SCHEMA.md'), 'unsupported schema');
     fs.mkdirSync(path.join(
       vault,
