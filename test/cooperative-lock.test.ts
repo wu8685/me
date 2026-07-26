@@ -5,6 +5,7 @@ import * as path from 'path';
 import {
   acquireVaultLock,
   releaseVaultLock,
+  type CooperativeLockHooks,
 } from '../bin/cooperative-lock.ts';
 import {
   bootstrapRuntimeDirectories,
@@ -101,6 +102,75 @@ describe('vault-wide cooperative lock', () => {
     fs.writeFileSync(lock.path, bytes, { mode: 0o600 });
 
     expect(() => releaseVaultLock(layout, lock)).toThrow(/RECOVERY_REQUIRED/);
+    expect(fs.existsSync(lock.path)).toBeTrue();
+  });
+
+  test('preserves a foreign replacement inserted during the final ownership read', () => {
+    const layout = preparedRuntime();
+    let releaseStarted = false;
+    let replacementInserted = false;
+    let descriptorOpenAtMutation = false;
+    let lockDescriptor = -1;
+    const hooks = {
+      beforeMutation(kind: 'create' | 'unlink') {
+        if (kind !== 'unlink') return;
+        releaseStarted = true;
+        try {
+          fs.fstatSync(lockDescriptor);
+          descriptorOpenAtMutation = true;
+        } catch {
+          descriptorOpenAtMutation = false;
+        }
+      },
+      __operations: {
+        readFileSync(candidate: string) {
+          const bytes = fs.readFileSync(candidate);
+          if (releaseStarted && !replacementInserted) {
+            replacementInserted = true;
+            fs.unlinkSync(candidate);
+            fs.writeFileSync(candidate, 'foreign replacement');
+          }
+          return bytes;
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: { readFileSync(candidate: string): Buffer };
+    };
+    const lock = acquireVaultLock(layout, {
+      operationId: 'owned',
+      owner: 'vault-write',
+    }, hooks);
+    lockDescriptor = lock.descriptor;
+
+    expect(() => releaseVaultLock(layout, lock, hooks)).toThrow(/RECOVERY_REQUIRED/);
+    expect(descriptorOpenAtMutation).toBeTrue();
+    expect(fs.readFileSync(lock.path, 'utf8')).toBe('foreign replacement');
+    expect(() => fs.fstatSync(lockDescriptor)).toThrow();
+    const preservedFiles: string[] = [];
+    const walk = (directory: string): void => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const candidate = path.join(directory, entry.name);
+        if (entry.isDirectory()) walk(candidate);
+        else preservedFiles.push(candidate);
+      }
+    };
+    walk(layout.lockDir);
+    expect(preservedFiles.some(candidate =>
+      fs.readFileSync(candidate, 'utf8') === 'foreign replacement')).toBeTrue();
+  });
+
+  test('normalizes an unlink hook failure and preserves the lock', () => {
+    const layout = preparedRuntime();
+    const lock = acquireVaultLock(layout, {
+      operationId: 'owned',
+      owner: 'ingest',
+    });
+
+    expect(() => releaseVaultLock(layout, lock, {
+      beforeMutation(kind) {
+        if (kind === 'unlink') throw new Error('injected unlink hook failure');
+      },
+    })).toThrow(/RECOVERY_REQUIRED/);
     expect(fs.existsSync(lock.path)).toBeTrue();
   });
 });

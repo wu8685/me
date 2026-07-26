@@ -44,7 +44,11 @@ interface CooperativeLockOperations {
   statSync(file: string): fs.BigIntStats;
   readFileSync(file: string): Buffer;
   closeSync(descriptor: number): void;
+  mkdtempSync(prefix: string): string;
+  renameSync(source: string, destination: string): void;
+  linkSync(existingPath: string, newPath: string): void;
   unlinkSync(file: string): void;
+  rmdirSync(directory: string): void;
 }
 
 interface InternalCooperativeLockHooks extends CooperativeLockHooks {
@@ -86,7 +90,11 @@ function operationsFor(hooks?: CooperativeLockHooks): CooperativeLockOperations 
       ?? (file => fs.statSync(file, { bigint: true })),
     readFileSync: injected?.readFileSync ?? (file => fs.readFileSync(file)),
     closeSync: injected?.closeSync ?? fs.closeSync,
+    mkdtempSync: injected?.mkdtempSync ?? fs.mkdtempSync,
+    renameSync: injected?.renameSync ?? fs.renameSync,
+    linkSync: injected?.linkSync ?? fs.linkSync,
     unlinkSync: injected?.unlinkSync ?? fs.unlinkSync,
+    rmdirSync: injected?.rmdirSync ?? fs.rmdirSync,
   };
 }
 
@@ -177,12 +185,13 @@ function validateAcquiredLock(
 function assertReleaseOwnership(
   lock: OwnedCooperativeLock,
   state: CooperativeLockState,
+  candidate: string = lock.path,
 ): boolean {
   try {
     const opened = state.operations.fstatSync(lock.descriptor);
-    const entry = state.operations.lstatSync(lock.path);
-    const target = state.operations.statSync(lock.path);
-    const actualBytes = state.operations.readFileSync(lock.path);
+    const entry = state.operations.lstatSync(candidate);
+    const target = state.operations.statSync(candidate);
+    const actualBytes = state.operations.readFileSync(candidate);
     return opened.isFile()
       && entry.isFile()
       && !entry.isSymbolicLink()
@@ -209,11 +218,12 @@ function assertReleaseOwnership(
 function assertPathOwnershipAfterClose(
   lock: OwnedCooperativeLock,
   state: CooperativeLockState,
+  candidate: string = lock.path,
 ): boolean {
   try {
-    const entry = state.operations.lstatSync(lock.path);
-    const target = state.operations.statSync(lock.path);
-    const actualBytes = state.operations.readFileSync(lock.path);
+    const entry = state.operations.lstatSync(candidate);
+    const target = state.operations.statSync(candidate);
+    const actualBytes = state.operations.readFileSync(candidate);
     return entry.isFile()
       && !entry.isSymbolicLink()
       && target.isFile()
@@ -318,41 +328,80 @@ export function releaseVaultLock(
 ): void {
   const expectedPath = path.join(layout.lockDir, 'vault.lock');
   const state = lockStates.get(lock);
-  if (
-    !state
-    || path.resolve(lock.path) !== path.resolve(expectedPath)
-    || !assertReleaseOwnership(lock, state)
-  ) {
-    if (state) {
+  if (!state) throw new CooperativeLockError('RECOVERY_REQUIRED');
+
+  let quarantineDirectory: string | undefined;
+  let quarantinePath: string | undefined;
+  let movedToQuarantine = false;
+  let quarantineUnlinked = false;
+  let descriptorCloseAttempted = false;
+  try {
+    if (
+      path.resolve(lock.path) !== path.resolve(expectedPath)
+      || !assertReleaseOwnership(lock, state)
+    ) {
+      throw new CooperativeLockError('RECOVERY_REQUIRED');
+    }
+
+    hooks?.beforeMutation?.('unlink', lock.path);
+    safeRuntimeMutation(layout, lock.path);
+    quarantineDirectory = state.operations.mkdtempSync(
+      path.join(layout.lockDir, '.vault-lock-release-'),
+    );
+    quarantinePath = path.join(quarantineDirectory, 'vault.lock');
+    safeRuntimeMutation(layout, quarantineDirectory);
+    safeRuntimeMutation(layout, quarantinePath);
+
+    /*
+     * Move the pathname out of the cooperative namespace atomically before
+     * inspecting it again. A replacement raced into vault.lock is moved, not
+     * deleted, and is retained in the private quarantine on mismatch.
+     */
+    state.operations.renameSync(lock.path, quarantinePath);
+    movedToQuarantine = true;
+    if (!assertReleaseOwnership(lock, state, quarantinePath)) {
+      throw new CooperativeLockError('RECOVERY_REQUIRED');
+    }
+
+    /*
+     * The descriptor remains open through the pathname mutation. It can be
+     * closed after the rename while the quarantined inode is still available
+     * as recovery material if close or final verification fails.
+     */
+    descriptorCloseAttempted = true;
+    state.operations.closeSync(lock.descriptor);
+    if (!assertPathOwnershipAfterClose(lock, state, quarantinePath)) {
+      throw new CooperativeLockError('RECOVERY_REQUIRED');
+    }
+    state.operations.unlinkSync(quarantinePath);
+    quarantineUnlinked = true;
+    try {
+      state.operations.rmdirSync(quarantineDirectory);
+    } catch {
+      // The lock is fully released; an empty private directory is harmless.
+    }
+  } catch {
+    if (!descriptorCloseAttempted) {
+      descriptorCloseAttempted = true;
       try {
         state.operations.closeSync(lock.descriptor);
       } catch {
-        // The lock remains recovery material either way.
+        // Preserve the path or quarantine as recovery material.
       }
-      lockStates.delete(lock);
     }
-    throw new CooperativeLockError('RECOVERY_REQUIRED');
-  }
-
-  try {
-    state.operations.closeSync(lock.descriptor);
-  } catch {
+    if (movedToQuarantine && !quarantineUnlinked && quarantinePath) {
+      try {
+        /*
+         * linkSync is no-clobber. Keeping both names makes the raced inode
+         * discoverable at vault.lock without risking deletion of quarantine.
+         */
+        state.operations.linkSync(quarantinePath, lock.path);
+      } catch {
+        // The quarantine path remains the recovery artifact.
+      }
+    }
     lockStates.delete(lock);
     throw new CooperativeLockError('RECOVERY_REQUIRED');
   }
   lockStates.delete(lock);
-
-  if (!assertPathOwnershipAfterClose(lock, state)) {
-    throw new CooperativeLockError('RECOVERY_REQUIRED');
-  }
-  hooks?.beforeMutation?.('unlink', lock.path);
-  safeRuntimeMutation(layout, lock.path);
-  if (!assertPathOwnershipAfterClose(lock, state)) {
-    throw new CooperativeLockError('RECOVERY_REQUIRED');
-  }
-  try {
-    state.operations.unlinkSync(lock.path);
-  } catch {
-    throw new CooperativeLockError('RECOVERY_REQUIRED');
-  }
 }

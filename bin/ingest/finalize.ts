@@ -61,6 +61,12 @@ export interface FinalizeFileOperations {
   renameSync(source: fs.PathLike, destination: fs.PathLike): void;
   beforeArtifactPublish?(destination: string): void;
   beforeReadmeCompare?(readmePath: string): void;
+  /** Test-only injection for final cleanup failure coverage. */
+  cleanupOps?: Partial<{
+    closeSync: typeof fs.closeSync;
+    rmSync: typeof fs.rmSync;
+    rmdirSync: typeof fs.rmdirSync;
+  }>;
 }
 
 interface PlannedAsset {
@@ -199,16 +205,21 @@ function createDirectoryTracked(directory: string, created: string[]): void {
   created.push(directory);
 }
 
-function cleanupCreatedDirectories(created: string[]): void {
+function cleanupCreatedDirectories(
+  created: string[],
+  rmdirSync: typeof fs.rmdirSync = fs.rmdirSync,
+): unknown[] {
+  const failures: unknown[] = [];
   for (const directory of [...created].reverse()) {
     try {
       if (fs.existsSync(directory) && fs.statSync(directory).isDirectory() && fs.readdirSync(directory).length === 0) {
-        fs.rmdirSync(directory);
+        rmdirSync(directory);
       }
-    } catch {
-      // Best-effort cleanup must never hide the original failure.
+    } catch (error) {
+      failures.push(error);
     }
   }
+  return failures;
 }
 
 function trustedRoots(input: FinalizeInput, vaultDir: string): TrustedRoot[] {
@@ -1141,16 +1152,51 @@ export function finalizeIngest(
     }
     throw cause;
   } finally {
-    try {
-      if (readmeTemp) fs.rmSync(readmeTemp, { force: true });
-      if (staging) fs.rmSync(staging, { recursive: true, force: true });
-      for (const acquired of locks.reverse()) {
-        fs.closeSync(acquired.handle);
-        fs.rmSync(acquired.path, { force: true });
+    const cleanupFailures: unknown[] = [];
+    const cleanupOps = {
+      closeSync: fileOperations.cleanupOps?.closeSync ?? fs.closeSync,
+      rmSync: fileOperations.cleanupOps?.rmSync ?? fs.rmSync,
+      rmdirSync: fileOperations.cleanupOps?.rmdirSync ?? fs.rmdirSync,
+    };
+    const attempt = (cleanup: () => void): boolean => {
+      try {
+        cleanup();
+        return true;
+      } catch (error) {
+        cleanupFailures.push(error);
+        return false;
       }
-      cleanupCreatedDirectories(createdDirectories);
-    } finally {
+    };
+
+    if (readmeTemp) attempt(() => cleanupOps.rmSync(readmeTemp, { force: true }));
+    if (staging) {
+      attempt(() => cleanupOps.rmSync(staging, { recursive: true, force: true }));
+    }
+    for (const acquired of locks.reverse()) {
+      const closed = attempt(() => cleanupOps.closeSync(acquired.handle));
+      if (closed) attempt(() => cleanupOps.rmSync(acquired.path, { force: true }));
+    }
+    cleanupFailures.push(...cleanupCreatedDirectories(
+      createdDirectories,
+      cleanupOps.rmdirSync,
+    ));
+
+    if (cleanupFailures.length === 0) {
       releaseVaultLock(runtime, vaultLock);
+    } else {
+      /*
+       * Keep vault.lock as recovery material so no other ME writer can enter
+       * while operation-specific locks or staging state remain ambiguous.
+       */
+      try {
+        fs.closeSync(vaultLock.descriptor);
+      } catch {
+        // The preserved vault.lock remains the authoritative blocker.
+      }
+      throw new Error(
+        `manual recovery required: ingest cleanup incomplete; `
+        + `${cleanupFailures.length} cleanup operation(s) failed and vault.lock was preserved`,
+      );
     }
   }
 }

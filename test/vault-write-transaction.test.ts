@@ -588,7 +588,7 @@ describe('lock precedence and operation discovery', () => {
       .toBe('foreign lock bytes');
   });
 
-  test('a final lock descriptor close failure preserves the lock and skips unlink', () => {
+  test('a final lock descriptor close failure preserves the lock after entering release mutation', () => {
     const vault = makeVault();
     const lockPath = writerLockPath(vault);
     const unlinks: string[] = [];
@@ -616,7 +616,7 @@ describe('lock precedence and operation discovery', () => {
     expect(result.status).toBe('manual_recovery');
     expect(result.error?.code).toBe('RECOVERY_REQUIRED');
     expect(fs.existsSync(lockPath)).toBeTrue();
-    expect(unlinks).not.toContain(lockPath);
+    expect(unlinks).toContain(lockPath);
     expect(result.recoveries.flatMap(item => item.preservedPaths))
       .toContain('<ME_RUNTIME>/locks/vault.lock');
   });

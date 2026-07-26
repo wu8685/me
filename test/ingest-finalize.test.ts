@@ -461,6 +461,72 @@ describe('finalizeIngest', () => {
     }
   });
 
+  test('cleans later operation locks best-effort and preserves vault.lock on cleanup failure', () => {
+    const vault = makeVault();
+    const runtime = resolveRuntimeLayout(vault);
+    const cleanupAttempts: string[] = [];
+
+    expect(() => finalizeIngest(validArticleInput(vault), {
+      beforeArtifactPublish() {
+        throw new Error('stop before publish');
+      },
+      cleanupOps: {
+        rmSync(candidate, options) {
+          const target = candidate.toString();
+          if (
+            path.dirname(target) === runtime.ingestLockDir
+            && target.endsWith('.lock')
+          ) {
+            cleanupAttempts.push(target);
+            if (cleanupAttempts.length === 1) {
+              throw new Error('injected operation-lock cleanup failure');
+            }
+          }
+          fs.rmSync(candidate, options);
+        },
+      },
+      renameSync: fs.renameSync,
+    })).toThrow(/recovery|required|cleanup/i);
+
+    expect(cleanupAttempts).toHaveLength(2);
+    expect(fs.readdirSync(runtime.ingestLockDir).filter(name => name.endsWith('.lock')))
+      .toHaveLength(1);
+    expect(fs.existsSync(path.join(runtime.lockDir, 'vault.lock'))).toBeTrue();
+    expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+  });
+
+  test('preserves vault.lock when staging cleanup is incomplete', () => {
+    const vault = makeVault();
+    const runtime = resolveRuntimeLayout(vault);
+    let stagingCleanupFailed = false;
+
+    expect(() => finalizeIngest(validArticleInput(vault), {
+      beforeArtifactPublish() {
+        throw new Error('stop before publish');
+      },
+      cleanupOps: {
+        rmSync(candidate, options) {
+          const target = candidate.toString();
+          if (
+            target.startsWith(`${runtime.ingestStagingDir}${path.sep}artifact-`)
+            && options?.recursive
+          ) {
+            stagingCleanupFailed = true;
+            throw new Error('injected staging cleanup failure');
+          }
+          fs.rmSync(candidate, options);
+        },
+      },
+      renameSync: fs.renameSync,
+    })).toThrow(/recovery|required|cleanup/i);
+
+    expect(stagingCleanupFailed).toBeTrue();
+    expect(fs.existsSync(path.join(runtime.lockDir, 'vault.lock'))).toBeTrue();
+    expect(fs.readdirSync(runtime.ingestStagingDir)
+      .some(name => name.startsWith('artifact-'))).toBeTrue();
+    expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+  });
+
   test('reserves a stem vault-wide across concurrent topics', () => {
     const vault = makeVault();
     const otherTopic = validArticleInput(vault);
