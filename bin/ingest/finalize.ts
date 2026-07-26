@@ -848,10 +848,15 @@ function legacyIngestState(vaultDir: string, layerDirectories: string[]): string
   ]) {
     const directory = path.join(vaultDir, ...relative);
     assertSafeVaultPath(vaultDir, directory, 'legacy runtime path');
-    if (!fs.existsSync(directory)) continue;
-    const stat = fs.lstatSync(directory);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(directory);
+    } catch (error) {
+      if ((error as { code?: string }).code === 'ENOENT') continue;
+      throw new Error('legacy runtime state requires inspection');
+    }
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
-      throw new Error('legacy ME runtime state requires manual recovery');
+      throw new Error('legacy runtime state requires inspection');
     }
     if (fs.readdirSync(directory).length > 0) {
       found.push(path.relative(vaultDir, directory));
@@ -957,7 +962,7 @@ export function finalizeIngest(
   const legacyState = legacyIngestState(vaultDir, configuredLayers);
   if (legacyState.length > 0) {
     throw new Error(
-      `legacy ME runtime state requires manual recovery: ${legacyState.join(', ')}`,
+      `legacy runtime state requires inspection: ${legacyState.join(', ')}`,
     );
   }
 

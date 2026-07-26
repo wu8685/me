@@ -965,6 +965,23 @@ describe('finalizeIngest', () => {
     },
   );
 
+  test.each(['tmp', 'locks', 'ingest-reservations'] as const)(
+    'blocks a dangling legacy .me/%s symlink before external runtime mutation',
+    directory => {
+      const vault = makeVault();
+      fs.symlinkSync(
+        path.join(path.dirname(vault), `missing-${directory}`),
+        path.join(vault, '.me', directory),
+      );
+      const runtime = resolveRuntimeLayout(vault, {});
+
+      expect(() => finalizeIngest(validArticleInput(vault)))
+        .toThrow(/legacy.*runtime state|manual recovery/i);
+      expect(fs.existsSync(runtime.runtimeBase)).toBeFalse();
+      expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+    },
+  );
+
   test('returns related notes, backlinks, and unlinked mentions without editing notes', () => {
     const vault = makeVault();
     const raw = path.join(vault, 'knowledge/raw');
