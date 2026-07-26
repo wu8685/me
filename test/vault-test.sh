@@ -170,8 +170,55 @@ test_vault_writer_public_binary() {
   assert_file_exists "$PLUGIN_ROOT/bin/vault-write.ts" || return 1
   node -e '
     const p=require(process.argv[1]);
-    if (p.bin["vault-write"] !== "bun run bin/vault-write.ts") process.exit(1)
+    if (p.bin["vault-write"] !== "bin/vault-write.ts") process.exit(1)
   ' "$PLUGIN_ROOT/package.json" || return 1
+  if [ ! -x "$PLUGIN_ROOT/bin/vault-write.ts" ]; then
+    echo -e "    ${RED}FAIL${NC}: vault-write entrypoint is not executable"
+    return 1
+  fi
+
+  local pack_dir install_dir tarball binary result
+  pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-pack.XXXXXX")
+  install_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-install.XXXXXX")
+  tarball=$(npm pack --silent --pack-destination "$pack_dir" "$PLUGIN_ROOT") || return 1
+  npm install --silent --ignore-scripts --prefix "$install_dir" \
+    "$pack_dir/$tarball" || return 1
+  binary="$install_dir/node_modules/.bin/vault-write"
+  if [ ! -x "$binary" ]; then
+    echo -e "    ${RED}FAIL${NC}: packed vault-write binary is not executable"
+    return 1
+  fi
+
+  mkdir -p "$MOCK_VAULT/.me" "$MOCK_VAULT/raw" \
+    "$MOCK_VAULT/practices" "$MOCK_VAULT/cognition"
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+  echo '# Source' > "$MOCK_VAULT/raw/source.md"
+  result=$(node -e '
+    process.stdout.write(JSON.stringify({
+      version: 1,
+      layer: "practices",
+      relativePath: "decisions/2026-07-26-packed-preview.md",
+      markdown: [
+        "---",
+        "title: Packed Preview",
+        "created: 2026-07-26",
+        "tags: [decision]",
+        "type: reflection",
+        "source: \"[[raw/source]]\"",
+        "project: \"\"",
+        "---",
+        "",
+        "# Preview",
+        ""
+      ].join("\n"),
+      index: { mode: "auto" }
+    }));
+  ' | "$binary" preview --vault-dir "$MOCK_VAULT") || return 1
+  node -e '
+    const result=JSON.parse(process.argv[1]);
+    if (result.status !== "preview") process.exit(1);
+  ' "$result" || return 1
+  rm -rf "$pack_dir" "$install_dir"
 
   local public_writer_paths=(
     "$PLUGIN_ROOT/bin/vault-write.ts"

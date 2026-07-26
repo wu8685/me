@@ -250,7 +250,12 @@ function ownedFileIdentity(file: string): string {
   return JSON.stringify({
     entry: ownedStatFingerprint(entry),
     target: ownedStatFingerprint(target),
-    canonicalPath: fs.realpathSync(file),
+    /*
+     * Do not use realpath here. On APFS, realpath of a hard-linked inode can
+     * transiently report another link to that inode. The lexical pathname is
+     * stable, while entry/target dev+ino still prove which inode it names.
+     */
+    lexicalPath: path.resolve(file),
   });
 }
 
@@ -502,6 +507,7 @@ function codeResult(
   plannedPaths: string[] = [],
 ): VaultWriteResultV1 {
   const definition = WRITER_ERROR_CATALOG[code];
+  const publicRecoveries = recoveries.map(publicRecovery);
   return {
     version: 1,
     status: definition.status,
@@ -515,8 +521,8 @@ function codeResult(
     unlinkedMentions: [],
     warnings: [],
     error: { code, message: definition.message },
-    recoveryState: recoveries.length === 0 ? 'none' : 'incomplete',
-    recoveries,
+    recoveryState: publicRecoveries.length === 0 ? 'none' : 'incomplete',
+    recoveries: publicRecoveries,
   };
 }
 
@@ -565,6 +571,45 @@ function recoveryAction(
         condition: 'Inspect preserved content before taking any recovery action.',
       },
     ],
+  };
+}
+
+const PUBLIC_OPERATION_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function publicRecovery(recovery: VaultWriteRecovery): VaultWriteRecovery {
+  const generatedDirectory = `.me/tmp/vault-write-${recovery.operationId}`;
+  const trustedDirectory = recovery.directory === '.me/tmp'
+    || recovery.directory === '.me/locks'
+    || recovery.directory === generatedDirectory;
+  const trustedJournal = recovery.journal === undefined
+    || (
+      recovery.directory === generatedDirectory
+      && recovery.journal === `${generatedDirectory}/journal.json`
+    );
+  if (
+    PUBLIC_OPERATION_ID.test(recovery.operationId)
+    && trustedDirectory
+    && trustedJournal
+  ) return recovery;
+  const operationId =
+    `recovery-${sha256(Buffer.from(JSON.stringify(recovery), 'utf8')).slice(0, 12)}`;
+  const directory = recovery.directory.startsWith('.me/locks')
+    ? '.me/locks'
+    : '.me/tmp';
+  return {
+    operationId,
+    state: recovery.state,
+    directory,
+    preservedPaths: [directory],
+    remainingMutations: recovery.remainingMutations.length === 0
+      ? []
+      : ['Inspect local recovery state for this operation.'],
+    actions: [{
+      kind: 'inspect',
+      path: directory,
+      condition: 'Inspect local recovery state using the opaque recovery identifier.',
+    }],
   };
 }
 
@@ -685,7 +730,7 @@ function scanRecoveries(
   const candidates: Candidate[] = [];
   for (const name of names) {
     const directory = path.join(layout.tmpDir, name);
-    const relativeDirectory = vaultRelative(layout, directory);
+    const relativeDirectory = `.me/tmp/${name}`;
     const fallbackId = name.slice('vault-write-'.length) || 'unrecognized';
     let stat: fs.Stats;
     try {
@@ -1212,7 +1257,7 @@ function captureAcquiredLock(
     identity: JSON.stringify({
       entry: ownedStatFingerprint(entry),
       target: ownedStatFingerprint(target),
-      canonicalPath: lockOps.realpathSync(lockPath),
+      lexicalPath: path.resolve(lockPath),
     }),
     sha256: sha256(expectedBytes),
   };

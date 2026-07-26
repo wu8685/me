@@ -5,10 +5,15 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   WRITER_ERROR_CATALOG,
+  VaultWriterError,
   type VaultWriteResultV1,
   type VaultWriteRequestV1,
 } from '../bin/vault-write/contracts.ts';
-import { exitCodeForResult } from '../bin/vault-write.ts';
+import {
+  exitCodeForResult,
+  readContainedRequestFile,
+  readLimitedRequest,
+} from '../bin/vault-write.ts';
 
 const pluginRoot = path.resolve(import.meta.dir, '..');
 const cli = path.join(pluginRoot, 'bin/vault-write.ts');
@@ -64,12 +69,13 @@ function request(
 function invoke(
   args: string[],
   input: string | Buffer = '',
+  environment: NodeJS.ProcessEnv = {},
 ) {
   return spawnSync('bun', ['run', cli, ...args], {
     cwd: pluginRoot,
     input,
     encoding: null,
-    env: process.env,
+    env: { ...process.env, ...environment },
   });
 }
 
@@ -203,14 +209,11 @@ describe('vault-write CLI JSON boundary', () => {
     const recoveries = body.recoveries as Array<Record<string, unknown>>;
 
     expect(recoveries).toHaveLength(3);
-    expect(recoveries.map(item => item.operationId).sort()).toEqual([
-      'first',
-      'second',
-      'third',
-    ]);
-    expect(recoveries.filter(item => item.journal === undefined)).toHaveLength(2);
+    expect(new Set(recoveries.map(item => item.operationId)).size).toBe(3);
+    expect(recoveries.filter(item => item.journal === undefined)).toHaveLength(3);
     for (const recovery of recoveries) {
-      expect(recovery.directory).toBe(`.me/tmp/vault-write-${recovery.operationId}`);
+      expect(recovery.operationId).toMatch(/^recovery-[a-f0-9]{12}$/);
+      expect(recovery.directory).toBe('.me/tmp');
       expect(JSON.stringify(recovery)).not.toContain(vault);
       expect(JSON.stringify(recovery)).not.toContain('\\');
     }
@@ -269,6 +272,47 @@ describe('vault-write CLI JSON boundary', () => {
     }
   });
 
+  test('reads a request from one no-follow descriptor and rejects a checked-path replacement', () => {
+    const vault = makeVault();
+    fs.mkdirSync(path.join(vault, '.me/tmp'));
+    const requestPath = path.join(vault, '.me/tmp/request.json');
+    const moved = path.join(vault, '.me/tmp/original.json');
+    const foreign = path.join(temporaryDirectory('me-vault-cli-foreign-'), 'secret.json');
+    fs.writeFileSync(requestPath, JSON.stringify(request()));
+    fs.writeFileSync(foreign, '{"secret":"descriptor-race-secret"}');
+
+    expect(() => readContainedRequestFile(vault, '.me/tmp/request.json', {
+      afterIdentityValidation() {
+        fs.renameSync(requestPath, moved);
+        fs.symlinkSync(foreign, requestPath);
+      },
+    })).toThrow(WRITER_ERROR_CATALOG.UNSAFE_PATH.message);
+  });
+
+  test('hard-limits raw stdin and request-file bytes to 4 MiB', () => {
+    const oversized = temporaryDirectory('me-vault-cli-limit-');
+    const file = path.join(oversized, 'request.json');
+    fs.writeFileSync(file, Buffer.alloc(4 * 1024 * 1024 + 1, 0x61));
+    const descriptor = fs.openSync(file, 'r');
+    try {
+      expect(() => readLimitedRequest(descriptor)).toThrow(
+        WRITER_ERROR_CATALOG.INVALID_REQUEST.message,
+      );
+    } finally {
+      fs.closeSync(descriptor);
+    }
+
+    const vault = makeVault();
+    const raw = Buffer.concat([
+      Buffer.from('{"padding":"'),
+      Buffer.alloc(4 * 1024 * 1024, 0x61),
+      Buffer.from('"}'),
+    ]);
+    const result = invoke(['preview', '--vault-dir', vault], raw);
+    expectPublicFailure(result, 'INVALID_REQUEST');
+    expect(fs.existsSync(path.join(vault, '.me/tmp'))).toBeFalse();
+  });
+
   test('never accepts Markdown through argv and redacts request and exception-looking values', () => {
     const vault = makeVault();
     const absoluteSentinel = path.join(path.parse(vault).root, 'Users', 'private', 'person');
@@ -291,6 +335,73 @@ describe('vault-write CLI JSON boundary', () => {
     expect(output).not.toContain('INJECTED_EXCEPTION');
     expect(output).not.toContain('COMMAND_STDERR_SENTINEL');
     expect(output).not.toContain(absoluteSentinel);
+  });
+
+  test('redacts untrusted recovery names and journal operation IDs into opaque public entries', () => {
+    const vault = makeVault();
+    const secretName = 'alice-secret\\backslash';
+    const controlName = `control-${String.fromCharCode(1)}-entry`;
+    const forgedUuid = '1be1506d-6b3a-4d1b-9f9a-a551dd66c037';
+    const tmp = path.join(vault, '.me/tmp');
+    for (const name of [secretName, controlName]) {
+      const directory = path.join(tmp, `vault-write-${name}`);
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, 'journal.json'), JSON.stringify({
+        version: 1,
+        operationId: `${name}-journal`,
+        state: 'staged',
+      }));
+    }
+    const forgedDirectory = path.join(tmp, 'vault-write-alice-secret-forged-uuid');
+    fs.mkdirSync(forgedDirectory, { recursive: true });
+    fs.writeFileSync(path.join(forgedDirectory, 'journal.json'), JSON.stringify({
+      version: 1,
+      operationId: forgedUuid,
+      state: 'staged',
+    }));
+
+    const result = invoke(['write', '--vault-dir', vault], JSON.stringify(request()));
+    const body = expectPublicFailure(result, 'INCOMPLETE_OPERATION');
+    const output = `${result.stdout}${result.stderr}`;
+    expect(output).not.toContain('alice-secret');
+    expect(output).not.toContain('backslash');
+    expect(output).not.toContain('control-');
+    expect(output).not.toContain(String.fromCharCode(1));
+    expect(output).not.toContain(forgedUuid);
+    expect((body.recoveries as Array<Record<string, unknown>>)).toHaveLength(3);
+    for (const recovery of body.recoveries as Array<Record<string, unknown>>) {
+      expect(recovery.operationId).toMatch(/^recovery-[a-f0-9]{12}$/);
+      expect(recovery.directory).toBe('.me/tmp');
+      expect(recovery.journal).toBeUndefined();
+      expect(JSON.stringify(recovery)).not.toContain('\\');
+    }
+  });
+
+  test('subprocess maps injected filesystem and internal failures through the public catalog', () => {
+    const unsupportedVault = makeVault();
+    const unsupported = invoke(
+      ['write', '--vault-dir', unsupportedVault],
+      JSON.stringify(request()),
+      {
+        NODE_ENV: 'test',
+        ME_VAULT_WRITE_TEST_FAILURE: 'UNSUPPORTED_FILESYSTEM',
+      },
+    );
+    expectPublicFailure(unsupported, 'UNSUPPORTED_FILESYSTEM');
+
+    const internalVault = makeVault();
+    const injected = `${'Authoriza'}${'tion'}: Bearer cli-injected-secret`;
+    const internal = invoke(
+      ['preview', '--vault-dir', internalVault],
+      JSON.stringify(request()),
+      {
+        NODE_ENV: 'test',
+        ME_VAULT_WRITE_TEST_FAILURE: `INTERNAL_ERROR:${injected}`,
+      },
+    );
+    expectPublicFailure(internal, 'INTERNAL_ERROR');
+    expect(`${internal.stdout}${internal.stderr}`).not.toContain('cli-injected-secret');
+    expect(`${internal.stdout}${internal.stderr}`).not.toContain(injected);
   });
 
   test('SIGINT leaves a journal that the next unlocked invocation reports for recovery', async () => {

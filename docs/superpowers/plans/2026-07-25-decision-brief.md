@@ -1186,12 +1186,16 @@ bun run bin/vault-write.ts write   --vault-dir VAULT [--request .me/tmp/request.
 - unknown flag、重复 flag、缺 mode/vault、非 JSON、多 object、invalid UTF-8；
 - request file 只允许 contained `.me/tmp/*.json`，拒绝 outside、escaping/dangling
   symlink；
+- stdin 与 request file 的完整 raw request 均硬限 4 MiB；file 使用
+  `O_NOFOLLOW` 与同一 fd 完成校验、有界读取和读取后 identity 复核；
 - argv/process command 不包含 Markdown；
 - stdout/stderr/result 中不出现 fixture 的 Markdown sentinel、secret、absolute vault、
   username、home、injected exception、command stderr；
 - output path 一律 `/` separator；
 - SIGINT/exception 后保留 journal并给下一次 invocation manual recovery，不伪报
   rollback。
+- 不可信 recovery dirname/journal operationId 变成 deterministic opaque public ID，
+  路径收敛到可操作的 `.me/tmp` recovery root，不回显原始名称。
 
 - [ ] **Step 2: 添加 installability RED tests**
 
@@ -1202,7 +1206,7 @@ test_vault_writer_public_binary() {
   assert_file_exists "$PLUGIN_ROOT/bin/vault-write.ts" || return 1
   node -e '
     const p=require(process.argv[1]);
-    if (p.bin["vault-write"] !== "bun run bin/vault-write.ts") process.exit(1)
+    if (p.bin["vault-write"] !== "bin/vault-write.ts") process.exit(1)
   ' "$PLUGIN_ROOT/package.json"
 }
 ```

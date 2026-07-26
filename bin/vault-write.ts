@@ -21,6 +21,12 @@ interface CliArguments {
   requestPath?: string;
 }
 
+interface RequestFileHooks {
+  afterIdentityValidation?(): void;
+}
+
+const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+
 function publicFailure(code: WriterErrorCode): VaultWriteResultV1 {
   const definition = WRITER_ERROR_CATALOG[code];
   return {
@@ -81,7 +87,35 @@ function decodeJson(bytes: Buffer): unknown {
   }
 }
 
-function readContainedRequestFile(vaultDir: string, requestValue: string): Buffer {
+export function readLimitedRequest(descriptor: number): Buffer {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (true) {
+    const remainingWithOverflowByte = MAX_REQUEST_BYTES - total + 1;
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, remainingWithOverflowByte));
+    const count = fs.readSync(descriptor, chunk, 0, chunk.length, null);
+    if (count === 0) break;
+    total += count;
+    if (total > MAX_REQUEST_BYTES) throw new VaultWriterError('INVALID_REQUEST');
+    chunks.push(chunk.subarray(0, count));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function sameFileIdentity(first: fs.Stats, second: fs.Stats): boolean {
+  return first.isFile()
+    && second.isFile()
+    && !first.isSymbolicLink()
+    && !second.isSymbolicLink()
+    && first.dev === second.dev
+    && first.ino === second.ino;
+}
+
+export function readContainedRequestFile(
+  vaultDir: string,
+  requestValue: string,
+  hooks: RequestFileHooks = {},
+): Buffer {
   const layout = resolveVaultLayout(vaultDir);
   const candidate = path.isAbsolute(requestValue)
     ? path.resolve(requestValue)
@@ -97,9 +131,17 @@ function readContainedRequestFile(vaultDir: string, requestValue: string): Buffe
   }
 
   assertSafeWriterPath(layout, candidate, 'request file');
+  let descriptor: number | undefined;
   try {
-    const stat = fs.lstatSync(candidate);
-    if (!stat.isFile() || stat.isSymbolicLink()) {
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (typeof noFollow !== 'number') throw new VaultWriterError('UNSAFE_PATH');
+    descriptor = fs.openSync(candidate, fs.constants.O_RDONLY | noFollow);
+    const opened = fs.fstatSync(descriptor);
+    const entry = fs.lstatSync(candidate);
+    if (opened.size > MAX_REQUEST_BYTES) {
+      throw new VaultWriterError('INVALID_REQUEST');
+    }
+    if (!sameFileIdentity(opened, entry)) {
       throw new VaultWriterError('UNSAFE_PATH');
     }
     const canonical = fs.realpathSync(candidate);
@@ -107,10 +149,21 @@ function readContainedRequestFile(vaultDir: string, requestValue: string): Buffe
     if (path.dirname(canonical) !== canonicalTmp) {
       throw new VaultWriterError('UNSAFE_PATH');
     }
-    return fs.readFileSync(candidate);
+    hooks.afterIdentityValidation?.();
+    const bytes = readLimitedRequest(descriptor);
+    const openedAfter = fs.fstatSync(descriptor);
+    const entryAfter = fs.lstatSync(candidate);
+    if (!sameFileIdentity(opened, openedAfter) || !sameFileIdentity(opened, entryAfter)) {
+      throw new VaultWriterError('UNSAFE_PATH');
+    }
+    return bytes;
   } catch (error) {
     if (error instanceof VaultWriterError) throw error;
     throw new VaultWriterError('UNSAFE_PATH');
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* descriptor is no longer usable */ }
+    }
   }
 }
 
@@ -131,8 +184,17 @@ function run(argv: string[]): VaultWriteResultV1 {
     const args = parseArguments(argv);
     const bytes = args.requestPath
       ? readContainedRequestFile(args.vaultDir, args.requestPath)
-      : fs.readFileSync(0);
+      : readLimitedRequest(0);
     const request = decodeJson(bytes);
+    const injectedFailure = process.env.NODE_ENV === 'test'
+      ? process.env.ME_VAULT_WRITE_TEST_FAILURE
+      : undefined;
+    if (injectedFailure === 'UNSUPPORTED_FILESYSTEM') {
+      throw new VaultWriterError('UNSUPPORTED_FILESYSTEM');
+    }
+    if (injectedFailure?.startsWith('INTERNAL_ERROR:')) {
+      throw new Error(injectedFailure.slice('INTERNAL_ERROR:'.length));
+    }
     return executeVaultWrite(args.vaultDir, request as never, {
       pluginRoot: path.resolve(__dirname, '..'),
       mode: args.mode,

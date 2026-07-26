@@ -528,8 +528,10 @@ vault/.me/
 ### 19.5 Request contract
 
 CLI 从 stdin 接收 UTF-8 JSON；也可通过 `--request` 读取文件，但该文件必须位于当前
-vault 的 `.me/tmp/` 内。Markdown 不放进 argv，避免被 shell history 和 process list
-记录。
+vault 的 `.me/tmp/` 内。两种输入的**完整 raw request** 均以 4 MiB 为硬上限。
+request file 通过 `O_NOFOLLOW` 打开，使用同一 fd 做 identity/containment 校验、有界
+读取和读取后复核，不能在 pathname 检查后重新按 pathname 读取。Markdown 不放进
+argv，避免被 shell history 和 process list 记录。
 
 ```ts
 interface VaultWriteRequestV1 {
@@ -564,6 +566,11 @@ bun run bin/vault-write.ts write   --vault-dir <vault> < request.json
 bun run bin/vault-write.ts preview --vault-dir <vault> --request .me/tmp/request.json
 bun run bin/vault-write.ts write   --vault-dir <vault> --request .me/tmp/request.json
 ```
+
+发布到 npm package 时，`package.json.bin["vault-write"]` 指向可执行文件
+`bin/vault-write.ts`；文件保留 Bun shebang 与 executable mode。`bin` 字段不能填写
+`bun run ...` shell command，install 后必须能通过
+`node_modules/.bin/vault-write` 直接调用。
 
 stdout 永远只输出一个 JSON object；人类诊断不得混入 stdout。exit code：
 
@@ -628,6 +635,13 @@ command stderr、secret-looking value 或原始 exception message。`message` �
 public error catalog；详细 path、fingerprint 与内部 error 只写入权限受限的本地
 journal。多个未完成 operation 必须聚合进 `recoveries[]`，不得只返回扫描到的第一
 项；`recoveryState` 是数组的 aggregate state。
+
+startup recovery 中的 dirname 与 journal `operationId` 都是不可信输入。只有 UUID、
+operation directory 与可选 journal path 三者共同符合 writer 生成格式时，才能保留
+具体 recovery path；其他 entry 使用
+`recovery-<sha256-prefix>` deterministic opaque identifier，公开 `directory` 收敛为
+`.me/tmp`、省略不可信 `journal`，并给出检查该本地 recovery root 的 action。不得把
+dirname、journal ID、反斜杠或 control character 原样投影到 JSON result。
 
 固定 error catalog 随 `contracts.ts` 实现，不留到 CLI 临时决定：
 

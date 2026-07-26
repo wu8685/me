@@ -125,6 +125,10 @@ function operation(
   return directory;
 }
 
+function isOpaqueRecoveryId(value: string): boolean {
+  return /^recovery-[a-f0-9]{12}$/.test(value);
+}
+
 describe('preview and successful journaled create', () => {
   test('preview is byte-for-byte read-only and deterministic apart from operationId', () => {
     const vault = makeVault();
@@ -225,14 +229,15 @@ describe('lock precedence and operation discovery', () => {
     expect(result.error?.code).toBe('INCOMPLETE_OPERATION');
     expect(result.recoveryState).toBe('incomplete');
     expect(result.recoveries.map(item => item.directory)).toEqual([
-      '.me/tmp/vault-write-file',
-      '.me/tmp/vault-write-link',
-      '.me/tmp/vault-write-missing',
-      '.me/tmp/vault-write-valid',
+      '.me/tmp',
+      '.me/tmp',
+      '.me/tmp',
+      '.me/tmp',
     ]);
-    expect(result.recoveries.find(item => item.directory.endsWith('missing'))?.journal).toBeUndefined();
-    expect(result.recoveries.find(item => item.directory.endsWith('valid'))?.state)
-      .toBe('incomplete-operation');
+    expect(result.recoveries.every(item => isOpaqueRecoveryId(item.operationId))).toBeTrue();
+    expect(new Set(result.recoveries.map(item => item.operationId)).size).toBe(4);
+    expect(result.recoveries.every(item => item.journal === undefined)).toBeTrue();
+    expect(result.recoveries.some(item => item.state === 'incomplete-operation')).toBeTrue();
   });
 
   test('scans startup recoveries before attempting exclusive lock acquisition', () => {
@@ -259,7 +264,9 @@ describe('lock precedence and operation discovery', () => {
 
     expect(result.status).toBe('manual_recovery');
     expect(result.error?.code).toBe('INCOMPLETE_OPERATION');
-    expect(result.recoveries.map(item => item.operationId)).toEqual(['crashed-before-lock']);
+    expect(result.recoveries).toHaveLength(1);
+    expect(isOpaqueRecoveryId(result.recoveries[0].operationId)).toBeTrue();
+    expect(result.recoveries[0].directory).toBe('.me/tmp');
     expect(opens).toBe(0);
     expect(releases).toBe(0);
     expect(fs.existsSync(path.join(vault, '.me/locks/vault-write.lock'))).toBeFalse();
@@ -363,10 +370,8 @@ describe('lock precedence and operation discovery', () => {
 
     expect(result.status).toBe('manual_recovery');
     expect(result.error?.code).toBe('RECOVERY_REQUIRED');
-    expect(result.recoveries.map(item => item.operationId).sort()).toEqual([
-      'raced-startup',
-      result.operationId,
-    ].sort());
+    expect(result.recoveries.map(item => item.operationId)).toContain(result.operationId);
+    expect(result.recoveries.some(item => isOpaqueRecoveryId(item.operationId))).toBeTrue();
     expect(result.recoveries.map(item => item.state).sort()).toEqual([
       'incomplete-operation',
       'ownership-conflict',
@@ -387,10 +392,8 @@ describe('lock precedence and operation discovery', () => {
 
     expect(result.status).toBe('manual_recovery');
     expect(result.error?.code).toBe('RECOVERY_REQUIRED');
-    expect(result.recoveries.map(item => item.operationId).sort()).toEqual([
-      'raced-release',
-      result.operationId,
-    ].sort());
+    expect(result.recoveries.map(item => item.operationId)).toContain(result.operationId);
+    expect(result.recoveries.some(item => isOpaqueRecoveryId(item.operationId))).toBeTrue();
     expect(result.recoveries.map(item => item.state).sort()).toEqual([
       'incomplete-operation',
       'ownership-conflict',
@@ -408,10 +411,8 @@ describe('lock precedence and operation discovery', () => {
 
     expect(result.status).toBe('manual_recovery');
     expect(result.error?.code).toBe('RECOVERY_REQUIRED');
-    expect(result.recoveries.map(item => item.operationId).sort()).toEqual([
-      'raced-final-release',
-      result.operationId,
-    ].sort());
+    expect(result.recoveries.map(item => item.operationId)).toContain(result.operationId);
+    expect(result.recoveries.some(item => isOpaqueRecoveryId(item.operationId))).toBeTrue();
     expect(result.recoveries.map(item => item.state).sort()).toEqual([
       'incomplete-operation',
       'ownership-conflict',
@@ -509,7 +510,10 @@ describe('lock precedence and operation discovery', () => {
     expect(result.status).toBe('manual_recovery');
     expect(result.recoveries).toHaveLength(2);
     expect(result.recoveries.every(item =>
-      item.operationId === 'duplicate' && item.state === 'unrecognized-operation')).toBeTrue();
+      isOpaqueRecoveryId(item.operationId)
+      && item.state === 'unrecognized-operation'
+      && item.directory === '.me/tmp')).toBeTrue();
+    expect(new Set(result.recoveries.map(item => item.operationId)).size).toBe(2);
   });
 
   test('rejects a journal whose path metadata contradicts vault containment', () => {
@@ -518,7 +522,9 @@ describe('lock precedence and operation discovery', () => {
     const result = write(vault);
     expect(result.status).toBe('manual_recovery');
     expect(result.recoveries[0].state).toBe('unrecognized-operation');
-    expect(result.recoveries[0].journal).toBe('.me/tmp/vault-write-unsafe-path/journal.json');
+    expect(isOpaqueRecoveryId(result.recoveries[0].operationId)).toBeTrue();
+    expect(result.recoveries[0].directory).toBe('.me/tmp');
+    expect(result.recoveries[0].journal).toBeUndefined();
   });
 
   test('a lock replaced before release is preserved and reported for recovery', () => {
@@ -1110,6 +1116,7 @@ describe('README concurrency and cleanup ownership', () => {
       },
     });
     expect(result.status).toBe('manual_recovery');
+    expect(injected).toBeTrue();
     const staged = result.recoveries.flatMap(item => item.preservedPaths)
       .find(item => item.endsWith('/staging/note.md'))!;
     expect(fs.readFileSync(path.join(vault, ...staged.split('/')), 'utf8'))
