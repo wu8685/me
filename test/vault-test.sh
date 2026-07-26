@@ -166,6 +166,32 @@ test_plugin_manifest() {
   assert_file_contains "$codex_marketplace" '"installation": "AVAILABLE"' || return 1
 }
 
+test_vault_writer_public_binary() {
+  assert_file_exists "$PLUGIN_ROOT/bin/vault-write.ts" || return 1
+  node -e '
+    const p=require(process.argv[1]);
+    if (p.bin["vault-write"] !== "bun run bin/vault-write.ts") process.exit(1)
+  ' "$PLUGIN_ROOT/package.json" || return 1
+
+  local public_writer_paths=(
+    "$PLUGIN_ROOT/bin/vault-write.ts"
+    "$PLUGIN_ROOT/bin/vault-write"
+    "$PLUGIN_ROOT/test/vault-write-cli.test.ts"
+    "$PLUGIN_ROOT/package.json"
+  )
+  local private_product="xiao""etong"
+  local private_product_zh="小鹅""通"
+  local private_vault="brain""-spark"
+  local user_root="/""Users/"
+  local machine_user_path="${user_root}wu8685/"
+  if rg -n -i \
+    "$private_product|$private_product_zh|$private_vault|$machine_user_path" \
+    "${public_writer_paths[@]}"; then
+    echo -e "    ${RED}FAIL${NC}: public vault writer artifacts contain private or machine-specific data"
+    return 1
+  fi
+}
+
 test_codex_public_docs() {
   assert_file_contains "$PLUGIN_ROOT/README.md" 'codex plugin marketplace add /path/to/me' || return 1
   assert_file_contains "$PLUGIN_ROOT/README.md" '\$me:setup' || return 1
@@ -4710,6 +4736,7 @@ main() {
     # Run all tests
     run_test test_plugin_structure
     run_test test_plugin_manifest
+    run_test test_vault_writer_public_binary
     run_test test_codex_public_docs
     run_test test_ingest_docs_rich_media
     run_test test_schema_fields

@@ -11,7 +11,8 @@
     "autolinks": "bun run bin/autolinks.ts",
     "backlinks": "bun run bin/backlinks.ts",
     "move": "bun run bin/move.ts",
-    "ingest": "bun run bin/ingest.ts"
+    "ingest": "bun run bin/ingest.ts",
+    "vault-write": "bun run bin/vault-write.ts"
   },
   "keywords": [
     "knowledge-management",
