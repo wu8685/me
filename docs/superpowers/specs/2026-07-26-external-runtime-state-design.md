@@ -40,17 +40,18 @@ The vault keeps only portable state:
 └── profiles/
 ```
 
-The default host-local runtime is a sibling of the canonical vault:
+The default host-local runtime is stored under the current user's home:
 
 ```text
-<canonical-vault-parent>/.me-runtime/
-└── vault-<sha256(canonical-vault-path)[0:24]>/
-    ├── locks/
-    ├── transactions/
-    ├── inbox/
-    └── ingest/
+~/.me/
+└── runtime/
+    └── vault-<sha256(canonical-vault-path)[0:24]>/
         ├── locks/
-        └── staging/
+        ├── transactions/
+        ├── inbox/
+        └── ingest/
+            ├── locks/
+            └── staging/
 ```
 
 The hash is a local namespace, not a portable vault identity. Moving a vault
@@ -65,13 +66,14 @@ Runtime resolution is centralized in `bin/runtime-paths.ts`.
 
 1. Resolve the lexical vault path.
 2. Resolve the canonical vault path.
-3. Use the canonical vault parent as the default runtime-base parent.
-4. Resolve `<parent>/.me-runtime/vault-<path-hash>`.
+3. Resolve the current user's home directory without consulting vault
+   configuration.
+4. Resolve `~/.me/runtime/vault-<path-hash>`.
 5. Do not create any directory during preview or path inspection.
 
 ### 4.2 Host-local override
 
-`ME_RUNTIME_ROOT` may override the `.me-runtime` base:
+`ME_RUNTIME_ROOT` may override the `~/.me/runtime` base:
 
 - it is a host-local environment variable, never written to
   `.me/config.yaml`;
@@ -95,7 +97,10 @@ Before any write, ME compares filesystem device identity for:
 - target layer/parent directories used by the operation.
 
 The operation stops before acquiring locks or staging bytes if these devices
-differ. This preserves the existing hard-link and atomic-rename model.
+differ. There is no automatic fallback to a vault-adjacent directory and no
+cross-device copy mode. The error directs the user to set `ME_RUNTIME_ROOT`
+to an absolute directory on the vault filesystem. This preserves the existing
+hard-link and atomic-rename model.
 
 ## 5. Path safety
 
@@ -234,7 +239,9 @@ after confirming no data is needed.
 - no longer recommends vault-local runtime ignore rules as the primary sync
   boundary;
 - documents that `.me/config.yaml` and `.me/profiles/` are portable;
-- documents that `.me-runtime/` is host-local and outside the vault.
+- documents that `~/.me/runtime/` is host-local and outside the vault;
+- documents the explicit `ME_RUNTIME_ROOT` remedy for cross-filesystem
+  vaults.
 
 The repository’s project instructions are updated to remove the obsolete
 “same directory, no sync” assumption.
@@ -258,10 +265,11 @@ contract exists.
 TDD proceeds in this order:
 
 1. Runtime resolver tests:
-   - deterministic sibling root;
+   - deterministic `~/.me/runtime` root;
    - override validation;
    - no creation during resolution;
    - symlink, traversal, control-character, and cross-device rejection;
+   - cross-device failure has no vault-adjacent fallback;
    - lexical/canonical vault roots.
 2. Vault writer path and transaction tests:
    - no `.me/tmp` or `.me/locks` creation;
