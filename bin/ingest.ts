@@ -39,6 +39,11 @@ import type {
   SourceKind,
 } from './ingest/contracts.ts';
 import { finalizeIngest, type FinalizeResult } from './ingest/finalize.ts';
+import {
+  RuntimePathError,
+  assertSafeRuntimePath,
+  resolveRuntimeLayout,
+} from './runtime-paths.ts';
 import { formatHandout, type HandoutResult } from './ingest/handout.ts';
 import { createAdapterRegistry } from './ingest/registry.ts';
 import { discoverTranscriptionProvider } from './ingest/media/transcription.ts';
@@ -953,7 +958,9 @@ export function parseIngestCliOptions(args: string[], cwd = process.cwd()): Inge
     ...(mode ? { mode } : {}),
     vaultDir: path.resolve(vaultDir),
     ...(topic ? { topic } : {}),
-    ...(processedMarkdown ? { processedMarkdown: path.resolve(processedMarkdown) } : {}),
+    ...(processedMarkdown
+      ? { processedMarkdown: processedMarkdown === '-' ? '-' : path.resolve(processedMarkdown) }
+      : {}),
     write,
   };
 }
@@ -994,20 +1001,98 @@ function isInside(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${path.sep}`);
 }
 
-function readProcessedMarkdown(vaultDir: string, filename: string | undefined): string | undefined {
+const MAX_PROCESSED_MARKDOWN_BYTES = 4 * 1024 * 1024;
+
+function readLimitedDescriptor(descriptor: number): Buffer {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (true) {
+    const chunk = Buffer.allocUnsafe(
+      Math.min(64 * 1024, MAX_PROCESSED_MARKDOWN_BYTES - total + 1),
+    );
+    const count = fs.readSync(descriptor, chunk, 0, chunk.length, null);
+    if (count === 0) break;
+    total += count;
+    if (total > MAX_PROCESSED_MARKDOWN_BYTES) {
+      throw new Error('--processed-markdown exceeds 4 MiB');
+    }
+    chunks.push(chunk.subarray(0, count));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+function decodeProcessedMarkdown(bytes: Buffer): string {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error('--processed-markdown must be valid UTF-8');
+  }
+}
+
+function sameFileIdentity(first: fs.Stats, second: fs.Stats): boolean {
+  return first.isFile()
+    && second.isFile()
+    && !first.isSymbolicLink()
+    && !second.isSymbolicLink()
+    && first.dev === second.dev
+    && first.ino === second.ino;
+}
+
+export function readProcessedMarkdown(
+  vaultDir: string,
+  filename: string | undefined,
+): string | undefined {
   if (!filename) return undefined;
-  const tmpRoot = path.resolve(vaultDir, '.me', 'tmp');
+  if (filename === '-') return decodeProcessedMarkdown(readLimitedDescriptor(0));
+  const runtime = resolveRuntimeLayout(vaultDir);
   const candidate = path.resolve(filename);
-  if (!isInside(tmpRoot, candidate) || !fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
-    throw new Error('--processed-markdown must be a file inside <vault>/.me/tmp/');
+  if (
+    path.dirname(candidate) !== runtime.inboxDir
+    || path.extname(candidate).toLowerCase() !== '.md'
+    || path.basename(candidate).toLowerCase() === '.md'
+  ) {
+    throw new Error('--processed-markdown must be a direct Markdown file in the runtime inbox');
   }
-  const realVault = fs.realpathSync(vaultDir);
-  const realTmp = fs.realpathSync(tmpRoot);
-  const realCandidate = fs.realpathSync(candidate);
-  if (!isInside(realVault, realTmp) || !isInside(realTmp, realCandidate)) {
-    throw new Error('--processed-markdown must be a file inside <vault>/.me/tmp/');
+  try {
+    assertSafeRuntimePath(runtime, candidate);
+  } catch (error) {
+    if (error instanceof RuntimePathError) {
+      throw new Error('--processed-markdown must be a direct Markdown file in the runtime inbox');
+    }
+    throw error;
   }
-  return fs.readFileSync(realCandidate, 'utf8');
+
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(
+      candidate,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    );
+    const opened = fs.fstatSync(descriptor);
+    const entry = fs.lstatSync(candidate);
+    if (!sameFileIdentity(opened, entry)) {
+      throw new Error('--processed-markdown must be a direct Markdown file in the runtime inbox');
+    }
+    if (opened.size > MAX_PROCESSED_MARKDOWN_BYTES) {
+      throw new Error('--processed-markdown exceeds 4 MiB');
+    }
+    const bytes = readLimitedDescriptor(descriptor);
+    const after = fs.fstatSync(descriptor);
+    const entryAfter = fs.lstatSync(candidate);
+    if (!sameFileIdentity(opened, after) || !sameFileIdentity(opened, entryAfter)) {
+      throw new Error('--processed-markdown must be a direct Markdown file in the runtime inbox');
+    }
+    return decodeProcessedMarkdown(bytes);
+  } catch (error) {
+    if (error instanceof Error && /processed Markdown|runtime inbox|4 MiB/.test(error.message)) {
+      throw error;
+    }
+    throw new Error('--processed-markdown must be a direct Markdown file in the runtime inbox');
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* descriptor is no longer usable */ }
+    }
+  }
 }
 
 const REMOTE_MEDIA_EXTENSIONS = {
@@ -1254,11 +1339,9 @@ export async function runRichIngest(
   const config = resolveIngestConfig(options.vaultDir);
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-run-'));
   let processedMarkdown: string | undefined;
-  let processedPath: string | undefined;
 
   try {
     processedMarkdown = readProcessedMarkdown(options.vaultDir, options.processedMarkdown);
-    processedPath = options.processedMarkdown ? fs.realpathSync(options.processedMarkdown) : undefined;
 
     let source: ExtractedSource;
     let adapterId: string;
@@ -1346,7 +1429,6 @@ export async function runRichIngest(
         created: today,
         trustedResourceRoots,
       });
-      if (processedPath) fs.rmSync(processedPath, { force: true });
     }
 
     return {

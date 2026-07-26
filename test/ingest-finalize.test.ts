@@ -8,6 +8,7 @@ import {
   finalizeIngest,
   type FinalizeInput,
 } from '../bin/ingest/finalize.ts';
+import { resolveRuntimeLayout } from '../bin/runtime-paths.ts';
 
 const temporaryDirectories: string[] = [];
 
@@ -24,8 +25,10 @@ function temporaryDirectory(prefix: string): string {
 }
 
 function makeVault(raw = 'knowledge/raw'): string {
-  const vault = temporaryDirectory('me-finalize-vault-');
-  fs.mkdirSync(path.join(vault, '.me', 'tmp'), { recursive: true });
+  const fixture = temporaryDirectory('me-finalize-vault-');
+  const vault = path.join(fixture, 'vault');
+  fs.mkdirSync(path.join(vault, '.me'), { recursive: true });
+  fs.mkdirSync(path.join(fixture, 'resources'));
   fs.mkdirSync(path.join(vault, raw), { recursive: true });
   fs.mkdirSync(path.join(vault, 'knowledge/practices'), { recursive: true });
   fs.mkdirSync(path.join(vault, 'knowledge/cognition'), { recursive: true });
@@ -39,8 +42,12 @@ function makeVault(raw = 'knowledge/raw'): string {
   return vault;
 }
 
+function resourceRoot(vault: string): string {
+  return path.join(path.dirname(vault), 'resources');
+}
+
 function writeAsset(vault: string, name: string, contents = 'image bytes'): string {
-  const assetPath = path.join(vault, '.me', 'tmp', name);
+  const assetPath = path.join(resourceRoot(vault), name);
   fs.writeFileSync(assetPath, contents);
   return assetPath;
 }
@@ -78,7 +85,7 @@ function validArticleInput(vault: string): FinalizeInput {
     stem: '2026-07-25-atomic-ingest-guide',
     created: '2026-07-25',
     tags: ['ingest', 'atomic'],
-    trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+    trustedResourceRoots: [resourceRoot(vault)],
   };
 }
 
@@ -128,7 +135,7 @@ function rawVisualInput(
     topic: 'raw-visual',
     stem,
     created: '2026-07-25',
-    trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+    trustedResourceRoots: [resourceRoot(vault)],
   };
 }
 
@@ -146,6 +153,25 @@ function stagingEntries(vault: string): string[] {
   return found;
 }
 
+function vaultRuntimeMarkers(vault: string): string[] {
+  const markers: string[] = [];
+  const walk = (directory: string): void => {
+    if (!fs.existsSync(directory)) return;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const candidate = path.join(directory, entry.name);
+      if (
+        entry.name.startsWith('.me-ingest-')
+        || entry.name === 'ingest-reservations'
+      ) {
+        markers.push(path.relative(vault, candidate));
+      }
+      if (entry.isDirectory() && !entry.isSymbolicLink()) walk(candidate);
+    }
+  };
+  walk(vault);
+  return markers.sort();
+}
+
 function expectedNote(vault: string): string {
   return path.join(
     vault,
@@ -157,7 +183,7 @@ describe('finalizeIngest', () => {
   test('leaves no destination or staging files after validation failure', () => {
     const vault = makeVault();
     const input = validArticleInput(vault);
-    input.source.media[0].path = path.join(vault, '.me', 'tmp', 'missing.jpg');
+    input.source.media[0].path = path.join(resourceRoot(vault), 'missing.jpg');
 
     expect(() => finalizeIngest(input)).toThrow(/missing asset/);
     expect(stagingEntries(vault)).toEqual([]);
@@ -166,9 +192,23 @@ describe('finalizeIngest', () => {
 
   test('copies assets and rewrites markdown in source order', () => {
     const vault = makeVault();
-    const result = finalizeIngest(validArticleInput(vault));
+    const runtime = resolveRuntimeLayout(vault, {});
+    let observedExternalState = false;
+    const result = finalizeIngest(validArticleInput(vault), {
+      beforeArtifactPublish() {
+        observedExternalState = true;
+        expect(vaultRuntimeMarkers(vault)).toEqual([]);
+        expect(fs.readdirSync(runtime.ingestLockDir).length).toBeGreaterThan(0);
+        expect(fs.readdirSync(runtime.ingestStagingDir).length).toBeGreaterThan(0);
+      },
+      renameSync: fs.renameSync,
+    });
     const note = fs.readFileSync(result.notePath, 'utf8');
 
+    expect(observedExternalState).toBeTrue();
+    expect(vaultRuntimeMarkers(vault)).toEqual([]);
+    expect(fs.readdirSync(runtime.ingestLockDir)).toEqual([]);
+    expect(fs.readdirSync(runtime.ingestStagingDir)).toEqual([]);
     expect(result.notePath).toBe(expectedNote(vault));
     expect(note).toContain('段落一\n\n![图一](images/image-001.jpg)\n\n段落二');
     expect(fs.readFileSync(path.join(path.dirname(result.notePath), 'images', 'image-001.jpg'), 'utf8'))
@@ -201,7 +241,7 @@ describe('finalizeIngest', () => {
     nonexistentOutside.source.media[0].path = path.join(outside, 'does-not-exist.jpg');
     expect(() => finalizeIngest(nonexistentOutside)).toThrow(/outside trusted resource roots/);
 
-    const symlink = path.join(vault, '.me', 'tmp', 'linked.jpg');
+    const symlink = path.join(resourceRoot(vault), 'linked.jpg');
     fs.symlinkSync(privatePath, symlink);
     const linked = validArticleInput(vault);
     linked.source.media[0].path = symlink;
@@ -296,7 +336,7 @@ describe('finalizeIngest', () => {
       topic: 'courses',
       stem: '2026-07-25-complete-course',
       created: '2026-07-25',
-      trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+      trustedResourceRoots: [resourceRoot(vault)],
     })).toThrow(/omitted transcript/);
 
     expect(stagingEntries(vault)).toEqual([]);
@@ -558,7 +598,7 @@ describe('finalizeIngest', () => {
         topic: 'courses',
         stem: '2026-07-25-empty-course',
         created: '2026-07-25',
-        trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+        trustedResourceRoots: [resourceRoot(vault)],
       })).toThrow(/transcript|substantive/i);
     }
 
@@ -595,7 +635,7 @@ describe('finalizeIngest', () => {
       topic: 'courses',
       stem: '2026-07-25-metadata-only',
       created: '2026-07-25',
-      trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+      trustedResourceRoots: [resourceRoot(vault)],
     })).toThrow(/processed handout|coverage|transcript/i);
   });
 
@@ -675,7 +715,7 @@ describe('finalizeIngest', () => {
       topic: 'courses',
       stem: '2026-07-25-incomplete-course',
       created: '2026-07-25',
-      trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+      trustedResourceRoots: [resourceRoot(vault)],
     })).toThrow(/coverage|transcript/i);
   });
 
@@ -694,13 +734,10 @@ describe('finalizeIngest', () => {
     }
   });
 
-  test('ignores stale staging, frontmatter, and fenced-code wikilinks for reachability', () => {
+  test('ignores frontmatter and fenced-code wikilinks for reachability', () => {
     const vault = makeVault();
     const raw = path.join(vault, 'knowledge/raw');
     const stem = '2026-07-25-atomic-ingest-guide';
-    const stale = path.join(raw, '.me-ingest-staging-stale');
-    fs.mkdirSync(stale);
-    fs.writeFileSync(path.join(stale, 'stale.md'), `[[${stem}]]\n`);
     fs.writeFileSync(path.join(raw, 'code-only.md'), [
       '---',
       `title: "[[${stem}]]"`,
@@ -902,6 +939,32 @@ describe('finalizeIngest', () => {
     expect(fs.existsSync(externalLock)).toBeFalse();
   });
 
+  test.each(['reservation', 'topic-marker', 'staging'] as const)(
+    'blocks legacy vault-local ingest state before external runtime mutation: %s',
+    legacy => {
+      const vault = makeVault();
+      if (legacy === 'reservation') {
+        const directory = path.join(vault, '.me', 'ingest-reservations');
+        fs.mkdirSync(directory);
+        fs.writeFileSync(path.join(directory, 'old.lock'), 'legacy');
+      } else if (legacy === 'topic-marker') {
+        const topic = path.join(vault, 'knowledge/raw/atomic-ingest');
+        fs.mkdirSync(topic, { recursive: true });
+        fs.writeFileSync(path.join(topic, '.me-ingest-finalize.lock'), 'legacy');
+      } else {
+        const staging = path.join(vault, 'knowledge/raw/.me-ingest-staging-old');
+        fs.mkdirSync(staging);
+        fs.writeFileSync(path.join(staging, 'note.md'), 'legacy');
+      }
+      const runtime = resolveRuntimeLayout(vault, {});
+
+      expect(() => finalizeIngest(validArticleInput(vault)))
+        .toThrow(/legacy.*runtime state|manual recovery/i);
+      expect(fs.existsSync(runtime.runtimeBase)).toBeFalse();
+      expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+    },
+  );
+
   test('returns related notes, backlinks, and unlinked mentions without editing notes', () => {
     const vault = makeVault();
     const raw = path.join(vault, 'knowledge/raw');
@@ -985,7 +1048,7 @@ describe('finalizeIngest', () => {
       topic: 'courses',
       stem: '2026-07-25-complete-course',
       created: '2026-07-25',
-      trustedResourceRoots: [path.join(vault, '.me', 'tmp')],
+      trustedResourceRoots: [resourceRoot(vault)],
     });
 
     expect(result.notePath).toBe(path.join(

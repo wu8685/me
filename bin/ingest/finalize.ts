@@ -11,6 +11,12 @@ import {
 } from '../ingest.ts';
 import type { ExtractedSource, MediaAsset } from './contracts.ts';
 import type { HandoutResult } from './handout.ts';
+import {
+  RuntimePathError,
+  assertSafeRuntimePath,
+  bootstrapRuntimeDirectories,
+  resolveRuntimeLayout,
+} from '../runtime-paths.ts';
 
 export interface FinalizeInput {
   vaultDir: string;
@@ -808,7 +814,11 @@ function readmeContent(state: ReadmeState, parent: string, stem: string): string
   return `${original}${separator}- [[${stem}]]\n`;
 }
 
-function restoreReadme(readmePath: string, state: ReadmeState): void {
+function restoreReadme(
+  readmePath: string,
+  state: ReadmeState,
+  runtimeStagingDir: string,
+): void {
   if (state.kind === 'directory') {
     if (!fs.existsSync(readmePath)) fs.mkdirSync(readmePath);
     return;
@@ -817,13 +827,54 @@ function restoreReadme(readmePath: string, state: ReadmeState): void {
     if (fs.existsSync(readmePath) && fs.lstatSync(readmePath).isFile()) fs.rmSync(readmePath, { force: true });
     return;
   }
-  const restorePath = path.join(path.dirname(readmePath), `.README.md.me-ingest-restore-${randomUUID()}.tmp`);
+  const restorePath = path.join(
+    runtimeStagingDir,
+    `.README.md.me-ingest-restore-${randomUUID()}.tmp`,
+  );
   try {
     fs.writeFileSync(restorePath, state.content ?? '');
     fs.renameSync(restorePath, readmePath);
   } finally {
     fs.rmSync(restorePath, { force: true });
   }
+}
+
+function legacyIngestState(vaultDir: string, layerDirectories: string[]): string[] {
+  const found: string[] = [];
+  for (const relative of [
+    ['.me', 'tmp'],
+    ['.me', 'locks'],
+    ['.me', 'ingest-reservations'],
+  ]) {
+    const directory = path.join(vaultDir, ...relative);
+    assertSafeVaultPath(vaultDir, directory, 'legacy runtime path');
+    if (!fs.existsSync(directory)) continue;
+    const stat = fs.lstatSync(directory);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error('legacy ME runtime state requires manual recovery');
+    }
+    if (fs.readdirSync(directory).length > 0) {
+      found.push(path.relative(vaultDir, directory));
+    }
+  }
+
+  const walk = (directory: string): void => {
+    if (!fs.existsSync(directory)) return;
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const candidate = path.join(directory, entry.name);
+      if (
+        entry.name === '.me-ingest-finalize.lock'
+        || entry.name.startsWith('.me-ingest-staging-')
+        || entry.name.startsWith('.README.md.me-ingest-')
+      ) {
+        found.push(path.relative(vaultDir, candidate));
+      }
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) walk(candidate);
+    }
+  };
+  for (const directory of layerDirectories) walk(directory);
+  return found.sort();
 }
 
 function artifactManifest(root: string): Map<string, string> {
@@ -903,6 +954,12 @@ export function finalizeIngest(
     .map(layer => path.resolve(vaultDir, layer));
   configuredLayers.forEach(layer => assertSafeVaultPath(vaultDir, layer, 'target path'));
   assertVaultTreeDoesNotEscape(vaultDir, configuredLayers);
+  const legacyState = legacyIngestState(vaultDir, configuredLayers);
+  if (legacyState.length > 0) {
+    throw new Error(
+      `legacy ME runtime state requires manual recovery: ${legacyState.join(', ')}`,
+    );
+  }
 
   const rawRoot = path.resolve(vaultDir, config.raw);
   const topic = safeTopic(input.topic);
@@ -922,17 +979,28 @@ export function finalizeIngest(
   }
   const tags = (input.tags ?? []).map(validateTag);
   const resourceRoots = trustedRoots(input, vaultDir);
+  const runtime = resolveRuntimeLayout(vaultDir);
 
   const createdDirectories: string[] = [];
+  try {
+    bootstrapRuntimeDirectories(runtime, [
+      runtime.ingestLockDir,
+      runtime.ingestStagingDir,
+    ]);
+  } catch (error) {
+    if (error instanceof RuntimePathError) {
+      throw new Error(`ME runtime path is unsafe: ${error.code}`);
+    }
+    throw error;
+  }
   createDirectoryTracked(finalParent, createdDirectories);
-  const reservationDirectory = path.join(vaultDir, '.me', 'ingest-reservations');
-  assertSafeVaultPath(vaultDir, reservationDirectory, 'ingest reservation path');
-  createDirectoryTracked(reservationDirectory, createdDirectories);
+  const digest = (value: string): string =>
+    createHash('sha256').update(value).digest('hex').slice(0, 24);
   const lockPaths = [
-    path.join(reservationDirectory, `${stem}.lock`),
-    path.join(finalParent, '.me-ingest-finalize.lock'),
+    path.join(runtime.ingestLockDir, `stem-${digest(stem.toLowerCase())}.lock`),
+    path.join(runtime.ingestLockDir, `topic-${digest(finalParent)}.lock`),
   ];
-  lockPaths.forEach(lockPath => assertSafeVaultPath(vaultDir, lockPath, 'ingest lock path'));
+  lockPaths.forEach(lockPath => assertSafeRuntimePath(runtime, lockPath));
   const locks: Array<{ path: string; handle: number }> = [];
   try {
     for (const lockPath of lockPaths) {
@@ -963,7 +1031,8 @@ export function finalizeIngest(
     const relatedNotes = scoreRelatedNotes(tags, input.source.source.title, vaultIndex, vaultDir);
     const suggestions = discoverSuggestions(vaultDir, files, stem, input.source.source.title);
 
-    staging = fs.mkdtempSync(path.join(finalParent, '.me-ingest-staging-'));
+    staging = fs.mkdtempSync(path.join(runtime.ingestStagingDir, 'artifact-'));
+    assertSafeRuntimePath(runtime, staging);
     const preparedParts = input.handout
       ? handoutBodyAndAssets(input, staging, artifactPath, resourceRoots)
       : articleBodyAndAssets(input, staging, artifactPath, resourceRoots);
@@ -991,7 +1060,11 @@ export function finalizeIngest(
       readmePath = path.join(finalParent, 'README.md');
       assertSafeVaultPath(vaultDir, readmePath, 'README path');
       readmeState = readReadmeState(readmePath);
-      readmeTemp = path.join(finalParent, `.README.md.me-ingest-${randomUUID()}.tmp`);
+      readmeTemp = path.join(
+        runtime.ingestStagingDir,
+        `.README.md.me-ingest-${randomUUID()}.tmp`,
+      );
+      assertSafeRuntimePath(runtime, readmeTemp);
       fs.writeFileSync(readmeTemp, readmeContent(readmeState, finalParent, stem), { flag: 'wx' });
     }
 
@@ -1028,7 +1101,7 @@ export function finalizeIngest(
   } catch (cause) {
     if (readmeAttempted && readmePath && readmeState) {
       try {
-        restoreReadme(readmePath, readmeState);
+        restoreReadme(readmePath, readmeState, runtime.ingestStagingDir);
       } catch {
         // Preserve the original transaction failure; artifact rollback still proceeds.
       }

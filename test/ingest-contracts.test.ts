@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -8,10 +9,15 @@ import {
   createRichIngestRegistry,
   ingestErrorPayload,
   parseIngestCliOptions,
+  readProcessedMarkdown,
   resolveIngestMode,
   runRichIngest,
   SourceBlockedError,
 } from '../bin/ingest.ts';
+import {
+  bootstrapRuntimeDirectories,
+  resolveRuntimeLayout,
+} from '../bin/runtime-paths.ts';
 import type { CommandRunner } from '../bin/ingest/command.ts';
 
 const html: SourceAdapter = {
@@ -27,6 +33,7 @@ const html: SourceAdapter = {
     provenance: { extractor: 'html', extractedAt: '2026-07-25T00:00:00Z', methods: [] },
   }),
 };
+const testPosixFifo = process.platform === 'win32' ? test.skip : test;
 
 describe('createAdapterRegistry', () => {
   test('selects the first matching adapter', () => {
@@ -154,6 +161,59 @@ describe('rich ingest CLI orchestration', () => {
       bundleDir: '/tmp/bundle',
       write: true,
     });
+    expect(parseIngestCliOptions([
+      '--bundle', '/tmp/bundle', '--processed-markdown', '-', '--write',
+    ])).toMatchObject({ processedMarkdown: '-' });
+  });
+
+  test('reads only a direct real Markdown file from the runtime inbox', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-inbox-'));
+    const vault = path.join(root, 'vault');
+    fs.mkdirSync(vault);
+    const runtime = resolveRuntimeLayout(vault, {});
+    bootstrapRuntimeDirectories(runtime, [runtime.inboxDir]);
+    const direct = path.join(runtime.inboxDir, 'reviewed.md');
+    const nested = path.join(runtime.inboxDir, 'nested', 'reviewed.md');
+    const outside = path.join(root, 'outside.md');
+    const wrongExtension = path.join(runtime.inboxDir, 'reviewed.txt');
+    const oversized = path.join(runtime.inboxDir, 'oversized.md');
+    fs.writeFileSync(direct, '# Reviewed\n');
+    fs.mkdirSync(path.dirname(nested));
+    fs.writeFileSync(nested, '# Nested\n');
+    fs.writeFileSync(outside, '# Outside\n');
+    fs.writeFileSync(wrongExtension, '# Wrong extension\n');
+    fs.writeFileSync(oversized, Buffer.alloc(4 * 1024 * 1024 + 1, 0x61));
+    fs.symlinkSync(outside, path.join(runtime.inboxDir, 'linked.md'));
+    try {
+      expect(readProcessedMarkdown(vault, direct)).toBe('# Reviewed\n');
+      for (const candidate of [
+        nested,
+        outside,
+        wrongExtension,
+        oversized,
+        path.join(runtime.inboxDir, 'linked.md'),
+      ]) {
+        expect(() => readProcessedMarkdown(vault, candidate)).toThrow(/runtime inbox|4 MiB/i);
+      }
+      expect(fs.existsSync(direct)).toBeTrue();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  testPosixFifo('rejects a processed-Markdown FIFO without blocking', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-fifo-'));
+    const vault = path.join(root, 'vault');
+    fs.mkdirSync(vault);
+    const runtime = resolveRuntimeLayout(vault, {});
+    bootstrapRuntimeDirectories(runtime, [runtime.inboxDir]);
+    const fifo = path.join(runtime.inboxDir, 'reviewed.md');
+    try {
+      expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+      expect(() => readProcessedMarkdown(vault, fifo)).toThrow(/runtime inbox/i);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('rejects ambiguous, incomplete, and unsafe options', () => {
@@ -231,12 +291,14 @@ describe('rich ingest CLI orchestration', () => {
     }
   });
 
-  test('writes a Bundle through the finalizer and consumes processed Markdown', async () => {
+  test('writes a Bundle through the finalizer without deleting processed Markdown', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-cli-'));
     const vault = path.join(root, 'vault');
     const bundle = path.join(root, 'bundle');
-    const edit = path.join(vault, '.me', 'tmp', 'edited.md');
-    fs.mkdirSync(path.dirname(edit), { recursive: true });
+    fs.mkdirSync(vault);
+    const runtime = resolveRuntimeLayout(vault, {});
+    bootstrapRuntimeDirectories(runtime, [runtime.inboxDir]);
+    const edit = path.join(runtime.inboxDir, 'edited.md');
     fs.mkdirSync(bundle);
     fs.writeFileSync(edit, '# Edited article\n\nReviewed body.\n');
     fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
@@ -260,13 +322,49 @@ describe('rich ingest CLI orchestration', () => {
         path.join(vault, 'raw', `${today}-bundle-article`, `${today}-bundle-article.md`),
       );
       expect(fs.readFileSync(result.writeResult!.notePath, 'utf8')).toContain('Reviewed body.');
-      expect(fs.existsSync(edit)).toBe(false);
+      expect(fs.existsSync(edit)).toBe(true);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test('rejects processed Markdown outside the vault temporary directory', async () => {
+  test('accepts processed Markdown from stdin without creating a vault-local temp file', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-stdin-'));
+    const vault = path.join(root, 'vault');
+    const bundle = path.join(root, 'bundle');
+    fs.mkdirSync(vault);
+    fs.mkdirSync(bundle);
+    fs.writeFileSync(path.join(bundle, 'source-bundle.json'), JSON.stringify({
+      version: 1,
+      source: { url: 'https://example.com/stdin', kind: 'article', title: 'Stdin article' },
+      blocks: [{ id: 'b1', kind: 'paragraph', markdown: 'Original body.' }],
+      media: [],
+      provenance: { extractor: 'fixture', extractedAt: '2026-07-25T00:00:00Z', methods: ['fixture'] },
+      warnings: [],
+    }));
+    try {
+      const result = spawnSync('bun', [
+        'run', path.resolve(import.meta.dir, '../bin/ingest.ts'),
+        '--bundle', bundle,
+        '--vault-dir', vault,
+        '--mode', 'raw',
+        '--processed-markdown', '-',
+        '--write',
+      ], {
+        input: '# Reviewed from stdin\n',
+        encoding: 'utf8',
+      });
+      expect(result.status).toBe(0);
+      const body = JSON.parse(result.stdout);
+      expect(fs.readFileSync(body.writeResult.notePath, 'utf8'))
+        .toContain('Reviewed from stdin');
+      expect(fs.existsSync(path.join(vault, '.me', 'tmp'))).toBeFalse();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects processed Markdown outside the runtime inbox', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-cli-'));
     const vault = path.join(root, 'vault');
     const bundle = path.join(root, 'bundle');
@@ -289,7 +387,7 @@ describe('rich ingest CLI orchestration', () => {
         '--mode', 'raw',
         '--processed-markdown', edit,
         '--write',
-      ]))).rejects.toThrow(/\.me\/tmp/);
+      ]))).rejects.toThrow(/runtime inbox/i);
       expect(fs.existsSync(edit)).toBe(true);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
