@@ -170,7 +170,7 @@ describe('rich ingest CLI orchestration', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-inbox-'));
     const vault = path.join(root, 'vault');
     fs.mkdirSync(vault);
-    const runtime = resolveRuntimeLayout(vault, {});
+    const runtime = resolveRuntimeLayout(vault);
     bootstrapRuntimeDirectories(runtime, [runtime.inboxDir]);
     const direct = path.join(runtime.inboxDir, 'reviewed.md');
     const nested = path.join(runtime.inboxDir, 'nested', 'reviewed.md');
@@ -205,7 +205,7 @@ describe('rich ingest CLI orchestration', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-ingest-fifo-'));
     const vault = path.join(root, 'vault');
     fs.mkdirSync(vault);
-    const runtime = resolveRuntimeLayout(vault, {});
+    const runtime = resolveRuntimeLayout(vault);
     bootstrapRuntimeDirectories(runtime, [runtime.inboxDir]);
     const fifo = path.join(runtime.inboxDir, 'reviewed.md');
     try {
@@ -296,7 +296,7 @@ describe('rich ingest CLI orchestration', () => {
     const vault = path.join(root, 'vault');
     const bundle = path.join(root, 'bundle');
     fs.mkdirSync(vault);
-    const runtime = resolveRuntimeLayout(vault, {});
+    const runtime = resolveRuntimeLayout(vault);
     bootstrapRuntimeDirectories(runtime, [runtime.inboxDir]);
     const edit = path.join(runtime.inboxDir, 'edited.md');
     fs.mkdirSync(bundle);
@@ -353,6 +353,7 @@ describe('rich ingest CLI orchestration', () => {
       ], {
         input: '# Reviewed from stdin\n',
         encoding: 'utf8',
+        env: process.env,
       });
       expect(result.status).toBe(0);
       const body = JSON.parse(result.stdout);

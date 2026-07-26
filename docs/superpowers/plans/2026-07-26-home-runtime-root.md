@@ -31,6 +31,11 @@
 - Modify `docs/development.md`: update the resolver contract for maintainers.
 - Modify `skills/setup/SKILL.md`: ensure setup teaches the new host-local default.
 - Modify `docs/superpowers/plans/2026-07-26-external-runtime-state.md`: mark the original sibling-default examples as superseded by the approved design amendment.
+- Create `bunfig.toml`: preload the Bun test runtime isolation hook.
+- Create `test/runtime-test-preload.ts`: route test mutations to a process-local temporary runtime and remove it on exit.
+- Create `test/runtime-test-environment.test.ts`: prove tests do not use the real home runtime.
+- Modify `test/ingest-contracts.test.ts`: keep expected runtime paths and child-process environments aligned with the test override.
+- Modify `test/ingest-finalize.test.ts`: assert per-vault non-mutation rather than shared-base absence.
 
 ### Task 1: Resolve the default runtime under the user home
 
@@ -196,11 +201,35 @@ git commit -m "docs: publish home runtime default"
 ### Task 3: Regression and release verification
 
 **Files:**
-- Verify only; modify task files only if a regression exposes a requirement mismatch.
+- Create: `bunfig.toml`
+- Create: `test/runtime-test-preload.ts`
+- Create: `test/runtime-test-environment.test.ts`
+- Modify: `test/ingest-contracts.test.ts`
+- Modify: `test/ingest-finalize.test.ts`
+- Verify all task files
 
 **Interfaces:**
 - Consumes: Tasks 1 and 2
 - Produces: evidence that ME 1.6 consistently ships the approved runtime default
+
+- [ ] **Step 0: Isolate the Bun suite from the real home runtime**
+
+Configure Bun to preload a test hook that creates a private runtime under the
+canonical temporary directory, exports it through `ME_RUNTIME_ROOT`, and
+removes it on process exit. Add a regression test that resolves a temporary
+vault with the process environment and proves its runtime base is under the
+temporary directory rather than `~/.me/runtime`. Integration-test helpers and
+child processes must consume or propagate the same environment; the dedicated
+default resolver test remains the only test that passes `{}` deliberately.
+
+Run:
+
+```bash
+bun test test/runtime-test-environment.test.ts \
+  test/ingest-finalize.test.ts test/ingest-contracts.test.ts
+```
+
+Expected: zero failures, and `~/.me/runtime` remains unchanged.
 
 - [ ] **Step 1: Run all Bun tests**
 

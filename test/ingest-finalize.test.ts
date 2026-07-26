@@ -192,7 +192,7 @@ describe('finalizeIngest', () => {
 
   test('copies assets and rewrites markdown in source order', () => {
     const vault = makeVault();
-    const runtime = resolveRuntimeLayout(vault, {});
+    const runtime = resolveRuntimeLayout(vault);
     let observedExternalState = false;
     const result = finalizeIngest(validArticleInput(vault), {
       beforeArtifactPublish() {
@@ -956,11 +956,11 @@ describe('finalizeIngest', () => {
         fs.mkdirSync(staging);
         fs.writeFileSync(path.join(staging, 'note.md'), 'legacy');
       }
-      const runtime = resolveRuntimeLayout(vault, {});
+      const runtime = resolveRuntimeLayout(vault);
 
       expect(() => finalizeIngest(validArticleInput(vault)))
         .toThrow(/legacy.*runtime state|manual recovery/i);
-      expect(fs.existsSync(runtime.runtimeBase)).toBeFalse();
+      expect(fs.existsSync(runtime.runtimeRoot)).toBeFalse();
       expect(fs.existsSync(expectedNote(vault))).toBeFalse();
     },
   );
@@ -973,11 +973,11 @@ describe('finalizeIngest', () => {
         path.join(path.dirname(vault), `missing-${directory}`),
         path.join(vault, '.me', directory),
       );
-      const runtime = resolveRuntimeLayout(vault, {});
+      const runtime = resolveRuntimeLayout(vault);
 
       expect(() => finalizeIngest(validArticleInput(vault)))
         .toThrow(/legacy.*runtime state|manual recovery/i);
-      expect(fs.existsSync(runtime.runtimeBase)).toBeFalse();
+      expect(fs.existsSync(runtime.runtimeRoot)).toBeFalse();
       expect(fs.existsSync(expectedNote(vault))).toBeFalse();
     },
   );
