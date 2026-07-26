@@ -433,20 +433,25 @@ describe('vault-write CLI JSON boundary', () => {
     expect(`${internal.stdout}${internal.stderr}`).not.toContain(injected);
   });
 
-  test('SIGINT leaves a journal that the next unlocked invocation reports for recovery', async () => {
+  test('SIGINT after a recognizable journal preserves it for manual recovery', async () => {
     const vault = makeVault();
     const preloadDirectory = temporaryDirectory('me-vault-cli-sigint-');
     const preload = path.join(preloadDirectory, 'preload.ts');
+    const afterJournalMarker = path.join(preloadDirectory, 'after-journal.marker');
     fs.writeFileSync(preload, [
-      "import fs from 'node:fs';",
+      "import { createRequire, syncBuiltinESMExports } from 'node:module';",
+      'const require = createRequire(import.meta.url);',
+      "const fs = require('node:fs') as typeof import('node:fs');",
       'const original = fs.linkSync;',
       'fs.linkSync = ((source, destination) => {',
       "  if (String(destination).endsWith('.probe')) {",
+      `    fs.writeFileSync(${JSON.stringify(afterJournalMarker)}, 'ready');`,
       '    const deadline = Date.now() + 10_000;',
       '    while (Date.now() < deadline) {}',
       '  }',
       '  return original(source, destination);',
       '}) as typeof fs.linkSync;',
+      'syncBuiltinESMExports();',
     ].join('\n'));
     const child = spawn(
       'bun',
@@ -455,11 +460,43 @@ describe('vault-write CLI JSON boundary', () => {
     );
     child.stdin.end(JSON.stringify(request()));
 
+    let journalPath: string | undefined;
     try {
       await waitFor(() => {
         const tmp = path.join(vault, '.me/tmp');
-        return fs.existsSync(tmp)
-          && fs.readdirSync(tmp).some(name => name.startsWith('vault-write-'));
+        if (!fs.existsSync(afterJournalMarker) || !fs.existsSync(tmp)) return false;
+        for (const name of fs.readdirSync(tmp)) {
+          const operation = name.match(
+            /^vault-write-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/,
+          );
+          if (!operation) continue;
+          const candidate = path.join(tmp, name, 'journal.json');
+          try {
+            const journal = JSON.parse(fs.readFileSync(candidate, 'utf8')) as {
+              version?: unknown;
+              operationId?: unknown;
+              state?: unknown;
+            };
+            if (
+              journal.version === 1
+              && journal.operationId === operation[1]
+              && [
+                'locked',
+                'staged',
+                'note-published',
+                'index-preserved',
+                'index-published',
+                'validated',
+              ].includes(journal.state as string)
+            ) {
+              journalPath = candidate;
+              return true;
+            }
+          } catch {
+            // The journal is not yet complete enough to justify interruption.
+          }
+        }
+        return false;
       });
       child.kill('SIGINT');
       await new Promise<void>((resolve, reject) => {
@@ -473,18 +510,85 @@ describe('vault-write CLI JSON boundary', () => {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
 
-    const operations = fs.readdirSync(path.join(vault, '.me/tmp'))
-      .filter(name => name.startsWith('vault-write-'));
-    expect(operations.length).toBeGreaterThan(0);
-    expect(operations.some(name => fs.existsSync(
-      path.join(vault, '.me/tmp', name, 'journal.json'),
-    ))).toBeTrue();
+    expect(journalPath).toBeDefined();
+    expect(fs.existsSync(journalPath!)).toBeTrue();
 
     const staleLock = path.join(vault, '.me/locks/vault-write.lock');
     if (fs.existsSync(staleLock)) fs.unlinkSync(staleLock);
     const recovery = invoke(['write', '--vault-dir', vault], JSON.stringify(request()));
     const body = expectPublicFailure(recovery, 'INCOMPLETE_OPERATION');
-    expect((body.recoveries as unknown[]).length).toBeGreaterThan(0);
+    const recoveries = body.recoveries as Array<Record<string, unknown>>;
+    expect(recoveries.some(item =>
+      item.state === 'incomplete-operation'
+      && item.journal === path.relative(vault, journalPath!).split(path.sep).join('/'),
+    )).toBeTrue();
+    expect(JSON.stringify(body)).not.toContain('MARKDOWN-SENTINEL');
+  });
+
+  test('SIGINT before journal creation leaves an unrecognized operation recovery', async () => {
+    const vault = makeVault();
+    const preloadDirectory = temporaryDirectory('me-vault-cli-pre-journal-sigint-');
+    const preload = path.join(preloadDirectory, 'preload.ts');
+    const beforeJournalMarker = path.join(preloadDirectory, 'before-journal.marker');
+    fs.writeFileSync(preload, [
+      "import { createRequire, syncBuiltinESMExports } from 'node:module';",
+      'const require = createRequire(import.meta.url);',
+      "const fs = require('node:fs') as typeof import('node:fs');",
+      'const original = fs.mkdirSync;',
+      'fs.mkdirSync = ((directory, options) => {',
+      '  const result = original(directory, options);',
+      "  if (/\\/vault-write-[0-9a-f-]+$/.test(String(directory))) {",
+      `    fs.writeFileSync(${JSON.stringify(beforeJournalMarker)}, 'ready');`,
+      '    const deadline = Date.now() + 10_000;',
+      '    while (Date.now() < deadline) {}',
+      '  }',
+      '  return result;',
+      '}) as typeof fs.mkdirSync;',
+      'syncBuiltinESMExports();',
+    ].join('\n'));
+    const child = spawn(
+      'bun',
+      ['run', '--preload', preload, cli, 'write', '--vault-dir', vault],
+      { cwd: pluginRoot, stdio: ['pipe', 'pipe', 'pipe'], env: process.env },
+    );
+    child.stdin.end(JSON.stringify(request()));
+
+    let operationDirectory: string | undefined;
+    try {
+      await waitFor(() => {
+        const tmp = path.join(vault, '.me/tmp');
+        if (!fs.existsSync(beforeJournalMarker) || !fs.existsSync(tmp)) return false;
+        const operation = fs.readdirSync(tmp).find(name =>
+          /^vault-write-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+            .test(name));
+        if (!operation) return false;
+        operationDirectory = path.join(tmp, operation);
+        return !fs.existsSync(path.join(operationDirectory, 'journal.json'));
+      });
+      child.kill('SIGINT');
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('SIGINT child did not exit')), 2_000);
+        child.once('close', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    }
+
+    expect(operationDirectory).toBeDefined();
+    expect(fs.existsSync(path.join(operationDirectory!, 'journal.json'))).toBeFalse();
+
+    const staleLock = path.join(vault, '.me/locks/vault-write.lock');
+    if (fs.existsSync(staleLock)) fs.unlinkSync(staleLock);
+    const recovery = invoke(['write', '--vault-dir', vault], JSON.stringify(request()));
+    const body = expectPublicFailure(recovery, 'INCOMPLETE_OPERATION');
+    const recoveries = body.recoveries as Array<Record<string, unknown>>;
+    expect(recoveries.some(item =>
+      item.state === 'unrecognized-operation'
+      && item.directory === path.relative(vault, operationDirectory!).split(path.sep).join('/'),
+    )).toBeTrue();
     expect(JSON.stringify(body)).not.toContain('MARKDOWN-SENTINEL');
   });
 });
