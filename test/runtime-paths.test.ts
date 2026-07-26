@@ -8,6 +8,7 @@ import {
   bootstrapRuntimeDirectories,
   resolveRuntimeLayout,
   runtimeDisplayPath,
+  runtimeLexicalDisplayPath,
 } from '../bin/runtime-paths';
 
 describe('external runtime path resolution', () => {
@@ -84,6 +85,19 @@ describe('external runtime path resolution', () => {
       .toThrow(/UNSAFE_PATH/);
     expect(() => runtimeDisplayPath(layout, path.join(vault, 'note.md')))
       .toThrow(/UNSAFE_PATH/);
+  });
+
+  test('renders a lexically contained unsafe entry for recovery reporting', () => {
+    const layout = resolveRuntimeLayout(vault, {});
+    bootstrapRuntimeDirectories(layout, [layout.transactionDir]);
+    const outside = path.join(fixtureRoot, 'foreign-journal');
+    const linkedJournal = path.join(layout.transactionDir, 'journal.json');
+    fs.writeFileSync(outside, '{}');
+    fs.symlinkSync(outside, linkedJournal);
+
+    expect(() => runtimeDisplayPath(layout, linkedJournal)).toThrow(/UNSAFE_PATH/);
+    expect(runtimeLexicalDisplayPath(layout, linkedJournal))
+      .toBe('<ME_RUNTIME>/transactions/journal.json');
   });
 
   test('bootstraps only requested contained directories with private permissions', () => {

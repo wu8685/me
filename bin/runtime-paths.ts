@@ -200,6 +200,15 @@ export function bootstrapRuntimeDirectories(
 
 export function runtimeDisplayPath(layout: RuntimeLayout, candidate: string): string {
   assertSafeRuntimePath(layout, candidate);
-  const relative = path.relative(layout.runtimeRoot, path.resolve(candidate));
+  return runtimeLexicalDisplayPath(layout, candidate);
+}
+
+export function runtimeLexicalDisplayPath(
+  layout: RuntimeLayout,
+  candidate: string,
+): string {
+  const absolute = path.resolve(candidate);
+  if (!isInside(layout.runtimeRoot, absolute)) fail('UNSAFE_PATH');
+  const relative = path.relative(layout.runtimeRoot, absolute);
   return relative ? `<ME_RUNTIME>/${relative.split(path.sep).join('/')}` : '<ME_RUNTIME>';
 }

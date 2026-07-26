@@ -8,6 +8,8 @@ import {
   type VaultWriteHooks,
 } from '../bin/vault-write/transaction.ts';
 import type { VaultWriteRequestV1 } from '../bin/vault-write/contracts.ts';
+import { resolveVaultLayout } from '../bin/vault-write/path-safety.ts';
+import { bootstrapRuntimeDirectories } from '../bin/runtime-paths.ts';
 
 const temporaryDirectories: string[] = [];
 const pluginRoot = path.resolve(import.meta.dir, '..');
@@ -25,7 +27,9 @@ function temporaryDirectory(prefix: string): string {
 }
 
 function makeVault(readme?: string): string {
-  const vault = temporaryDirectory('me-vault-transaction-');
+  const fixture = temporaryDirectory('me-vault-transaction-');
+  const vault = path.join(fixture, 'vault');
+  fs.mkdirSync(vault);
   fs.mkdirSync(path.join(vault, '.me'));
   for (const layer of ['raw', 'practices', 'cognition']) {
     fs.mkdirSync(path.join(vault, layer));
@@ -36,6 +40,27 @@ function makeVault(readme?: string): string {
     fs.writeFileSync(path.join(vault, 'practices/README.md'), readme, { mode: 0o640 });
   }
   return vault;
+}
+
+function transactionRoot(vault: string): string {
+  return resolveVaultLayout(vault).transactionDir;
+}
+
+function writerLockPath(vault: string): string {
+  return path.join(resolveVaultLayout(vault).lockDir, 'vault-write.lock');
+}
+
+function prepareRuntime(vault: string): ReturnType<typeof resolveVaultLayout> {
+  const layout = resolveVaultLayout(vault);
+  bootstrapRuntimeDirectories(layout, [layout.transactionDir, layout.lockDir]);
+  return layout;
+}
+
+function absoluteDisplayPath(vault: string, displayPath: string): string {
+  const runtimePrefix = '<ME_RUNTIME>/';
+  return displayPath.startsWith(runtimePrefix)
+    ? path.join(resolveVaultLayout(vault).runtimeRoot, ...displayPath.slice(runtimePrefix.length).split('/'))
+    : path.join(vault, ...displayPath.split('/'));
 }
 
 function request(secret = 'orchid-body'): VaultWriteRequestV1 {
@@ -114,7 +139,8 @@ function operation(
   state: string,
   overrides: Record<string, unknown> = {},
 ): string {
-  const directory = path.join(vault, '.me/tmp', `vault-write-${operationId}`);
+  const layout = prepareRuntime(vault);
+  const directory = path.join(layout.transactionDir, `vault-write-${operationId}`);
   fs.mkdirSync(directory, { recursive: true });
   fs.writeFileSync(path.join(directory, 'journal.json'), JSON.stringify({
     version: 1,
@@ -132,6 +158,7 @@ function isOpaqueRecoveryId(value: string): boolean {
 describe('preview and successful journaled create', () => {
   test('preview is byte-for-byte read-only and deterministic apart from operationId', () => {
     const vault = makeVault();
+    const layout = resolveVaultLayout(vault);
     const before = manifest(vault);
     const first = executeVaultWrite(vault, request(), { pluginRoot, mode: 'preview' });
     const second = executeVaultWrite(vault, request(), { pluginRoot, mode: 'preview' });
@@ -143,6 +170,7 @@ describe('preview and successful journaled create', () => {
     expect(first.operationId).not.toBe(second.operationId);
     expect({ ...first, operationId: '' }).toEqual({ ...second, operationId: '' });
     expect(fs.existsSync(path.join(vault, '.me/tmp'))).toBeFalse();
+    expect(fs.existsSync(layout.runtimeRoot)).toBeFalse();
   });
 
   test('publishes a note and a new README through staged hard links then detaches staging', () => {
@@ -162,13 +190,15 @@ describe('preview and successful journaled create', () => {
       'practices/README.md',
     ]);
     expect(mutations.some(item => item.startsWith('link:2'))).toBeTrue();
-    const operation = path.join(vault, '.me/tmp', `vault-write-${result.operationId}`);
+    const operation = path.join(transactionRoot(vault), `vault-write-${result.operationId}`);
     expect(fs.statSync(operation).mode & 0o777).toBe(0o700);
     expect(fs.readdirSync(operation).sort()).toEqual(['journal.json']);
     const journal = JSON.parse(fs.readFileSync(path.join(operation, 'journal.json'), 'utf8'));
     expect(journal.state).toBe('committed');
     expect(JSON.stringify(journal)).not.toContain('orchid-body');
     expect(fs.statSync(path.join(operation, 'journal.json')).mode & 0o777).toBe(0o600);
+    expect(fs.existsSync(path.join(vault, '.me/tmp'))).toBeFalse();
+    expect(fs.existsSync(path.join(vault, '.me/locks'))).toBeFalse();
   });
 
   test('preserves an existing README inode and permission bits when replacing it', () => {
@@ -180,8 +210,7 @@ describe('preview and successful journaled create', () => {
     expect(result.recoveryState).toBe('retained-originals');
     expect(result.recoveries).toHaveLength(1);
     const original = path.join(
-      vault,
-      '.me/tmp',
+      transactionRoot(vault),
       `vault-write-${result.operationId}`,
       'originals/README.md',
     );
@@ -194,16 +223,18 @@ describe('preview and successful journaled create', () => {
       'compare',
       'remove-owned',
     ]);
+    expect(result.recoveries[0].directory)
+      .toBe(`<ME_RUNTIME>/transactions/vault-write-${result.operationId}`);
   });
 });
 
 describe('lock precedence and operation discovery', () => {
   test('an existing lock wins over every incomplete or malformed operation', () => {
     const vault = makeVault();
-    fs.mkdirSync(path.join(vault, '.me/locks'), { recursive: true });
-    fs.mkdirSync(path.join(vault, '.me/tmp/vault-write-old'), { recursive: true });
-    fs.writeFileSync(path.join(vault, '.me/locks/vault-write.lock'), 'foreign');
-    fs.writeFileSync(path.join(vault, '.me/tmp/vault-write-old/journal.json'), '{bad');
+    const layout = prepareRuntime(vault);
+    fs.mkdirSync(path.join(layout.transactionDir, 'vault-write-old'), { recursive: true });
+    fs.writeFileSync(path.join(layout.lockDir, 'vault-write.lock'), 'foreign');
+    fs.writeFileSync(path.join(layout.transactionDir, 'vault-write-old/journal.json'), '{bad');
 
     const result = write(vault);
     expect(result.status).toBe('conflict');
@@ -211,9 +242,21 @@ describe('lock precedence and operation discovery', () => {
     expect(result.recoveries).toEqual([]);
   });
 
+  test('non-empty vault-local v1.5 state blocks before external runtime mutation', () => {
+    const vault = makeVault();
+    fs.mkdirSync(path.join(vault, '.me/tmp/vault-write-old'), { recursive: true });
+
+    const result = write(vault);
+
+    expect(result.status).toBe('manual_recovery');
+    expect(result.error?.code).toBe('LEGACY_RUNTIME_STATE');
+    expect(fs.existsSync(resolveVaultLayout(vault).runtimeRoot)).toBeFalse();
+    expect(fs.existsSync(path.join(vault, '.me/tmp/vault-write-old'))).toBeTrue();
+  });
+
   test('aggregates every no-lock incomplete and unrecognized operation', () => {
     const vault = makeVault();
-    const tmp = path.join(vault, '.me/tmp');
+    const tmp = prepareRuntime(vault).transactionDir;
     fs.mkdirSync(path.join(tmp, 'vault-write-valid'), { recursive: true });
     fs.writeFileSync(path.join(tmp, 'vault-write-valid/journal.json'), JSON.stringify({
       version: 1,
@@ -229,10 +272,10 @@ describe('lock precedence and operation discovery', () => {
     expect(result.error?.code).toBe('INCOMPLETE_OPERATION');
     expect(result.recoveryState).toBe('incomplete');
     expect(result.recoveries.map(item => item.directory)).toEqual([
-      '.me/tmp',
-      '.me/tmp',
-      '.me/tmp',
-      '.me/tmp',
+      '<ME_RUNTIME>/transactions',
+      '<ME_RUNTIME>/transactions',
+      '<ME_RUNTIME>/transactions',
+      '<ME_RUNTIME>/transactions',
     ]);
     expect(result.recoveries.every(item => isOpaqueRecoveryId(item.operationId))).toBeTrue();
     expect(new Set(result.recoveries.map(item => item.operationId)).size).toBe(4);
@@ -266,10 +309,10 @@ describe('lock precedence and operation discovery', () => {
     expect(result.error?.code).toBe('INCOMPLETE_OPERATION');
     expect(result.recoveries).toHaveLength(1);
     expect(isOpaqueRecoveryId(result.recoveries[0].operationId)).toBeTrue();
-    expect(result.recoveries[0].directory).toBe('.me/tmp');
+    expect(result.recoveries[0].directory).toBe('<ME_RUNTIME>/transactions');
     expect(opens).toBe(0);
     expect(releases).toBe(0);
-    expect(fs.existsSync(path.join(vault, '.me/locks/vault-write.lock'))).toBeFalse();
+    expect(fs.existsSync(writerLockPath(vault))).toBeFalse();
   });
 
   test.each([
@@ -280,7 +323,7 @@ describe('lock precedence and operation discovery', () => {
     'ownership',
   ] as const)('closes the acquisition descriptor and safely handles an injected %s failure', stage => {
     const vault = makeVault();
-    const lockPath = path.join(vault, '.me/locks/vault-write.lock');
+    const lockPath = writerLockPath(vault);
     let closes = 0;
     const injected = () => {
       const error = new Error(`injected ${stage}`) as NodeJS.ErrnoException;
@@ -320,7 +363,7 @@ describe('lock precedence and operation discovery', () => {
 
   test('preserves a lock replacement introduced between acquisition identity checks', () => {
     const vault = makeVault();
-    const lockPath = path.join(vault, '.me/locks/vault-write.lock');
+    const lockPath = writerLockPath(vault);
     let inspected = false;
     let closes = 0;
 
@@ -353,7 +396,7 @@ describe('lock precedence and operation discovery', () => {
 
   test('aggregates a racing startup operation with acquisition cleanup recovery', () => {
     const vault = makeVault();
-    const lockPath = path.join(vault, '.me/locks/vault-write.lock');
+    const lockPath = writerLockPath(vault);
 
     const result = executeVaultWrite(vault, request(), {
       pluginRoot,
@@ -421,8 +464,9 @@ describe('lock precedence and operation discovery', () => {
 
   test('a minimal committed marker without exact committed content is unrecognized', () => {
     const vault = makeVault();
-    fs.mkdirSync(path.join(vault, '.me/tmp/vault-write-done'), { recursive: true });
-    fs.writeFileSync(path.join(vault, '.me/tmp/vault-write-done/journal.json'), JSON.stringify({
+    const tmp = prepareRuntime(vault).transactionDir;
+    fs.mkdirSync(path.join(tmp, 'vault-write-done'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'vault-write-done/journal.json'), JSON.stringify({
       version: 1,
       operationId: 'done',
       state: 'committed',
@@ -451,7 +495,7 @@ describe('lock precedence and operation discovery', () => {
 
   test('classifies malformed, unknown, mismatched, symlink and non-file journals', () => {
     const vault = makeVault();
-    const tmp = path.join(vault, '.me/tmp');
+    const tmp = prepareRuntime(vault).transactionDir;
     operation(vault, 'unknown-state', 'future');
     operation(vault, 'unknown-version', 'staged', { version: 2 });
     const mismatch = operation(vault, 'directory-id', 'staged', { operationId: 'journal-id' });
@@ -512,7 +556,7 @@ describe('lock precedence and operation discovery', () => {
     expect(result.recoveries.every(item =>
       isOpaqueRecoveryId(item.operationId)
       && item.state === 'unrecognized-operation'
-      && item.directory === '.me/tmp')).toBeTrue();
+      && item.directory === '<ME_RUNTIME>/transactions')).toBeTrue();
     expect(new Set(result.recoveries.map(item => item.operationId)).size).toBe(2);
   });
 
@@ -523,7 +567,7 @@ describe('lock precedence and operation discovery', () => {
     expect(result.status).toBe('manual_recovery');
     expect(result.recoveries[0].state).toBe('unrecognized-operation');
     expect(isOpaqueRecoveryId(result.recoveries[0].operationId)).toBeTrue();
-    expect(result.recoveries[0].directory).toBe('.me/tmp');
+    expect(result.recoveries[0].directory).toBe('<ME_RUNTIME>/transactions');
     expect(result.recoveries[0].journal).toBeUndefined();
   });
 
@@ -536,13 +580,13 @@ describe('lock precedence and operation discovery', () => {
     });
     expect(result.status).toBe('manual_recovery');
     expect(result.error?.code).toBe('RECOVERY_REQUIRED');
-    expect(fs.readFileSync(path.join(vault, '.me/locks/vault-write.lock'), 'utf8'))
+    expect(fs.readFileSync(writerLockPath(vault), 'utf8'))
       .toBe('foreign lock bytes');
   });
 
   test('a final lock descriptor close failure preserves the lock and skips unlink', () => {
     const vault = makeVault();
-    const lockPath = path.join(vault, '.me/locks/vault-write.lock');
+    const lockPath = writerLockPath(vault);
     const unlinks: string[] = [];
     let closes = 0;
     const result = executeVaultWrite(vault, request(), {
@@ -570,7 +614,7 @@ describe('lock precedence and operation discovery', () => {
     expect(fs.existsSync(lockPath)).toBeTrue();
     expect(unlinks).not.toContain(lockPath);
     expect(result.recoveries.flatMap(item => item.preservedPaths))
-      .toContain('.me/locks/vault-write.lock');
+      .toContain('<ME_RUNTIME>/locks/vault-write.lock');
   });
 
   test('a nested cooperative writer observes LOCK_HELD while the owner completes', () => {
@@ -588,10 +632,10 @@ describe('lock precedence and operation discovery', () => {
 
   test('LOCK_HELD precedes schema, target, graph, and recovery planning failures', () => {
     const vault = makeVault();
-    fs.mkdirSync(path.join(vault, '.me/locks'), { recursive: true });
-    fs.mkdirSync(path.join(vault, '.me/tmp/vault-write-bad'), { recursive: true });
-    fs.writeFileSync(path.join(vault, '.me/tmp/vault-write-bad/journal.json'), '{bad');
-    fs.writeFileSync(path.join(vault, '.me/locks/vault-write.lock'), 'foreign lock');
+    const layout = prepareRuntime(vault);
+    fs.mkdirSync(path.join(layout.transactionDir, 'vault-write-bad'), { recursive: true });
+    fs.writeFileSync(path.join(layout.transactionDir, 'vault-write-bad/journal.json'), '{bad');
+    fs.writeFileSync(path.join(layout.lockDir, 'vault-write.lock'), 'foreign lock');
     fs.writeFileSync(path.join(vault, 'SCHEMA.md'), 'unsupported schema');
     fs.mkdirSync(path.join(
       vault,
@@ -608,7 +652,7 @@ describe('lock precedence and operation discovery', () => {
     const vault = makeVault();
     const first = write(vault);
     expect(first.status).toBe('committed');
-    const directory = path.join(vault, '.me/tmp', `vault-write-${first.operationId}`);
+    const directory = path.join(transactionRoot(vault), `vault-write-${first.operationId}`);
     const journalPath = path.join(directory, 'journal.json');
     const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
     journal.pendingMutation = { kind: 'unlink', paths: ['staging/note.md'] };
@@ -655,9 +699,8 @@ describe('journal acquisition and phase ownership', () => {
         const operationDirectory = hookName === 'beforeCommitCleanup'
           ? args[0]
           : path.join(
-            vault,
-            '.me/tmp',
-            fs.readdirSync(path.join(vault, '.me/tmp'))
+            transactionRoot(vault),
+            fs.readdirSync(transactionRoot(vault))
               .find(name => name.startsWith('vault-write-'))!,
           );
         const journal = path.join(operationDirectory, 'journal.json');
@@ -671,7 +714,7 @@ describe('journal acquisition and phase ownership', () => {
     expect(result.status).toBe('manual_recovery');
     const journal = result.recoveries.flatMap(item => item.preservedPaths)
       .find(item => item.endsWith('/journal.json'))!;
-    expect(fs.readFileSync(path.join(vault, ...journal.split('/')), 'utf8')).toBe(replacement);
+    expect(fs.readFileSync(absoluteDisplayPath(vault, journal), 'utf8')).toBe(replacement);
   });
 
   test('never follows or truncates a symlink substituted for the journal', () => {
@@ -681,9 +724,9 @@ describe('journal acquisition and phase ownership', () => {
     fs.writeFileSync(foreign, 'outside-bytes');
     const result = write(vault, {
       afterStaging() {
-        const operationName = fs.readdirSync(path.join(vault, '.me/tmp'))
+        const operationName = fs.readdirSync(transactionRoot(vault))
           .find(name => name.startsWith('vault-write-'))!;
-        const journal = path.join(vault, '.me/tmp', operationName, 'journal.json');
+        const journal = path.join(transactionRoot(vault), operationName, 'journal.json');
         fs.unlinkSync(journal);
         fs.symlinkSync(foreign, journal);
       },
@@ -722,7 +765,7 @@ describe('fingerprint, no-clobber, and rollback windows', () => {
       },
     });
     expect(first.status).toBe('conflict');
-    expect(fs.readdirSync(path.join(vault, '.me/tmp'))
+    expect(fs.readdirSync(transactionRoot(vault))
       .filter(name => name.startsWith('vault-write-'))).toEqual([]);
     fs.unlinkSync(config);
     expect(write(vault).status).toBe('committed');
@@ -848,7 +891,7 @@ describe('fingerprint, no-clobber, and rollback windows', () => {
     let fingerprint: Record<string, unknown> | undefined;
     const result = write(vault, {
       afterStaging() {
-        const tmp = path.join(vault, '.me/tmp');
+        const tmp = transactionRoot(vault);
         const operationName = fs.readdirSync(tmp).find(name => name.startsWith('vault-write-'))!;
         fingerprint = JSON.parse(fs.readFileSync(
           path.join(tmp, operationName, 'fingerprint.json'),
@@ -915,13 +958,17 @@ describe('fingerprint, no-clobber, and rollback windows', () => {
     expect(result.error?.code).toBe('INPUT_CHANGED');
   });
 
-  test.each(['tmp', 'locks'] as const)(
-    'fingerprints .me/%s metadata after lock acquisition',
+  test.each(['transactions', 'locks'] as const)(
+    'fingerprints external runtime %s metadata after lock acquisition',
     internal => {
       const vault = makeVault();
       const result = write(vault, {
         afterLock() {
-          fs.chmodSync(path.join(vault, '.me', internal), 0o755);
+          const layout = resolveVaultLayout(vault);
+          fs.chmodSync(
+            internal === 'transactions' ? layout.transactionDir : layout.lockDir,
+            0o755,
+          );
         },
       });
       expect(result.status).toBe('conflict');
@@ -968,8 +1015,7 @@ describe('README concurrency and cleanup ownership', () => {
     expect(fs.readFileSync(path.join(vault, 'practices/README.md'), 'utf8'))
       .toBe('# Foreign create\n');
     const original = path.join(
-      vault,
-      '.me/tmp',
+      transactionRoot(vault),
       `vault-write-${result.operationId}`,
       'originals/README.md',
     );
@@ -986,7 +1032,7 @@ describe('README concurrency and cleanup ownership', () => {
     expect(result.status).toBe('manual_recovery');
     const original = result.recoveries.flatMap(item => item.preservedPaths)
       .find(item => item.endsWith('/originals/README.md'))!;
-    expect(fs.readFileSync(path.join(vault, ...original.split('/')), 'utf8'))
+    expect(fs.readFileSync(absoluteDisplayPath(vault, original), 'utf8'))
       .toBe('# Open editor write\n');
   });
 
@@ -1077,7 +1123,7 @@ describe('README concurrency and cleanup ownership', () => {
     let injected = false;
     const result = write(vault, {
       beforeFsMutation(kind, paths) {
-        if (kind !== 'mkdir' || injected || !paths[0].endsWith('.me/tmp')) return;
+        if (kind !== 'mkdir' || injected || !paths[0].endsWith('transactions')) return;
         injected = true;
         fs.symlinkSync(outside, paths[0]);
       },
@@ -1119,7 +1165,7 @@ describe('README concurrency and cleanup ownership', () => {
     expect(injected).toBeTrue();
     const staged = result.recoveries.flatMap(item => item.preservedPaths)
       .find(item => item.endsWith('/staging/note.md'))!;
-    expect(fs.readFileSync(path.join(vault, ...staged.split('/')), 'utf8'))
+    expect(fs.readFileSync(absoluteDisplayPath(vault, staged), 'utf8'))
       .toBe('foreign unlink bytes');
   });
 
@@ -1183,7 +1229,7 @@ describe('README concurrency and cleanup ownership', () => {
         .find(item => target === 'staging'
           ? item.endsWith('/staging')
           : item.endsWith('practices/decisions'))!;
-      expect(fs.statSync(path.join(vault, ...replaced.split('/'))).isDirectory()).toBeTrue();
+      expect(fs.statSync(absoluteDisplayPath(vault, replaced)).isDirectory()).toBeTrue();
     },
   );
 

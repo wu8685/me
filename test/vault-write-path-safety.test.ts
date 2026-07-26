@@ -4,11 +4,16 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   assertSafeWriterPath,
+  detectLegacyVaultWriterState,
   resolveVaultLayout,
   resolveWriteTarget,
   vaultRelative,
 } from '../bin/vault-write/path-safety.ts';
 import { parseVaultWriteRequest } from '../bin/vault-write/contracts.ts';
+import {
+  assertSafeRuntimePath,
+  bootstrapRuntimeDirectories,
+} from '../bin/runtime-paths.ts';
 
 const temporaryDirectories: string[] = [];
 
@@ -25,7 +30,8 @@ function temporaryDirectory(prefix: string): string {
 }
 
 function makeVault(config?: string, layerPaths = ['raw', 'practices', 'cognition']): string {
-  const vault = temporaryDirectory('me-vault-write-');
+  const fixture = temporaryDirectory('me-vault-write-');
+  const vault = path.join(fixture, 'vault');
   fs.mkdirSync(path.join(vault, '.me'), { recursive: true });
   fs.writeFileSync(path.join(vault, 'SCHEMA.md'), '# Schema\n');
   for (const layer of layerPaths) fs.mkdirSync(path.join(vault, layer), { recursive: true });
@@ -79,7 +85,8 @@ describe('resolveVaultLayout configuration', () => {
     ]);
     const layout = resolveVaultLayout(vault);
     expect(layout.layers.practices).toBe(path.join(vault, 'knowledge/practices'));
-    expect(fs.existsSync(layout.tmpDir)).toBeFalse();
+    expect(layout.runtimeRoot.startsWith(`${vault}${path.sep}`)).toBeFalse();
+    expect(fs.existsSync(layout.transactionDir)).toBeFalse();
     expect(fs.existsSync(layout.lockDir)).toBeFalse();
   });
 
@@ -125,15 +132,17 @@ describe('resolveVaultLayout containment matrices', () => {
     expectInvalidConfig(() => resolveVaultLayout(vault));
   });
 
-  test('accepts the intended internal nesting tree', () => {
+  test('accepts the intended external runtime nesting tree', () => {
     const vault = makeVault();
-    fs.mkdirSync(path.join(vault, '.me/tmp/vault-write-op/originals'), { recursive: true });
-    fs.mkdirSync(path.join(vault, '.me/locks'), { recursive: true });
-    fs.writeFileSync(path.join(vault, '.me/locks/vault-write.lock'), 'lock');
     const layout = resolveVaultLayout(vault);
-    assertSafeWriterPath(layout, path.join(layout.tmpDir, 'vault-write-op/originals'), 'originals');
-    assertSafeWriterPath(layout, path.join(layout.lockDir, 'vault-write.lock'), 'lock');
-    expect(path.relative(layout.tmpDir, layout.lockDir).startsWith('..')).toBeTrue();
+    bootstrapRuntimeDirectories(layout, [layout.transactionDir, layout.lockDir]);
+    fs.mkdirSync(path.join(layout.transactionDir, 'vault-write-op/originals'), { recursive: true });
+    fs.writeFileSync(path.join(layout.lockDir, 'vault-write.lock'), 'lock');
+    assertSafeRuntimePath(layout, path.join(layout.transactionDir, 'vault-write-op/originals'));
+    assertSafeRuntimePath(layout, path.join(layout.lockDir, 'vault-write.lock'));
+    expect(path.relative(layout.transactionDir, layout.lockDir).startsWith('..')).toBeTrue();
+    expect(fs.existsSync(path.join(vault, '.me/tmp'))).toBeFalse();
+    expect(fs.existsSync(path.join(vault, '.me/locks'))).toBeFalse();
   });
 });
 
@@ -155,15 +164,31 @@ describe('resolveVaultLayout filesystem identity', () => {
     expectUnsafe(() => resolveVaultLayout(vault));
   });
 
-  test.each(['tmp', 'locks'])('rejects escaping and dangling .me/%s symlinks', child => {
+  test.each(['tmp', 'locks'])('rejects escaping and dangling legacy .me/%s symlinks', child => {
     const vault = makeVault();
     const outside = temporaryDirectory('me-vault-write-outside-');
     fs.symlinkSync(outside, path.join(vault, '.me', child));
-    expectUnsafe(() => resolveVaultLayout(vault));
+    const layout = resolveVaultLayout(vault);
+    expectUnsafe(() => detectLegacyVaultWriterState(layout));
 
     fs.unlinkSync(path.join(vault, '.me', child));
     fs.symlinkSync(path.join(outside, 'missing'), path.join(vault, '.me', child));
-    expectUnsafe(() => resolveVaultLayout(vault));
+    expectUnsafe(() => detectLegacyVaultWriterState(layout));
+  });
+
+  test('allows empty legacy directories and reports every non-empty legacy entry', () => {
+    const vault = makeVault();
+    const layout = resolveVaultLayout(vault);
+    fs.mkdirSync(path.join(vault, '.me/tmp'));
+    fs.mkdirSync(path.join(vault, '.me/locks'));
+    expect(detectLegacyVaultWriterState(layout)).toEqual([]);
+
+    fs.mkdirSync(path.join(vault, '.me/tmp/vault-write-old'));
+    fs.writeFileSync(path.join(vault, '.me/locks/vault-write.lock'), 'legacy');
+    expect(detectLegacyVaultWriterState(layout)).toEqual([
+      '.me/locks/vault-write.lock',
+      '.me/tmp/vault-write-old',
+    ]);
   });
 
   test('rejects escaping config, schema, layer, and README symlinks', () => {

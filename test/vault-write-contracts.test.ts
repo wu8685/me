@@ -122,6 +122,7 @@ describe('WRITER_ERROR_CATALOG', () => {
       POST_VALIDATION_FAILED: { status: 'validation_failed', exitCode: 2, message: 'Post-write validation failed and owned changes were restored.' },
       INCOMPLETE_OPERATION: { status: 'manual_recovery', exitCode: 4, message: 'One or more incomplete operations require inspection.' },
       RECOVERY_REQUIRED: { status: 'manual_recovery', exitCode: 4, message: 'Conflicting content was preserved; manual recovery is required.' },
+      LEGACY_RUNTIME_STATE: { status: 'manual_recovery', exitCode: 4, message: 'Vault-local ME 1.5 runtime state requires inspection.' },
       INTERNAL_ERROR: { status: 'validation_failed', exitCode: 1, message: 'Vault write could not complete safely.' },
     });
     expect(Object.isFrozen(WRITER_ERROR_CATALOG)).toBeTrue();

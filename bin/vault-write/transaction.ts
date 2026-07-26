@@ -12,6 +12,7 @@ import {
 } from './contracts';
 import {
   assertSafeWriterPath,
+  detectLegacyVaultWriterState,
   resolveVaultLayout,
   resolveWriteTarget,
   type ResolvedVaultLayout,
@@ -30,6 +31,12 @@ import {
   validateNoteMarkdown,
   type ValidatedNote,
 } from './schema';
+import {
+  assertSafeRuntimePath,
+  bootstrapRuntimeDirectories,
+  RuntimePathError,
+  runtimeLexicalDisplayPath,
+} from '../runtime-paths';
 
 export interface VaultWriteHooks {
   beforeFsMutation?(
@@ -185,13 +192,35 @@ function requestDigest(request: VaultWriteRequestV1): string {
   return sha256(Buffer.from(JSON.stringify(request), 'utf8'));
 }
 
-function lexicalVaultRelative(layout: ResolvedVaultLayout, absolute: string): string {
+function isInside(root: string, candidate: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function displayRelative(layout: ResolvedVaultLayout, absolute: string): string {
   const candidate = path.resolve(absolute);
-  if (
-    candidate !== layout.lexicalVault
-    && !candidate.startsWith(`${layout.lexicalVault}${path.sep}`)
-  ) throw new VaultWriterError('UNSAFE_PATH');
-  return path.relative(layout.lexicalVault, candidate).split(path.sep).join('/') || '.';
+  if (isInside(layout.lexicalVault, candidate)) {
+    return path.relative(layout.lexicalVault, candidate).split(path.sep).join('/') || '.';
+  }
+  if (isInside(layout.runtimeRoot, candidate)) {
+    return runtimeLexicalDisplayPath(layout, candidate);
+  }
+  throw new VaultWriterError('UNSAFE_PATH');
+}
+
+function assertSafeMutationPath(
+  layout: ResolvedVaultLayout,
+  candidate: string,
+  label: string,
+): void {
+  if (isInside(layout.runtimeRoot, path.resolve(candidate))) {
+    try {
+      assertSafeRuntimePath(layout, candidate);
+      return;
+    } catch {
+      throw new VaultWriterError('UNSAFE_PATH');
+    }
+  }
+  assertSafeWriterPath(layout, candidate, label);
 }
 
 function errno(error: unknown): string | undefined {
@@ -388,7 +417,7 @@ function pathState(
   layout: ResolvedVaultLayout,
   absolute: string,
 ): PlanFingerprintV1['pathIdentities'][number] {
-  const relative = vaultRelative(layout, absolute);
+  const relative = displayRelative(layout, absolute);
   try {
     const stat = fs.lstatSync(absolute);
     if (!stat.isFile() && !stat.isDirectory()) throw new VaultWriterError('UNSAFE_PATH');
@@ -418,7 +447,7 @@ function makeFingerprint(
   const directPaths = [
     ...Object.values(layout.layers),
     layout.meDir,
-    layout.tmpDir,
+    layout.transactionDir,
     layout.lockDir,
     path.join(layout.lockDir, 'vault-write.lock'),
     path.dirname(target.notePath),
@@ -428,7 +457,10 @@ function makeFingerprint(
   const allPaths = new Set<string>(directPaths);
   for (const candidate of directPaths) {
     let current = path.resolve(candidate);
-    while (current !== layout.lexicalVault) {
+    const root = isInside(layout.runtimeRoot, current)
+      ? layout.runtimeRoot
+      : layout.lexicalVault;
+    while (current !== root) {
       allPaths.add(current);
       const parent = path.dirname(current);
       if (parent === current) break;
@@ -578,9 +610,18 @@ const PUBLIC_OPERATION_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function publicRecovery(recovery: VaultWriteRecovery): VaultWriteRecovery {
-  const generatedDirectory = `.me/tmp/vault-write-${recovery.operationId}`;
-  const trustedDirectory = recovery.directory === '.me/tmp'
-    || recovery.directory === '.me/locks'
+  if (
+    recovery.operationId === 'legacy-v1.5'
+    && recovery.directory === '.me'
+    && recovery.journal === undefined
+    && recovery.preservedPaths.every(item =>
+      item.startsWith('.me/tmp/') || item.startsWith('.me/locks/'))
+  ) {
+    return recovery;
+  }
+  const generatedDirectory = `<ME_RUNTIME>/transactions/vault-write-${recovery.operationId}`;
+  const trustedDirectory = recovery.directory === '<ME_RUNTIME>/transactions'
+    || recovery.directory === '<ME_RUNTIME>/locks'
     || recovery.directory === generatedDirectory;
   const trustedJournal = recovery.journal === undefined
     || (
@@ -594,9 +635,9 @@ function publicRecovery(recovery: VaultWriteRecovery): VaultWriteRecovery {
   ) return recovery;
   const operationId =
     `recovery-${sha256(Buffer.from(JSON.stringify(recovery), 'utf8')).slice(0, 12)}`;
-  const directory = recovery.directory.startsWith('.me/locks')
-    ? '.me/locks'
-    : '.me/tmp';
+  const directory = recovery.directory.startsWith('<ME_RUNTIME>/locks')
+    ? '<ME_RUNTIME>/locks'
+    : '<ME_RUNTIME>/transactions';
   return {
     operationId,
     state: recovery.state,
@@ -707,16 +748,16 @@ function scanRecoveries(
 ): VaultWriteRecovery[] {
   let names: string[];
   try {
-    names = (operations.readdirSync(layout.tmpDir) as string[])
+    names = (operations.readdirSync(layout.transactionDir) as string[])
       .filter(name => name.startsWith('vault-write-'))
       .sort();
   } catch (error) {
     if (errno(error) === 'ENOENT') return [];
     return [recoveryAction(
       'unrecognized',
-      '.me/tmp',
+      '<ME_RUNTIME>/transactions',
       'unrecognized-operation',
-      ['.me/tmp'],
+      ['<ME_RUNTIME>/transactions'],
       ['Inspect the unreadable operation directory.'],
     )];
   }
@@ -729,8 +770,8 @@ function scanRecoveries(
   };
   const candidates: Candidate[] = [];
   for (const name of names) {
-    const directory = path.join(layout.tmpDir, name);
-    const relativeDirectory = `.me/tmp/${name}`;
+    const directory = path.join(layout.transactionDir, name);
+    const relativeDirectory = `<ME_RUNTIME>/transactions/${name}`;
     const fallbackId = name.slice('vault-write-'.length) || 'unrecognized';
     let stat: fs.Stats;
     try {
@@ -855,7 +896,7 @@ function scanRecoveries(
   for (const item of candidates) counts.set(item.operationId, (counts.get(item.operationId) ?? 0) + 1);
   for (const item of candidates) {
     if ((counts.get(item.operationId) ?? 0) <= 1) continue;
-    const directory = `.me/tmp/${item.name}`;
+    const directory = `<ME_RUNTIME>/transactions/${item.name}`;
     item.committed = false;
     item.recovery = recoveryAction(
       item.operationId,
@@ -895,13 +936,13 @@ class Transaction {
   }
 
   private relative(file: string): string {
-    return vaultRelative(this.plan.layout, file);
+    return displayRelative(this.plan.layout, file);
   }
 
   private validateMutation(kind: MutationKind, paths: string[]): void {
     this.hooks.beforeFsMutation?.(kind, paths);
     for (const candidate of paths) {
-      assertSafeWriterPath(this.plan.layout, candidate, `${kind} boundary`);
+      assertSafeMutationPath(this.plan.layout, candidate, `${kind} boundary`);
     }
   }
 
@@ -1084,7 +1125,7 @@ class Transaction {
   verifyJournalOwnership(): boolean {
     if (!this.journalPath || this.journalDescriptor === undefined || !this.journalOwned) return false;
     try {
-      assertSafeWriterPath(this.plan.layout, this.journalPath, 'journal ownership');
+      assertSafeMutationPath(this.plan.layout, this.journalPath, 'journal ownership');
       const entry = fs.lstatSync(this.journalPath, { bigint: true });
       const opened = fs.fstatSync(this.journalDescriptor, { bigint: true });
       return entry.isFile()
@@ -1136,8 +1177,15 @@ function compareFingerprints(first: PlanFingerprintV1, second: PlanFingerprintV1
 }
 
 function snapshotFingerprintPaths(plan: PlannedWrite): PlanFingerprintV1['pathIdentities'] {
-  return plan.fingerprint.pathIdentities.map(item =>
-    pathState(plan.layout, path.join(plan.layout.lexicalVault, ...item.path.split('/'))));
+  return plan.fingerprint.pathIdentities.map(item => {
+    const runtimePrefix = '<ME_RUNTIME>/';
+    const absolute = item.path === '<ME_RUNTIME>'
+      ? plan.layout.runtimeRoot
+      : item.path.startsWith(runtimePrefix)
+        ? path.join(plan.layout.runtimeRoot, ...item.path.slice(runtimePrefix.length).split('/'))
+        : path.join(plan.layout.lexicalVault, ...item.path.split('/'));
+    return pathState(plan.layout, absolute);
+  });
 }
 
 function assertBoundaryPaths(
@@ -1332,7 +1380,7 @@ function acquireLock(
     if (failedAcquisitionStillOwned(lockPath, descriptor, bytes, operationId)) {
       try {
         options.hooks?.beforeFsMutation?.('unlink', [lockPath]);
-        assertSafeWriterPath(layout, lockPath, 'failed lock acquisition cleanup');
+        assertSafeMutationPath(layout, lockPath, 'failed lock acquisition cleanup');
         if (failedAcquisitionStillOwned(lockPath, descriptor, bytes, operationId)) {
           operations.unlinkSync(lockPath);
           removed = true;
@@ -1357,9 +1405,9 @@ function acquireLock(
     ...(!removed || !closed ? {
       recovery: recoveryAction(
         operationId,
-        '.me/locks',
+        '<ME_RUNTIME>/locks',
         'ownership-conflict',
-        ['.me/locks/vault-write.lock'],
+        ['<ME_RUNTIME>/locks/vault-write.lock'],
         ['Inspect the failed cooperative-lock acquisition and remove only owned content.'],
       ),
     } : {}),
@@ -1395,7 +1443,7 @@ function bootstrapDirectory(
     if (errno(error) !== 'ENOENT') throw error;
   }
   options.hooks?.beforeFsMutation?.('mkdir', [directory]);
-  assertSafeWriterPath(layout, directory, 'bootstrap directory');
+  assertSafeMutationPath(layout, directory, 'bootstrap directory');
   try {
     operations.lstatSync(directory);
     throw new VaultWriterError('INPUT_CHANGED');
@@ -1404,6 +1452,19 @@ function bootstrapDirectory(
     if (errno(error) !== 'ENOENT') throw error;
   }
   operations.mkdirSync(directory, { mode: 0o700 });
+}
+
+function bootstrapRuntimeRoot(layout: ResolvedVaultLayout): void {
+  try {
+    bootstrapRuntimeDirectories(layout, []);
+  } catch (error) {
+    if (error instanceof RuntimePathError) {
+      throw new VaultWriterError(
+        error.code === 'UNSUPPORTED_FILESYSTEM' ? 'UNSUPPORTED_FILESYSTEM' : 'UNSAFE_PATH',
+      );
+    }
+    throw error;
+  }
 }
 
 function releaseOwnedLockEarly(
@@ -1417,7 +1478,7 @@ function releaseOwnedLockEarly(
   if (!sameOwnedFile(lock.file)) return false;
   options.hooks?.beforeFsMutation?.('unlink', [lock.file.path]);
   try {
-    assertSafeWriterPath(layout, lock.file.path, 'lock release');
+    assertSafeMutationPath(layout, lock.file.path, 'lock release');
   } catch {
     return false;
   }
@@ -1451,11 +1512,11 @@ function recoveryForOwnership(
 ): VaultWriteRecovery {
   const recovery = recoveryAction(
     operationId,
-    vaultRelative(plan.layout, operationDir),
+    displayRelative(plan.layout, operationDir),
     'ownership-conflict',
     [...new Set(preserved)].sort(),
     [...new Set(remaining)],
-    `${vaultRelative(plan.layout, operationDir)}/journal.json`,
+    `${displayRelative(plan.layout, operationDir)}/journal.json`,
   );
   const original = recovery.preservedPaths.find(item => item.endsWith('/originals/README.md'));
   if (original) {
@@ -1506,14 +1567,35 @@ export function executeVaultWrite(
     }
   }
 
+  try {
+    const legacyPaths = detectLegacyVaultWriterState(minimalLayout);
+    if (legacyPaths.length > 0) {
+      return codeResult(operationId, digest, 'LEGACY_RUNTIME_STATE', 'none', [{
+        operationId: 'legacy-v1.5',
+        state: 'unrecognized-operation',
+        directory: '.me',
+        preservedPaths: legacyPaths,
+        remainingMutations: [],
+        actions: legacyPaths.map(legacyPath => ({
+          kind: 'inspect' as const,
+          path: legacyPath,
+          condition: 'Inspect legacy vault-local runtime state before removing it.',
+        })),
+      }]);
+    }
+  } catch (error) {
+    return codeResult(operationId, digest, errorCode(error, false));
+  }
+
   const operations = makeFileOperations(options);
   const layout = minimalLayout;
   const lockPath = path.join(layout.lockDir, 'vault-write.lock');
   let lockOwned: OwnedLock | undefined;
   try {
+    bootstrapRuntimeRoot(layout);
     bootstrapDirectory(layout, layout.lockDir, options, operations);
-    bootstrapDirectory(layout, layout.tmpDir, options, operations);
-    assertSafeWriterPath(layout, lockPath, 'lock');
+    bootstrapDirectory(layout, layout.transactionDir, options, operations);
+    assertSafeMutationPath(layout, lockPath, 'lock');
     if (lockExists(lockPath, operations)) {
       return codeResult(operationId, digest, 'LOCK_HELD');
     }
@@ -1564,9 +1646,9 @@ export function executeVaultWrite(
     if (!released) {
       const recovery = recoveryAction(
         operationId,
-        '.me/tmp',
+        '<ME_RUNTIME>/transactions',
         'ownership-conflict',
-        ['.me/locks/vault-write.lock'],
+        ['<ME_RUNTIME>/locks/vault-write.lock'],
         ['Inspect the changed cooperative lock.'],
       );
       return codeResult(
@@ -1594,7 +1676,7 @@ export function executeVaultWrite(
     ...(initialPlan.index.action === 'none' ? [] : [initialPlan.index.path]),
   ];
   const tx = new Transaction(initialPlan, operationId, options);
-  let operationDir = path.join(layout.tmpDir, `vault-write-${operationId}`);
+  let operationDir = path.join(layout.transactionDir, `vault-write-${operationId}`);
   let stagingDir = path.join(operationDir, 'staging');
   let originalsDir = path.join(operationDir, 'originals');
   let noteStaged: OwnedFile | undefined;
@@ -1617,20 +1699,20 @@ export function executeVaultWrite(
   let lockReleaseConflict = false;
 
   const markPreserved = (absolute: string, mutation: string): void => {
-    preserved.push(lexicalVaultRelative(layout, absolute));
+    preserved.push(displayRelative(layout, absolute));
     remaining.push(mutation);
   };
 
   const cleanupOwnedTransient = (owned: OwnedFile | undefined): void => {
     if (!owned) return;
     if (!sameOwnedLineage(owned)) {
-      markPreserved(owned.path, `Inspect changed transient ${vaultRelative(layout, owned.path)}.`);
+      markPreserved(owned.path, `Inspect changed transient ${displayRelative(layout, owned.path)}.`);
       return;
     }
     try {
       tx.unlink(ownedFile(owned.path));
     } catch {
-      markPreserved(owned.path, `Remove owned transient ${vaultRelative(layout, owned.path)}.`);
+      markPreserved(owned.path, `Remove owned transient ${displayRelative(layout, owned.path)}.`);
     }
   };
 
@@ -1895,7 +1977,7 @@ export function executeVaultWrite(
         || !sameInode(staged.path, published.path)
         || links !== 2n
       ) {
-        markPreserved(staged.path, `Inspect changed staging link ${vaultRelative(layout, staged.path)}.`);
+        markPreserved(staged.path, `Inspect changed staging link ${displayRelative(layout, staged.path)}.`);
         return;
       }
       try {
@@ -1912,7 +1994,7 @@ export function executeVaultWrite(
           markPreserved(published.path, 'Verify published target after staging cleanup.');
         }
       } catch {
-        markPreserved(staged.path, `Remove operation-owned staging link ${vaultRelative(layout, staged.path)}.`);
+        markPreserved(staged.path, `Remove operation-owned staging link ${displayRelative(layout, staged.path)}.`);
       }
     };
     cleanupStagedLink(noteStaged, notePublished);
@@ -1989,7 +2071,7 @@ export function executeVaultWrite(
           directory.path === operationDir
           || directory.path === stagingDir
           || directory.path === originalsDir
-          || directory.path === layout.tmpDir
+          || directory.path === layout.transactionDir
           || directory.path === layout.lockDir
           || directory.path === layout.meDir
         ) continue;
@@ -2113,8 +2195,8 @@ export function executeVaultWrite(
   }
 
   if (originalReadme) {
-    const originalRelative = vaultRelative(layout, originalReadme.path);
-    const directory = vaultRelative(layout, operationDir);
+    const originalRelative = displayRelative(layout, originalReadme.path);
+    const directory = displayRelative(layout, operationDir);
     recoveries.push({
       operationId,
       state: 'retained-original',

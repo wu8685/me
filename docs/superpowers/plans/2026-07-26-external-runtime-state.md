@@ -158,19 +158,23 @@ git add bin/runtime-paths.ts test/runtime-paths.test.ts
 git commit -m "feat: resolve host-local ME runtime state"
 ```
 
-### Task 2: Vault writer layout and legacy gate
+### Task 2: Vault writer layout, transaction migration, and legacy gate
 
 **Files:**
 - Modify: `bin/vault-write/contracts.ts`
 - Modify: `bin/vault-write/path-safety.ts`
+- Modify: `bin/vault-write/transaction.ts`
 - Modify: `test/vault-write-contracts.test.ts`
 - Modify: `test/vault-write-path-safety.test.ts`
+- Modify: `test/vault-write-transaction.test.ts`
 
 **Interfaces:**
 - `ResolvedVaultLayout` consumes `RuntimeLayout` and exposes its runtime paths.
 - `WriterErrorCode` gains `LEGACY_RUNTIME_STATE`.
 - `detectLegacyVaultWriterState(layout): string[]` returns contained
   vault-relative entries without mutation.
+- Transaction locks, journals, staging, originals, and public recovery paths
+  consume the external runtime layout.
 
 - [ ] **Step 1: Write failing contract and layout tests**
 
@@ -187,10 +191,15 @@ Add fixtures for empty legacy directories (allowed), non-empty legacy
 `tmp`/`locks` (reported), symlinks (fail closed), runtime/vault overlap, and
 cross-device injection.
 
+Convert transaction expectations to external runtime, preserve every existing
+interrupt/concurrency case, and add a non-empty legacy-state test that expects
+`manual_recovery / LEGACY_RUNTIME_STATE` before lock acquisition.
+
 - [ ] **Step 2: Run RED tests**
 
 ```bash
-bun test test/vault-write-contracts.test.ts test/vault-write-path-safety.test.ts
+bun test test/vault-write-contracts.test.ts test/vault-write-path-safety.test.ts \
+  test/vault-write-transaction.test.ts
 ```
 
 Expected: assertions fail against vault-local v1.5 layout.
@@ -199,76 +208,28 @@ Expected: assertions fail against vault-local v1.5 layout.
 
 Call `resolveRuntimeLayout`, keep `.me` only for config/Profile, add explicit
 vault/runtime assertion functions, map `RuntimePathError` to fixed writer
-errors, and add legacy-state detection without creating files.
+errors, and add legacy-state detection without creating files. Replace
+vault-local tmp/lock construction with `transactionDir`/`lockDir`, apply
+runtime containment to locks, journals, staging, originals, cleanup, and
+fingerprints, then render public recovery paths through `runtimeDisplayPath`.
 
 - [ ] **Step 4: Run GREEN tests**
 
 ```bash
-bun test test/vault-write-contracts.test.ts test/vault-write-path-safety.test.ts
+bun test test/vault-write-contracts.test.ts test/vault-write-path-safety.test.ts \
+  test/vault-write-transaction.test.ts
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add bin/vault-write/contracts.ts bin/vault-write/path-safety.ts \
-  test/vault-write-contracts.test.ts test/vault-write-path-safety.test.ts
-git commit -m "feat: separate vault and runtime writer paths"
-```
-
-### Task 3: Vault writer transaction migration
-
-**Files:**
-- Modify: `bin/vault-write/transaction.ts`
-- Modify: `test/vault-write-transaction.test.ts`
-
-**Interfaces:**
-- Consumes external `lockDir` and `transactionDir`.
-- Produces runtime-relative recovery paths under `<ME_RUNTIME>/`.
-- Preserves all existing transaction phases and ownership hooks.
-
-- [ ] **Step 1: Convert transaction expectations to external runtime**
-
-Add assertions:
-
-```ts
-expect(fs.existsSync(path.join(vault, '.me/tmp'))).toBeFalse();
-expect(fs.existsSync(path.join(vault, '.me/locks'))).toBeFalse();
-expect(result.recoveries[0].directory).toStartWith('<ME_RUNTIME>/transactions/');
-```
-
-Add a non-empty legacy-state test that expects
-`manual_recovery / LEGACY_RUNTIME_STATE` before lock acquisition.
-
-- [ ] **Step 2: Run RED transaction suite**
-
-```bash
-bun test test/vault-write-transaction.test.ts
-```
-
-- [ ] **Step 3: Migrate transaction paths**
-
-Replace vault-local tmp/lock construction with `transactionDir`/`lockDir`,
-use runtime containment for every lock, journal, staging, original, and
-cleanup mutation, update fingerprints, and translate public paths through
-`runtimeDisplayPath`.
-
-- [ ] **Step 4: Run GREEN transaction suite**
-
-```bash
-bun test test/vault-write-transaction.test.ts
-```
-
-Expected: all existing interruption/concurrency tests and new runtime tests
-pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add bin/vault-write/transaction.ts test/vault-write-transaction.test.ts
+  bin/vault-write/transaction.ts test/vault-write-contracts.test.ts \
+  test/vault-write-path-safety.test.ts test/vault-write-transaction.test.ts
 git commit -m "feat: move vault transactions outside synced vaults"
 ```
 
-### Task 4: Runtime CLI and request inbox
+### Task 3: Runtime CLI and request inbox
 
 **Files:**
 - Create: `bin/runtime.ts`
@@ -306,7 +267,7 @@ Use the same no-follow descriptor, identity recheck, file-type, extension, and
 ```
 
 to `package.json`’s `bin` map. Release versions are updated together in
-Task 6.
+Task 5.
 
 - [ ] **Step 4: Run GREEN CLI tests**
 
@@ -322,7 +283,7 @@ git add bin/runtime.ts bin/vault-write.ts package.json \
 git commit -m "feat: expose local runtime inbox"
 ```
 
-### Task 5: Ingest runtime migration
+### Task 4: Ingest runtime migration
 
 **Files:**
 - Modify: `bin/ingest.ts`
@@ -379,7 +340,7 @@ git add bin/ingest.ts bin/ingest/finalize.ts \
 git commit -m "feat: move ingest runtime state outside vaults"
 ```
 
-### Task 6: Skills, setup, and public documentation
+### Task 5: Skills, setup, and public documentation
 
 **Files:**
 - Modify: `skills/decision-brief/SKILL.md`
@@ -449,7 +410,7 @@ git add skills README.md docs AGENTS.md CLAUDE.md package.json \
 git commit -m "docs: publish external runtime workflow"
 ```
 
-### Task 7: Full verification and release readiness
+### Task 6: Full verification and release readiness
 
 **Files:**
 - Verify all changed files.

@@ -1,17 +1,18 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+  RuntimePathError,
+  type RuntimeLayout,
+  resolveRuntimeLayout,
+} from '../runtime-paths';
+import {
   type LogicalLayer,
   type VaultWriteRequestV1,
   VaultWriterError,
 } from './contracts';
 
-export interface ResolvedVaultLayout {
-  lexicalVault: string;
-  canonicalVault: string;
+export interface ResolvedVaultLayout extends RuntimeLayout {
   meDir: string;
-  tmpDir: string;
-  lockDir: string;
   schemaPath: string;
   layers: Record<LogicalLayer, string>;
 }
@@ -226,13 +227,22 @@ export function resolveVaultLayout(vaultDir: string): ResolvedVaultLayout {
     invalidConfig();
   }
 
+  let runtime: RuntimeLayout;
+  try {
+    runtime = resolveRuntimeLayout(lexicalVault);
+  } catch (error) {
+    if (error instanceof RuntimePathError) {
+      throw new VaultWriterError(
+        error.code === 'UNSUPPORTED_FILESYSTEM' ? 'UNSUPPORTED_FILESYSTEM' : 'UNSAFE_PATH',
+      );
+    }
+    unsafePath();
+  }
+
   const meDir = path.join(lexicalVault, '.me');
   const layout: ResolvedVaultLayout = {
-    lexicalVault,
-    canonicalVault,
+    ...runtime,
     meDir,
-    tmpDir: path.join(meDir, 'tmp'),
-    lockDir: path.join(meDir, 'locks'),
     schemaPath: path.join(lexicalVault, 'SCHEMA.md'),
     layers: {
       raw: path.join(lexicalVault, DEFAULT_LAYERS.raw),
@@ -261,10 +271,6 @@ export function resolveVaultLayout(vaultDir: string): ResolvedVaultLayout {
     validateConfiguredLayerPath(configuredPath);
     layout.layers[layer] = path.join(lexicalVault, ...configuredPath.split('/'));
   }
-
-  validateOptionalRealDirectory(layout, layout.tmpDir);
-  validateOptionalRealDirectory(layout, layout.lockDir);
-  if (overlaps(layout.tmpDir, layout.lockDir)) invalidConfig();
 
   validateOptionalContainedEntry(layout, layout.schemaPath);
   const schemaStat = lstatIfPresent(layout.schemaPath);
@@ -300,6 +306,31 @@ export function resolveVaultLayout(vaultDir: string): ResolvedVaultLayout {
   }
 
   return layout;
+}
+
+export function detectLegacyVaultWriterState(layout: ResolvedVaultLayout): string[] {
+  const entries: string[] = [];
+  for (const directory of [
+    path.join(layout.meDir, 'locks'),
+    path.join(layout.meDir, 'tmp'),
+  ]) {
+    assertSafeWriterPath(layout, directory, 'legacy runtime directory');
+    const stat = lstatIfPresent(directory);
+    if (!stat) continue;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) unsafePath();
+    let names: string[];
+    try {
+      names = fs.readdirSync(directory);
+    } catch {
+      unsafePath();
+    }
+    for (const name of names) {
+      const candidate = path.join(directory, name);
+      assertSafeWriterPath(layout, candidate, 'legacy runtime entry');
+      entries.push(vaultRelative(layout, candidate));
+    }
+  }
+  return entries.sort();
 }
 
 export function resolveWriteTarget(

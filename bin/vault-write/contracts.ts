@@ -68,6 +68,7 @@ export type WriterErrorCode =
   | 'POST_VALIDATION_FAILED'
   | 'INCOMPLETE_OPERATION'
   | 'RECOVERY_REQUIRED'
+  | 'LEGACY_RUNTIME_STATE'
   | 'INTERNAL_ERROR';
 
 export interface WriterErrorDefinition {
@@ -99,6 +100,7 @@ export const WRITER_ERROR_CATALOG: Readonly<Record<WriterErrorCode, WriterErrorD
     POST_VALIDATION_FAILED: definition('validation_failed', 2, 'Post-write validation failed and owned changes were restored.'),
     INCOMPLETE_OPERATION: definition('manual_recovery', 4, 'One or more incomplete operations require inspection.'),
     RECOVERY_REQUIRED: definition('manual_recovery', 4, 'Conflicting content was preserved; manual recovery is required.'),
+    LEGACY_RUNTIME_STATE: definition('manual_recovery', 4, 'Vault-local ME 1.5 runtime state requires inspection.'),
     INTERNAL_ERROR: definition('validation_failed', 1, 'Vault write could not complete safely.'),
   });
 
