@@ -267,6 +267,9 @@ test_vault_writer_public_binary() {
 
 test_codex_public_docs() {
   assert_file_contains "$PLUGIN_ROOT/README.md" '个人的知识操作系统\|面向个人的知识操作系统' || return 1
+  assert_file_contains "$PLUGIN_ROOT/README.md" 'Claude Code 或 Codex' || return 1
+  assert_file_contains "$PLUGIN_ROOT/README.md" 'claude plugin marketplace add https://github.com/wu8685/me.git' || return 1
+  assert_file_contains "$PLUGIN_ROOT/README.md" '/me:setup' || return 1
   assert_file_contains "$PLUGIN_ROOT/README.md" 'codex plugin marketplace add https://github.com/wu8685/me.git' || return 1
   assert_file_contains "$PLUGIN_ROOT/README.md" '\$me:setup' || return 1
   assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" '.agents/plugins/marketplace.json' || return 1
@@ -1345,6 +1348,69 @@ EOF
   fi
 }
 
+# ── Claude Code E2E Tests ─────────────────────────────────────────
+
+test_e2e_me_setup() {
+  if ! command -v claude &>/dev/null; then
+    echo -e "    ${YELLOW}SKIP${NC}: claude CLI not found"
+    return 0
+  fi
+
+  local output
+  output=$(cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
+  if echo "$output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key"; then
+    echo -e "    ${YELLOW}SKIP${NC}: Claude Code authentication unavailable"
+    return 0
+  fi
+
+  echo "    claude output: $(echo "$output" | head -3)"
+
+  assert_dir_exists "$MOCK_VAULT/raw" || return 1
+  assert_dir_exists "$MOCK_VAULT/practices" || return 1
+  assert_dir_exists "$MOCK_VAULT/cognition" || return 1
+  assert_file_exists "$MOCK_VAULT/SCHEMA.md" || return 1
+  assert_file_exists "$MOCK_VAULT/CLAUDE.md" || return 1
+  assert_file_exists "$MOCK_VAULT/.gitignore" || return 1
+
+  assert_file_contains "$MOCK_VAULT/CLAUDE.md" "three-layer knowledge vault" || return 1
+  assert_file_contains "$MOCK_VAULT/CLAUDE.md" "/me:setup" || return 1
+  assert_file_contains "$MOCK_VAULT/SCHEMA.md" "LOCKED" || return 1
+  assert_file_contains "$MOCK_VAULT/.gitignore" ".obsidian/" || return 1
+
+  assert_file_exists "$MOCK_VAULT/raw/.gitkeep" || return 1
+  assert_file_exists "$MOCK_VAULT/practices/.gitkeep" || return 1
+  assert_file_exists "$MOCK_VAULT/cognition/.gitkeep" || return 1
+}
+
+test_e2e_me_setup_idempotent() {
+  if ! command -v claude &>/dev/null; then
+    echo -e "    ${YELLOW}SKIP${NC}: claude CLI not found"
+    return 0
+  fi
+
+  local first_output
+  first_output=$(cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
+  if echo "$first_output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key"; then
+    echo -e "    ${YELLOW}SKIP${NC}: Claude Code authentication unavailable"
+    return 0
+  fi
+
+  local output
+  output=$(cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
+
+  echo "    second run output: $(echo "$output" | head -3)"
+
+  assert_dir_exists "$MOCK_VAULT/raw" || return 1
+  assert_file_exists "$MOCK_VAULT/SCHEMA.md" || return 1
+
+  local count
+  count=$(grep -c ".obsidian/" "$MOCK_VAULT/.gitignore" 2>/dev/null || echo "0")
+  if [ "$count" -ne 1 ]; then
+    echo -e "    ${RED}FAIL${NC}: .obsidian/ appears $count times after second run (expected 1)"
+    return 1
+  fi
+}
+
 test_no_hardcoded_paths() {
   # Commands must not reference ~/.claude/skills/me/
   local found=0
@@ -1698,6 +1764,46 @@ EOF
 
   if ! echo "$mentions" | grep -q "note-c"; then
     echo -e "    ${RED}FAIL${NC}: unlinked mention grep did not find note-c mentioning note-b"
+    return 1
+  fi
+}
+
+test_e2e_me_checklink_headless() {
+  if ! command -v claude &>/dev/null; then
+    echo -e "    ${YELLOW}SKIP${NC}: claude CLI not found"
+    return 0
+  fi
+
+  local v="$MOCK_VAULT"
+  local setup_output
+  setup_output=$(cd "$v" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
+  if echo "$setup_output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key"; then
+    echo -e "    ${YELLOW}SKIP${NC}: Claude Code authentication unavailable"
+    return 0
+  fi
+
+  mkdir -p "$v/raw"
+  cat > "$v/raw/2026-04-05-test.md" << 'EOF'
+---
+title: "Test"
+created: 2026-04-05
+tags: [test]
+type: article
+source: "https://example.com"
+---
+
+Links to [[does-not-exist]].
+EOF
+
+  local output
+  output=$(cd "$v" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:checklinks" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
+
+  echo "    claude output: $(echo "$output" | head -5)"
+
+  if echo "$output" | grep -qi "broken\\|does-not-exist\\|unresolved\\|headless\\|grep"; then
+    return 0
+  else
+    echo -e "    ${RED}FAIL${NC}: /me:checklinks did not report broken link or headless mode"
     return 1
   fi
 }
@@ -5152,6 +5258,11 @@ main() {
     run_test test_decision_brief_discovery_and_release_version
     run_test test_packed_release_has_no_private_paths
     run_test test_decision_brief_profile_example_uses_real_layer_contract
+
+    # Claude Code E2E tests (skip when CLI authentication is unavailable)
+    run_test test_e2e_me_setup
+    run_test test_e2e_me_setup_idempotent
+    run_test test_e2e_me_checklink_headless
 
     # Quick task 260406-din: checklinks (plural) and autolinks
     run_test test_checklinks_files_exist

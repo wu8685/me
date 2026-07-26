@@ -2,8 +2,9 @@
 
 > 让知识持续参与你的研究、判断与行动。
 
-ME 是一套面向个人的知识操作系统。它以 Codex 为交互入口，以 Markdown
-保存内容，用 Git 记录变化，帮助你管理知识从来源、实践到认知的生长过程。
+ME 是一套面向个人的知识操作系统。它以 Claude Code 或 Codex 为交互入口，
+以 Markdown 保存内容，用 Git 记录变化，帮助你管理知识从来源、实践到认知
+的生长过程。
 
 人们已经不缺少收藏信息的工具。真正困难的是后半程：哪些材料值得留下，
 哪些观点经受过实践，哪些经验已经足以成为下一次判断的依据。ME 关注的正是
@@ -31,7 +32,7 @@ Raw → Practices → Cognition
 
 ME 把知识库作为个人工作的长期基础设施：
 
-- 通过自然语言与 Codex 协作，在当前问题中调用已有知识；
+- 通过自然语言与 Agent 协作，在当前问题中调用已有知识；
 - 用纯 Markdown 保留完整内容，不把个人积累锁在某个平台；
 - 用 Git 保存知识变化的过程，使重要判断可以追溯和修正；
 - 与 Obsidian 等现有工具共存，不要求改变熟悉的阅读和写作方式。
@@ -50,21 +51,32 @@ ME 适合需要长期积累上下文的工作：
 
 ## 开始使用
 
-安装 Codex 插件：
+Claude Code：
+
+```bash
+claude plugin marketplace add https://github.com/wu8685/me.git
+claude plugin install me@me-marketplace
+```
+
+Codex：
 
 ```bash
 codex plugin marketplace add https://github.com/wu8685/me.git
 codex plugin add me@me-marketplace
 ```
 
-进入准备作为知识库的工作空间，在 Codex 中运行：
+进入准备作为知识库的工作空间，运行初始化命令：
 
 ```text
+# Claude Code
+/me:setup
+
+# Codex
 $me:setup
 ```
 
-ME 会建立三层知识结构。之后可以继续使用 `me:*` skills 摄入材料、检索笔记、
-维护连接，并让已有知识参与新的问题。
+ME 会建立三层知识结构。之后可以继续使用 `/me:*` commands 或 `me:*`
+skills 摄入材料、检索笔记、维护连接，并让已有知识参与新的问题。
 
 ## 文档
 
