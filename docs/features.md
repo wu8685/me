@@ -40,6 +40,7 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 |------|-------------|-------------|------|------|
 | 初始化工作空间 | `/me:setup` | `me:setup` | - | 三层目录 + 配置文件 |
 | 摄入外部材料 | `/me:ingest <source>` | `me:ingest` | URL 或 Source Bundle | 结构化 Markdown 笔记与本地素材 |
+| 生成决策简报 | `/me:decision-brief <问题>` | `me:decision-brief` | 待决问题、约束与相关证据 | 建议、选项比较、验证实验与复盘条件 |
 | 多维搜索笔记 | `/me:search` | `me:search` | 查询条件 | 匹配笔记列表 |
 | 链接健康检查 | `/me:checklinks` | `me:checklinks` | - | 断链/孤儿/死结报告 |
 | 自动添加 WikiLink | `/me:autolinks` | `me:autolinks` | - | 批量更新笔记链接 |
@@ -52,6 +53,7 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 |------|------|------|
 | Events | `bin/events.ts` | JSONL 事件日志 — append/query，支持 UUID 关联 |
 | Wikilink Graph | `bin/wikilink-graph.ts` | 无依赖的链接图引擎 |
+| Vault Write | `bin/vault-write.ts` | 通用笔记写入的预览、校验、索引维护与恢复报告 |
 
 ## /me:setup - 初始化工作空间
 
@@ -140,6 +142,28 @@ source: "https://example.com/article"
 - Kebab-case 英文 slug
 - 自动添加 WikiLink（基于 vault index）
 - 相关笔记推荐（基于 tag + 关键词）
+
+## /me:decision-brief - 决策简报（Decision Brief）
+
+**功能：** 当问题涉及有后果的选择、时间或资源投入时，把“该选什么”整理成可检验、可复盘的建议，而不是只给一份利弊清单。
+
+**输入：**
+
+- 待决定的问题、负责人、时间范围和不可突破的约束
+- 成功信号与可接受的最坏结果
+- 当前 vault 中实际相关的 Cognition、Practices 与 Raw 笔记
+- 必要时补充的最新事实
+
+**输出：**
+
+- 明确建议与置信度；证据不足时给出“暂不决策”
+- 主要矛盾、至少两个可行选项及其机会成本
+- 最强反方、最小验证实验、失效条件和复盘时间
+- 实际影响建议的本地笔记与事实来源
+
+默认只在对话中返回，不修改 vault。只有用户明确要求保存，而且存在实际参与判断的本地来源时，才把阶段性判断保存为 Practices 笔记；它不会直接进入 Cognition。
+
+通用 `vault-write` 提供两个阶段：`preview` 先展示目标路径、索引动作和校验结果，不写文件；`write` 在同一请求通过校验后写入笔记并维护索引。调用方只有收到明确的 committed 结果才应报告保存成功；冲突、环境不支持或需要人工恢复时，应如实报告未写入或恢复指引。
 
 ## /me:checklinks - 链接健康检查
 

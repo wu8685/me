@@ -1,7 +1,7 @@
 {
   "name": "me",
   "version": "1.5.0",
-  "description": "ME — a personal knowledge base plugin: a three-layer knowledge flywheel (raw → practices → cognition) with free wikilink cross-references.",
+  "description": "ME — a personal knowledge base plugin for a three-layer knowledge flywheel and evidence-backed decision briefs.",
   "author": {
     "name": "wuke",
     "email": "optimuswu8685@gmail.com"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "ME",
     "shortDescription": "Turn any workspace into a Git + Markdown knowledge flywheel.",
-    "longDescription": "ME gives Codex skills for managing a three-layer knowledge vault: ingest research, record practices, distill cognition, maintain wikilinks, and search Markdown notes without external infrastructure.",
+    "longDescription": "ME gives Codex skills for managing a three-layer knowledge vault: ingest research, build evidence-backed decision briefs, record practices, distill cognition, maintain wikilinks, and search Markdown notes without external infrastructure.",
     "developerName": "wuke",
     "category": "Productivity",
     "capabilities": [
@@ -32,6 +32,7 @@
     "defaultPrompt": [
       "Initialize this workspace as a ME vault.",
       "Ingest this URL into my knowledge base.",
+      "Build a decision brief from my local evidence.",
       "Check wikilinks in this vault."
     ],
     "brandColor": "#0F766E"

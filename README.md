@@ -4,6 +4,7 @@
 
 **ME** 把任何工作空间变成知识飞轮 —— 零基础设施，只需 Git + Markdown + Claude Code 或 Codex。
 同一个 `/me:ingest` 可以把 HTML 文章、PDF、X 与 Bilibili 公共内容整理成带来源、正文和本地素材的笔记；视频默认优先生成保留完整时间线的讲义，便于之后检索、复习和引用。
+当研究走到“该怎么选”时，`/me:decision-brief` 会把本地证据、现实约束、备选方案和最小验证实验整理成可复盘的决策简报。简报默认只在对话中返回；只有明确要求保存时，才会写入 Practices。
 
 ## 快速开始
 
@@ -27,9 +28,10 @@ Claude Code 使用 `/me:*` slash commands：
 cd your-workspace
 /me:setup
 /me:ingest https://example.com/article
+/me:decision-brief "团队是否应该在下个季度采用新的发布流程？"
 ```
 
-Codex 安装后会把技能加载为 `me:*`。在 Codex 里运行 `/skills` 选择 `me:setup`，或在 prompt 中显式写 `$me:setup`、`$me:ingest https://example.com/article`。
+Codex 安装后会把技能加载为 `me:*`。在 Codex 里运行 `/skills` 选择 `me:setup`，或在 prompt 中显式写 `$me:setup`、`$me:ingest https://example.com/article`、`$me:decision-brief ...`。
 
 ## 核心功能
 
@@ -37,6 +39,7 @@ Codex 安装后会把技能加载为 `me:*`。在 Codex 里运行 `/skills` 选�
 | --- | --- | --- |
 | 初始化三层知识目录结构 | `/me:setup` | `me:setup` |
 | 摘入文章、PDF、公开视频或 Source Bundle | `/me:ingest <source>` | `me:ingest` |
+| 基于证据形成可复盘的决策简报 | `/me:decision-brief <问题>` | `me:decision-brief` |
 | 多维搜索笔记（全文 / 标签 / 层级 / 日期） | `/me:search <query>` | `me:search` |
 | 检查链接健康（断链、孤儿、死结） | `/me:checklinks` | `me:checklinks` |
 | 自动添加 WikiLink（支持单笔记模式） | `/me:autolinks [note]` | `me:autolinks` |

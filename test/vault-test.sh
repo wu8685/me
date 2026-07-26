@@ -247,6 +247,39 @@ test_codex_public_docs() {
   assert_file_contains "$PLUGIN_ROOT/docs/features.md" 'Codex skill' || return 1
 }
 
+test_decision_brief_documented() {
+  assert_file_contains "$PLUGIN_ROOT/README.md" 'decision-brief' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/features.md" '决策简报\|Decision Brief' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'me:decision-brief' || return 1
+}
+
+test_decision_brief_discovery_and_release_version() {
+  assert_file_exists "$PLUGIN_ROOT/skills/decision-brief/SKILL.md" || return 1
+  assert_file_contains "$PLUGIN_ROOT/.codex-plugin/plugin.json" '"skills": "./skills/"' || return 1
+
+  local versions
+  versions=$(bun -e "
+    const fs = require('fs');
+    const files = [
+      'package.json',
+      '.codex-plugin/plugin.json',
+      '.claude-plugin/plugin.json',
+    ];
+    console.log(files.map(file => {
+      const data = JSON.parse(fs.readFileSync('$PLUGIN_ROOT/' + file, 'utf8'));
+      return data.version;
+    }).join('\\n'));
+  ")
+  [ "$(echo "$versions" | sort -u | wc -l | tr -d ' ')" -eq 1 ] || {
+    echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
+    return 1
+  }
+  [ "$(echo "$versions" | head -n 1)" = "1.5.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected current release version 1.5.0"
+    return 1
+  }
+}
+
 test_ingest_docs_rich_media() {
   local readme="$PLUGIN_ROOT/README.md"
   local features="$PLUGIN_ROOT/docs/features.md"
@@ -5021,6 +5054,8 @@ main() {
     run_test test_decision_brief_profile_behavior_evidence
     run_test test_decision_brief_write_transaction_contract
     run_test test_decision_brief_writer_contract
+    run_test test_decision_brief_documented
+    run_test test_decision_brief_discovery_and_release_version
 
     # E2E tests (require claude CLI)
     run_test test_e2e_me_setup

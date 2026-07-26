@@ -14,6 +14,8 @@ me/
 ├── bin/                          # TypeScript CLI tools
 │   ├── wikilink-graph.ts         # Core link graph engine
 │   ├── ingest.ts                 # URL ingestion pipeline
+│   ├── vault-write.ts            # Generic transactional vault writer CLI
+│   ├── vault-write/              # Validation, graph planning and transaction modules
 │   ├── checklinks.ts             # Link health checker
 │   ├── autolinks.ts              # Auto wikilink generator
 │   ├── backlinks.ts              # Backlink discovery
@@ -22,6 +24,7 @@ me/
 │   └── events.ts                 # JSONL event log (append/query)
 ├── skills/                       # Claude Code / Codex skills
 │   ├── ingest/SKILL.md           # URL ingestion skill
+│   ├── decision-brief/SKILL.md   # Evidence-backed decision skill
 │   ├── setup/SKILL.md            # Workspace setup skill
 │   ├── search/SKILL.md           # Multi-dimensional search skill
 │   ├── checklinks/SKILL.md       # Link health skill
@@ -38,6 +41,24 @@ me/
 │   └── cognition-template.md     # Cognition layer template
 └── README.md
 ```
+
+## Decision Brief 与 Vault Writer 边界
+
+`skills/decision-brief/` 负责判断层：建立 Decision Contract、检索证据、比较选项、给出最小验证实验，并决定用户是否已经明确授权保存。它不直接操作目标笔记或 README，也不自行实现写入事务。
+
+`bin/vault-write.ts` 与 `bin/vault-write/` 是领域无关的工具层：解析 v1 request、校验内置 schema profile、规划目标与索引、执行写入并返回结构化结果。Decision Brief 是首个 Practices 调用方，但 writer 不包含决策领域规则；其他满足同一 request contract 的 Skill 也可以复用它。
+
+### Commit model
+
+- `preview` 是零写入检查，返回 `commitModel: preview-only`。
+- `write` 使用 `commitModel: journaled-cooperative`：合作式锁、operation journal、ownership 检查和 filesystem hard-link/rename 语义共同降低并发覆盖与中断风险。
+- 该模型不是跨文件 atomic CAS。网络盘、FUSE、断电和不支持所需 filesystem primitive 的环境，仍受实际 filesystem 语义限制；能力不足时 writer 必须 fail closed，不能悄悄退化为覆盖写入。
+
+### Recovery contract
+
+启动 write 时会先检查未完成 operation。可以证明 ownership 且未发生外部变化的内容才允许自动清理或恢复；无法证明归属、内容已变化或 operation 目录损坏时，保留现有数据并返回 `status: manual_recovery`。
+
+调用方必须读取聚合的 `recoveryState`，并逐项展示 `recoveries[]` 中的 `operationId`、`state`、`preservedPaths`、`remainingMutations` 与全部 `actions`。不得把 `manual_recovery` 简化为“已保存”或“已回滚”。只有 `status: committed` 才能对外报告保存成功。
 
 ## 添加新 Skill
 
