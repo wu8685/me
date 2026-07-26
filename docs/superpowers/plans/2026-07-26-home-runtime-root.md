@@ -221,6 +221,9 @@ vault with the process environment and proves its runtime base is under the
 temporary directory rather than `~/.me/runtime`. Integration-test helpers and
 child processes must consume or propagate the same environment; the dedicated
 default resolver test remains the only test that passes `{}` deliberately.
+The shell suite must likewise create and export its own temporary
+`ME_RUNTIME_ROOT`, verify the isolation as part of the suite, and remove the
+directory from its existing exit trap.
 
 Run:
 

@@ -15,6 +15,8 @@ set -euo pipefail
 # ── Config ──────────────────────────────────────────────────────────
 PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MOCK_VAULT=""
+TEST_RUNTIME_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/me-shell-runtime.XXXXXX")
+export ME_RUNTIME_ROOT="$TEST_RUNTIME_ROOT"
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
@@ -42,8 +44,16 @@ teardown_vault() {
   fi
 }
 
+teardown_test_environment() {
+  teardown_vault
+  if [ -n "$TEST_RUNTIME_ROOT" ] && [ -d "$TEST_RUNTIME_ROOT" ]; then
+    rm -rf "$TEST_RUNTIME_ROOT"
+    TEST_RUNTIME_ROOT=""
+  fi
+}
+
 # Always teardown on exit (covers crashes, Ctrl+C, etc.)
-trap teardown_vault EXIT
+trap teardown_test_environment EXIT
 
 # ── Assertions ──────────────────────────────────────────────────────
 assert_dir_exists() {
@@ -278,6 +288,24 @@ test_external_runtime_documented() {
   if grep -Fq 'same directory, no sync' "$PLUGIN_ROOT/AGENTS.md" \
     || grep -Fq 'same directory, no sync' "$PLUGIN_ROOT/CLAUDE.md"; then
     echo -e "    ${RED}FAIL${NC}: project instructions still assume vaults are never synced"
+    return 1
+  fi
+}
+
+test_shell_runtime_isolated() {
+  if [ -z "${ME_RUNTIME_ROOT:-}" ]; then
+    echo -e "    ${RED}FAIL${NC}: shell suite has no isolated ME_RUNTIME_ROOT"
+    return 1
+  fi
+  case "$ME_RUNTIME_ROOT" in
+    "${TMPDIR:-/tmp}/"*) ;;
+    *)
+      echo -e "    ${RED}FAIL${NC}: shell suite runtime is not under the temporary directory"
+      return 1
+      ;;
+  esac
+  if [ "$ME_RUNTIME_ROOT" = "${HOME}/.me/runtime" ]; then
+    echo -e "    ${RED}FAIL${NC}: shell suite points at the real home runtime"
     return 1
   fi
 }
@@ -5110,6 +5138,7 @@ main() {
     run_test test_vault_writer_public_binary
     run_test test_codex_public_docs
     run_test test_external_runtime_documented
+    run_test test_shell_runtime_isolated
     run_test test_skills_use_external_runtime
     run_test test_ingest_docs_rich_media
     run_test test_schema_fields
