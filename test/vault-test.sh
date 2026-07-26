@@ -373,8 +373,8 @@ test_decision_brief_discovery_and_release_version() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.6.0" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected current release version 1.6.0"
+  [ "$(echo "$versions" | head -n 1)" = "1.6.1" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected current release version 1.6.1"
     return 1
   }
 }
@@ -547,8 +547,8 @@ test_ingest_docs_rich_media() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.6.0" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.6.0"
+  [ "$(echo "$versions" | head -n 1)" = "1.6.1" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.6.1"
     return 1
   }
 
