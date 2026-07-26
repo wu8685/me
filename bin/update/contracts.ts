@@ -188,14 +188,24 @@ export class UpdateError extends Error {
   }
 }
 
-const ABSOLUTE_PATH =
-  /(^|[\s("'=])(?:\/(?!\/)[^\n,;)}\]]+|[A-Za-z]:[\\/][^\n,;)}\]]+)/g;
+const ABSOLUTE_PATH_PATTERNS = [
+  /\bfile:[\\/]{1,3}[^\n,;)}\]"'<>]+/gi,
+  /(?<![A-Za-z0-9_>/\\])\\\\[^\\\s]+\\[^\n,;)}\]"'<>]+/g,
+  /(?<![A-Za-z0-9_>:/\\])\/\/[^/\s]+\/[^\n,;)}\]"'<>]+/g,
+  /(?<![A-Za-z0-9_>/\\])[A-Za-z]:[\\/][^\n,;)}\]"'<>]+/g,
+  /(?<![A-Za-z0-9_>/\\])\/(?!\/)[^\n,;)}\]"'<>]+/g,
+] as const;
+
+function redactAbsolutePaths(value: string): string {
+  return ABSOLUTE_PATH_PATTERNS.reduce(
+    (redacted, pattern) => redacted.replace(pattern, '<ABSOLUTE_PATH>'),
+    value,
+  );
+}
 
 function redactPublicValue(value: unknown): unknown {
   if (typeof value === 'string') {
-    return value.replace(ABSOLUTE_PATH, (_match, prefix: string) => (
-      `${prefix}<ABSOLUTE_PATH>`
-    ));
+    return redactAbsolutePaths(value);
   }
   if (Array.isArray(value)) return value.map(redactPublicValue);
   if (value && typeof value === 'object') {

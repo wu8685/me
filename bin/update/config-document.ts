@@ -1,10 +1,13 @@
 import * as fs from 'fs';
 import { createHash } from 'crypto';
+import { TextDecoder } from 'util';
 import {
   Document,
+  isAlias,
   isMap,
   isNode,
   isScalar,
+  isSeq,
   parseDocument,
   type Pair,
   type Scalar,
@@ -29,50 +32,59 @@ export interface ConfigRenderResult {
   desiredSha256: string;
 }
 
+type ConfigEditValue = string | number | boolean | readonly string[];
+
+function invalidConfig(): never {
+  throw new UpdateError('INVALID_CONFIG');
+}
+
+function invalidRequest(): never {
+  throw new UpdateError('INVALID_REQUEST');
+}
+
+function assertSupportedNode(node: unknown): void {
+  if (node === null) return;
+  if (isAlias(node) || !isNode(node) || node.anchor) invalidConfig();
+  if (isScalar(node)) return;
+
+  if (isSeq(node)) {
+    for (const item of node.items) assertSupportedNode(item);
+    return;
+  }
+
+  if (isMap(node)) {
+    const keys = new Set<string>();
+    for (const pair of node.items) {
+      if (
+        !isScalar(pair.key)
+        || pair.key.anchor
+        || typeof pair.key.value !== 'string'
+        || pair.key.value === '<<'
+        || keys.has(pair.key.value)
+      ) {
+        invalidConfig();
+      }
+      keys.add(pair.key.value);
+      assertSupportedNode(pair.value);
+    }
+    return;
+  }
+
+  invalidConfig();
+}
+
 function parseConfig(source: string): Document {
-  let document: Document;
   try {
-    document = parseDocument(source, {
+    const document = parseDocument(source, {
       keepSourceTokens: true,
       uniqueKeys: true,
     });
-  } catch {
-    throw new UpdateError('INVALID_CONFIG');
-  }
-  if (document.errors.length > 0 || !isMap(document.contents)) {
-    throw new UpdateError('INVALID_CONFIG');
-  }
-  return document;
-}
-
-function readVersion(document: Document): number {
-  if (!document.has('vault_schema_version')) return 0;
-  const value = document.get('vault_schema_version');
-  if (
-    typeof value !== 'number'
-    || !Number.isSafeInteger(value)
-    || value < 0
-  ) {
-    throw new UpdateError('INVALID_VAULT_SCHEMA_VERSION');
-  }
-  return value;
-}
-
-export function readVaultSchemaVersion(source: string): number {
-  return readVersion(parseConfig(source));
-}
-
-function validatePath(candidate: readonly string[] | undefined): void {
-  if (
-    !Array.isArray(candidate)
-    || candidate.length === 0
-    || candidate.some(component => (
-      typeof component !== 'string'
-      || component.length === 0
-      || component.includes('\u0000')
-    ))
-  ) {
-    throw new UpdateError('INVALID_REQUEST');
+    if (document.errors.length > 0 || !isMap(document.contents)) invalidConfig();
+    assertSupportedNode(document.contents);
+    return document;
+  } catch (error) {
+    if (error instanceof UpdateError) throw error;
+    return invalidConfig();
   }
 }
 
@@ -82,46 +94,215 @@ function pairFor(map: YAMLMap, key: string): Pair | undefined {
   ));
 }
 
+function readVersion(document: Document): number {
+  if (!isMap(document.contents)) invalidConfig();
+  const pair = pairFor(document.contents, 'vault_schema_version');
+  if (!pair) return 0;
+  if (
+    !isScalar(pair.value)
+    || typeof pair.value.value !== 'number'
+    || !Number.isSafeInteger(pair.value.value)
+    || pair.value.value < 0
+  ) {
+    throw new UpdateError('INVALID_VAULT_SCHEMA_VERSION');
+  }
+  return pair.value.value;
+}
+
+export function readVaultSchemaVersion(source: string): number {
+  return readVersion(parseConfig(source));
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasExactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
+  const actual = Reflect.ownKeys(value);
+  return actual.length === expected.length
+    && actual.every(key => (
+      typeof key === 'string' && expected.includes(key)
+    ));
+}
+
+function parsePath(candidate: unknown): readonly string[] {
+  if (
+    !Array.isArray(candidate)
+    || candidate.length === 0
+    || candidate.some(component => (
+      typeof component !== 'string'
+      || component.length === 0
+      || component.includes('\u0000')
+    ))
+  ) {
+    invalidRequest();
+  }
+  return [...candidate] as string[];
+}
+
+function isVaultSchemaVersionPath(path: readonly string[]): boolean {
+  return path.length === 1 && path[0] === 'vault_schema_version';
+}
+
+function parseSetValue(value: unknown, path: readonly string[]): ConfigEditValue {
+  if (isVaultSchemaVersionPath(path)) {
+    if (
+      typeof value !== 'number'
+      || !Number.isSafeInteger(value)
+      || value < 0
+    ) {
+      throw new UpdateError('INVALID_VAULT_SCHEMA_VERSION');
+    }
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    if (value.length === 0) invalidRequest();
+    return value;
+  }
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) invalidRequest();
+    return value;
+  }
+  if (
+    Array.isArray(value)
+    && value.length > 0
+    && value.every(item => typeof item === 'string' && item.length > 0)
+  ) {
+    return [...value] as string[];
+  }
+  return invalidRequest();
+}
+
+function isPathPrefix(
+  prefix: readonly string[],
+  candidate: readonly string[],
+): boolean {
+  return prefix.length <= candidate.length
+    && prefix.every((component, index) => candidate[index] === component);
+}
+
+function parseConfigEdit(value: unknown): ConfigEdit {
+  if (!isPlainRecord(value) || typeof value.kind !== 'string') invalidRequest();
+
+  if (value.kind === 'set') {
+    if (!hasExactKeys(value, ['kind', 'path', 'value'])) invalidRequest();
+    const path = parsePath(value.path);
+    return {
+      kind: 'set',
+      path,
+      value: parseSetValue(value.value, path),
+    };
+  }
+
+  if (value.kind === 'remove') {
+    if (!hasExactKeys(value, ['kind', 'path'])) invalidRequest();
+    return { kind: 'remove', path: parsePath(value.path) };
+  }
+
+  if (value.kind === 'rename') {
+    if (!hasExactKeys(value, ['kind', 'from', 'to'])) invalidRequest();
+    const from = parsePath(value.from);
+    const to = parsePath(value.to);
+    if (isPathPrefix(from, to) || isPathPrefix(to, from)) invalidRequest();
+    return { kind: 'rename', from, to };
+  }
+
+  return invalidRequest();
+}
+
+function parseConfigEdits(edits: unknown): ConfigEdit[] {
+  if (!Array.isArray(edits)) invalidRequest();
+  try {
+    return edits.map(parseConfigEdit);
+  } catch (error) {
+    if (error instanceof UpdateError) throw error;
+    return invalidRequest();
+  }
+}
+
 function parentMap(document: Document, path: readonly string[]): YAMLMap {
-  validatePath(path);
   let current = document.contents;
   for (const component of path.slice(0, -1)) {
-    if (!isMap(current)) throw new UpdateError('INVALID_CONFIG');
+    if (!isMap(current)) invalidConfig();
     current = current.get(component, true);
   }
-  if (!isMap(current)) throw new UpdateError('INVALID_CONFIG');
+  if (!isMap(current)) invalidConfig();
   return current;
 }
 
-function cloneJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(cloneJsonValue);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, cloneJsonValue(item)]),
-    );
+type ComparableNode =
+  | null
+  | string
+  | number
+  | boolean
+  | ComparableNode[]
+  | { readonly entries: ReadonlyArray<readonly [string, ComparableNode]> };
+
+function comparableNode(node: unknown): ComparableNode {
+  if (node === null) return null;
+  if (isAlias(node) || !isNode(node) || node.anchor) invalidConfig();
+  if (isScalar(node)) {
+    const value = node.value;
+    if (
+      value === null
+      || typeof value === 'string'
+      || typeof value === 'number'
+      || typeof value === 'boolean'
+    ) {
+      return value as null | string | number | boolean;
+    }
+    return invalidConfig();
   }
-  return value;
+  if (isSeq(node)) return node.items.map(comparableNode);
+  if (isMap(node)) {
+    return {
+      entries: node.items.map(pair => {
+        if (!isScalar(pair.key) || typeof pair.key.value !== 'string') invalidConfig();
+        return [pair.key.value, comparableNode(pair.value)] as const;
+      }),
+    };
+  }
+  return invalidConfig();
 }
 
-function jsValueAt(document: Document, path: readonly string[]): unknown {
-  let current = document.toJS();
-  for (const component of path) {
-    if (
-      !current
-      || typeof current !== 'object'
-      || Array.isArray(current)
-    ) {
-      return undefined;
-    }
-    current = (current as Record<string, unknown>)[component];
+function comparableEqual(left: ComparableNode, right: ComparableNode): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((item, index) => comparableEqual(item, right[index]));
   }
-  return cloneJsonValue(current);
+  if (
+    !left
+    || !right
+    || typeof left !== 'object'
+    || typeof right !== 'object'
+  ) {
+    return false;
+  }
+  return left.entries.length === right.entries.length
+    && left.entries.every(([key, value], index) => (
+      right.entries[index][0] === key
+      && comparableEqual(value, right.entries[index][1])
+    ));
+}
+
+function pairAt(document: Document, path: readonly string[]): Pair | undefined {
+  return pairFor(parentMap(document, path), path.at(-1)!);
 }
 
 function applySet(
   document: Document,
   path: readonly string[],
-  value: string | number | boolean | readonly string[],
+  value: ConfigEditValue,
 ): void {
   const map = parentMap(document, path);
   const key = path.at(-1)!;
@@ -134,7 +315,6 @@ function applySet(
   if (
     isScalar(pair.value)
     && !Array.isArray(value)
-    && (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
     && typeof pair.value.value === typeof value
   ) {
     (pair.value as Scalar).value = value;
@@ -151,15 +331,14 @@ function applySet(
 }
 
 function applyRemove(document: Document, path: readonly string[]): void {
-  const map = parentMap(document, path);
-  map.delete(path.at(-1)!);
+  parentMap(document, path).delete(path.at(-1)!);
 }
 
 function applyRename(
   document: Document,
   from: readonly string[],
   to: readonly string[],
-): unknown {
+): ComparableNode {
   const sourceMap = parentMap(document, from);
   const destinationMap = parentMap(document, to);
   const sourceKey = from.at(-1)!;
@@ -169,16 +348,15 @@ function applyRename(
     throw new UpdateError('MIGRATION_CONFLICT');
   }
 
-  const sourceValue = jsValueAt(document, from);
+  const sourceValue = comparableNode(sourcePair.value);
   if (sourceMap === destinationMap) {
-    if (!isScalar(sourcePair.key)) throw new UpdateError('INVALID_CONFIG');
+    if (!isScalar(sourcePair.key)) invalidConfig();
     sourcePair.key.value = destinationKey;
     return sourceValue;
   }
 
-  const sourceIndex = sourceMap.items.indexOf(sourcePair);
-  sourceMap.items.splice(sourceIndex, 1);
-  if (!isScalar(sourcePair.key)) throw new UpdateError('INVALID_CONFIG');
+  sourceMap.items.splice(sourceMap.items.indexOf(sourcePair), 1);
+  if (!isScalar(sourcePair.key)) invalidConfig();
   sourcePair.key.value = destinationKey;
   destinationMap.items.push(sourcePair);
   return sourceValue;
@@ -186,7 +364,7 @@ function applyRename(
 
 interface AppliedEdit {
   edit: ConfigEdit;
-  renamedValue?: unknown;
+  renamedValue?: ComparableNode;
 }
 
 function applyEdits(document: Document, edits: readonly ConfigEdit[]): AppliedEdit[] {
@@ -199,35 +377,68 @@ function applyEdits(document: Document, edits: readonly ConfigEdit[]): AppliedEd
       applyRemove(document, edit.path);
       return { edit };
     }
-    if (edit.kind === 'rename') {
-      return {
-        edit,
-        renamedValue: applyRename(document, edit.from, edit.to),
-      };
-    }
-    throw new UpdateError('INVALID_REQUEST');
+    return {
+      edit,
+      renamedValue: applyRename(document, edit.from, edit.to),
+    };
   });
 }
 
-function valuesEqual(actual: unknown, expected: unknown): boolean {
-  return JSON.stringify(actual) === JSON.stringify(expected);
+function comparableEditValue(value: ConfigEditValue): ComparableNode {
+  if (
+    typeof value === 'string'
+    || typeof value === 'number'
+    || typeof value === 'boolean'
+  ) {
+    return value;
+  }
+  return [...value];
 }
 
 function verifyEdits(document: Document, applied: readonly AppliedEdit[]): void {
   for (const { edit, renamedValue } of applied) {
     if (edit.kind === 'set') {
-      const expected = Array.isArray(edit.value) ? [...edit.value] : edit.value;
-      if (!valuesEqual(document.getIn(edit.path), expected)) {
+      const pair = pairAt(document, edit.path);
+      if (
+        !pair
+        || !comparableEqual(
+          comparableNode(pair.value),
+          comparableEditValue(edit.value),
+        )
+      ) {
         throw new UpdateError('VALIDATION_FAILED');
       }
     } else if (edit.kind === 'remove') {
-      if (document.hasIn(edit.path)) throw new UpdateError('VALIDATION_FAILED');
-    } else if (
-      document.hasIn(edit.from)
-      || !valuesEqual(document.getIn(edit.to), renamedValue)
-    ) {
-      throw new UpdateError('VALIDATION_FAILED');
+      if (pairAt(document, edit.path)) throw new UpdateError('VALIDATION_FAILED');
+    } else {
+      const source = pairAt(document, edit.from);
+      const destination = pairAt(document, edit.to);
+      if (
+        source
+        || !destination
+        || renamedValue === undefined
+        || !comparableEqual(comparableNode(destination.value), renamedValue)
+      ) {
+        throw new UpdateError('VALIDATION_FAILED');
+      }
     }
+  }
+}
+
+function decodeUtf8(bytes: Buffer): string {
+  try {
+    return new TextDecoder('utf-8', { fatal: true })
+      .decode(Uint8Array.from(bytes));
+  } catch {
+    return invalidConfig();
+  }
+}
+
+function renderDocument(document: Document): string {
+  try {
+    return document.toString().replace(/\n*$/, '\n');
+  } catch {
+    return invalidConfig();
   }
 }
 
@@ -239,7 +450,7 @@ export function renderConfigEdits(
   configPath: string,
   edits: readonly ConfigEdit[],
 ): ConfigRenderResult {
-  if (!Array.isArray(edits)) throw new UpdateError('INVALID_REQUEST');
+  const validatedEdits = parseConfigEdits(edits);
   let sourceBytes: Buffer;
   try {
     sourceBytes = fs.readFileSync(configPath);
@@ -247,19 +458,24 @@ export function renderConfigEdits(
     throw new UpdateError('INVALID_CONFIG');
   }
 
-  const document = parseConfig(sourceBytes.toString('utf8'));
-  const currentVersion = readVersion(document);
-  const applied = applyEdits(document, edits);
-  const rendered = document.toString().replace(/\n*$/, '\n');
-  const desiredBytes = Buffer.from(rendered, 'utf8');
-  const verified = parseConfig(desiredBytes.toString('utf8'));
-  verifyEdits(verified, applied);
+  try {
+    const document = parseConfig(decodeUtf8(sourceBytes));
+    const currentVersion = readVersion(document);
+    const applied = applyEdits(document, validatedEdits);
+    const desiredBytes = Buffer.from(renderDocument(document), 'utf8');
+    const verified = parseConfig(decodeUtf8(desiredBytes));
+    readVersion(verified);
+    verifyEdits(verified, applied);
 
-  return {
-    currentVersion,
-    sourceBytes,
-    desiredBytes,
-    sourceSha256: sha256(sourceBytes),
-    desiredSha256: sha256(desiredBytes),
-  };
+    return {
+      currentVersion,
+      sourceBytes,
+      desiredBytes,
+      sourceSha256: sha256(sourceBytes),
+      desiredSha256: sha256(desiredBytes),
+    };
+  } catch (error) {
+    if (error instanceof UpdateError) throw error;
+    return invalidConfig();
+  }
 }

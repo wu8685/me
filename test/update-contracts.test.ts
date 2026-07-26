@@ -148,4 +148,39 @@ describe('update contracts', () => {
       plannedPaths: ['.me/config.yaml'],
     });
   });
+
+  test('redacts cross-platform, file URL, UNC, and punctuation-adjacent paths', () => {
+    const sensitivePaths = [
+      '/private/me-runtime/transactions/unix.json',
+      'file:///private/me-runtime/transactions/file-url.json',
+      'file:///C:/runtime/transactions/file-url-windows.json',
+      'file://server/share/transactions/file-url-unc.json',
+      'C:\\runtime\\transactions\\windows-backslash.json',
+      'C:/runtime/transactions/windows-slash.json',
+      '\\\\server\\share\\transactions\\unc-backslash.json',
+      '//server/share/transactions/unc-slash.json',
+      'file:/private/me-runtime/transactions/file-url-single-slash.json',
+    ];
+    const serialized = serializeUpdateResult(result({
+      warnings: [
+        `bracket=[${sensitivePaths[0]}]`,
+        `colon:${sensitivePaths[0]}`,
+        `url=${sensitivePaths[1]}`,
+        `windows-url=${sensitivePaths[2]}`,
+        `unc-url=${sensitivePaths[3]}`,
+        `windows=(${sensitivePaths[4]})`,
+        `windows-slash={${sensitivePaths[5]}}`,
+        `unc=${sensitivePaths[6]}`,
+        `unc-slash=${sensitivePaths[7]}`,
+        `single-slash-url=${sensitivePaths[8]}`,
+        'portable=<ME_RUNTIME>/transactions/public.json',
+      ],
+    }));
+
+    for (const sensitivePath of sensitivePaths) {
+      expect(serialized).not.toContain(sensitivePath);
+    }
+    expect(serialized).toContain('<ME_RUNTIME>/transactions/public.json');
+    expect(serialized).toContain('<ABSOLUTE_PATH>');
+  });
 });
