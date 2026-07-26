@@ -134,8 +134,14 @@ export function readContainedRequestFile(
   let descriptor: number | undefined;
   try {
     const noFollow = fs.constants.O_NOFOLLOW;
-    if (typeof noFollow !== 'number') throw new VaultWriterError('UNSAFE_PATH');
-    descriptor = fs.openSync(candidate, fs.constants.O_RDONLY | noFollow);
+    const nonBlock = fs.constants.O_NONBLOCK;
+    if (typeof noFollow !== 'number' || typeof nonBlock !== 'number') {
+      throw new VaultWriterError('UNSAFE_PATH');
+    }
+    descriptor = fs.openSync(
+      candidate,
+      fs.constants.O_RDONLY | noFollow | nonBlock,
+    );
     const opened = fs.fstatSync(descriptor);
     const entry = fs.lstatSync(candidate);
     if (opened.size > MAX_REQUEST_BYTES) {

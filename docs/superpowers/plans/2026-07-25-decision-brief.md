@@ -1187,7 +1187,8 @@ bun run bin/vault-write.ts write   --vault-dir VAULT [--request .me/tmp/request.
 - request file 只允许 contained `.me/tmp/*.json`，拒绝 outside、escaping/dangling
   symlink；
 - stdin 与 request file 的完整 raw request 均硬限 4 MiB；file 使用
-  `O_NOFOLLOW` 与同一 fd 完成校验、有界读取和读取后 identity 复核；
+  `O_NOFOLLOW | O_NONBLOCK` 打开，先由同一 fd 的 `fstat` 拒绝 FIFO/socket/device，
+  再完成 regular-file 校验、有界读取和读取后 identity 复核；
 - argv/process command 不包含 Markdown；
 - stdout/stderr/result 中不出现 fixture 的 Markdown sentinel、secret、absolute vault、
   username、home、injected exception、command stderr；

@@ -529,9 +529,11 @@ vault/.me/
 
 CLI 从 stdin 接收 UTF-8 JSON；也可通过 `--request` 读取文件，但该文件必须位于当前
 vault 的 `.me/tmp/` 内。两种输入的**完整 raw request** 均以 4 MiB 为硬上限。
-request file 通过 `O_NOFOLLOW` 打开，使用同一 fd 做 identity/containment 校验、有界
-读取和读取后复核，不能在 pathname 检查后重新按 pathname 读取。Markdown 不放进
-argv，避免被 shell history 和 process list 记录。
+request file 通过 `O_NOFOLLOW | O_NONBLOCK` 打开，避免 FIFO 在 file-type 校验前
+阻塞；同一 fd 的 `fstat` 必须先确认 regular file，再做 identity/containment 校验、
+有界读取和读取后复核。socket/device 等非 regular file 也必须立即 validation fail，
+不能在 pathname 检查后重新按 pathname 读取。`O_NONBLOCK` 对 regular file 不改变
+读取语义。Markdown 不放进 argv，避免被 shell history 和 process list 记录。
 
 ```ts
 interface VaultWriteRequestV1 {

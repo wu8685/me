@@ -18,6 +18,7 @@ import {
 const pluginRoot = path.resolve(import.meta.dir, '..');
 const cli = path.join(pluginRoot, 'bin/vault-write.ts');
 const temporaryDirectories: string[] = [];
+const testPosixFifo = process.platform === 'win32' ? test.skip : test;
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
@@ -270,6 +271,34 @@ describe('vault-write CLI JSON boundary', () => {
         requestPath,
       ]), 'UNSAFE_PATH');
     }
+  });
+
+  testPosixFifo('rejects a request FIFO without blocking the CLI open boundary', () => {
+    const vault = makeVault();
+    fs.mkdirSync(path.join(vault, '.me/tmp'));
+    const requestPath = path.join(vault, '.me/tmp/request.json');
+    const mkfifo = spawnSync('mkfifo', [requestPath], {
+      cwd: pluginRoot,
+      encoding: null,
+    });
+    expect(mkfifo.status).toBe(0);
+    expect(mkfifo.error).toBeUndefined();
+
+    const result = spawnSync(
+      'bun',
+      ['run', cli, 'preview', '--vault-dir', vault, '--request', '.me/tmp/request.json'],
+      {
+        cwd: pluginRoot,
+        encoding: null,
+        env: process.env,
+        timeout: 1_000,
+        killSignal: 'SIGKILL',
+      },
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expectPublicFailure(result, 'UNSAFE_PATH');
   });
 
   test('reads a request from one no-follow descriptor and rejects a checked-path replacement', () => {
