@@ -188,18 +188,48 @@ export class UpdateError extends Error {
   }
 }
 
+const PATH_TOKEN_END = String.raw`\s,;)}\]"'<>`;
 const ABSOLUTE_PATH_PATTERNS = [
-  /\bfile:[\\/]{1,3}[^\n,;)}\]"'<>]+/gi,
-  /(?<![A-Za-z0-9_>/\\])\\\\[^\\\s]+\\[^\n,;)}\]"'<>]+/g,
-  /(?<![A-Za-z0-9_>:/\\])\/\/[^/\s]+\/[^\n,;)}\]"'<>]+/g,
-  /(?<![A-Za-z0-9_>/\\])[A-Za-z]:[\\/][^\n,;)}\]"'<>]+/g,
-  /(?<![A-Za-z0-9_>/\\])\/(?!\/)[^\n,;)}\]"'<>]+/g,
+  new RegExp(
+    String.raw`(?<![A-Za-z0-9_:/\\])file:[\\/]{1,3}[^${PATH_TOKEN_END}]+`,
+    'gi',
+  ),
+  new RegExp(
+    String.raw`(?<![A-Za-z0-9_/\\<])\\\\[^${PATH_TOKEN_END}]+`,
+    'g',
+  ),
+  new RegExp(
+    String.raw`(?<![A-Za-z0-9_/\\<])[A-Za-z]:[\\/][^${PATH_TOKEN_END}]+`,
+    'g',
+  ),
+  new RegExp(
+    String.raw`(?<![A-Za-z0-9_/\\<])\/+[^${PATH_TOKEN_END}]*`,
+    'g',
+  ),
 ] as const;
 
 function redactAbsolutePaths(value: string): string {
-  return ABSOLUTE_PATH_PATTERNS.reduce(
+  const protectedRuntimePaths: string[] = [];
+  let sentinelPrefix = '\u{e000}ME_RUNTIME_';
+  while (value.includes(sentinelPrefix)) sentinelPrefix += '_';
+  const protectedValue = value.replace(
+    /<ME_RUNTIME>(?:[\\/][^\s,;)}\]"'<>]+)?/g,
+    match => {
+      const sentinel = `${sentinelPrefix}${protectedRuntimePaths.length}\u{e001}`;
+      protectedRuntimePaths.push(match);
+      return sentinel;
+    },
+  );
+  const redacted = ABSOLUTE_PATH_PATTERNS.reduce(
     (redacted, pattern) => redacted.replace(pattern, '<ABSOLUTE_PATH>'),
-    value,
+    protectedValue,
+  );
+  return protectedRuntimePaths.reduce(
+    (restored, runtimePath, index) => restored.replace(
+      `${sentinelPrefix}${index}\u{e001}`,
+      runtimePath,
+    ),
+    redacted,
   );
 }
 

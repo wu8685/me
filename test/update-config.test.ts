@@ -243,6 +243,88 @@ describe('renderConfigEdits', () => {
     expect(rendered).toContain('enabled: "true" # keep enabled note');
   });
 
+  test('accepts every public set value including empty strings and string arrays', () => {
+    const config = fixtureConfig([
+      'custom:',
+      '  replace: original',
+      '',
+    ].join('\n'));
+
+    const result = renderConfigEdits(config, [
+      { kind: 'set', path: ['custom', 'empty_string'], value: '' },
+      { kind: 'set', path: ['custom', 'empty_array'], value: [] },
+      { kind: 'set', path: ['custom', 'empty_elements'], value: ['', 'kept', ''] },
+      { kind: 'set', path: ['custom', 'positive_infinity'], value: Number.POSITIVE_INFINITY },
+      { kind: 'set', path: ['custom', 'not_a_number'], value: Number.NaN },
+    ]);
+    const parsed = parseDocument(result.desiredBytes.toString('utf8')).toJS();
+
+    expect(parsed.custom.empty_string).toBe('');
+    expect(parsed.custom.empty_array).toEqual([]);
+    expect(parsed.custom.empty_elements).toEqual(['', 'kept', '']);
+    expect(parsed.custom.positive_infinity).toBe(Number.POSITIVE_INFINITY);
+    expect(Number.isNaN(parsed.custom.not_a_number)).toBeTrue();
+  });
+
+  test('preserves a quoted literal merge-looking key as unknown config', () => {
+    const config = fixtureConfig([
+      '"<<": literal-key',
+      'custom:',
+      '  keep: true',
+      '',
+    ].join('\n'));
+
+    const result = renderConfigEdits(config, [{
+      kind: 'set',
+      path: ['vault_schema_version'],
+      value: 1,
+    }]);
+    const rendered = result.desiredBytes.toString('utf8');
+
+    expect(rendered).toContain('"<<"');
+    expect(parseDocument(rendered).get('<<')).toBe('literal-key');
+    expect(parseDocument(rendered).get('vault_schema_version')).toBe(1);
+  });
+
+  test('verifies the final state after repeated set and set then remove edits', () => {
+    const config = fixtureConfig('custom:\n  keep: original\n');
+
+    const result = renderConfigEdits(config, [
+      { kind: 'set', path: ['custom', 'keep'], value: 'first' },
+      { kind: 'set', path: ['custom', 'keep'], value: 'final' },
+      { kind: 'set', path: ['custom', 'temporary'], value: 'remove-me' },
+      { kind: 'remove', path: ['custom', 'temporary'] },
+    ]);
+    const document = parseDocument(result.desiredBytes.toString('utf8'));
+
+    expect(document.getIn(['custom', 'keep'])).toBe('final');
+    expect(document.getIn(['custom', 'temporary'])).toBeUndefined();
+  });
+
+  test('verifies the final state of a rename chain', () => {
+    const config = fixtureConfig('custom:\n  first: "preserved" # keep chain note\n');
+
+    const result = renderConfigEdits(config, [
+      {
+        kind: 'rename',
+        from: ['custom', 'first'],
+        to: ['custom', 'second'],
+      },
+      {
+        kind: 'rename',
+        from: ['custom', 'second'],
+        to: ['custom', 'third'],
+      },
+    ]);
+    const rendered = result.desiredBytes.toString('utf8');
+    const document = parseDocument(rendered);
+
+    expect(document.getIn(['custom', 'first'])).toBeUndefined();
+    expect(document.getIn(['custom', 'second'])).toBeUndefined();
+    expect(document.getIn(['custom', 'third'])).toBe('preserved');
+    expect(rendered).toContain('third: "preserved" # keep chain note');
+  });
+
   test.each([
     {
       label: 'identical paths',
@@ -300,13 +382,9 @@ describe('renderConfigEdits', () => {
     ['empty path', { kind: 'set', path: [], value: true }],
     ['empty path component', { kind: 'set', path: [''], value: true }],
     ['non-string path component', { kind: 'set', path: ['custom', 1], value: true }],
-    ['empty string value', { kind: 'set', path: ['custom'], value: '' }],
     ['null value', { kind: 'set', path: ['custom'], value: null }],
     ['object value', { kind: 'set', path: ['custom'], value: { keep: true } }],
-    ['empty string array', { kind: 'set', path: ['custom'], value: [] }],
-    ['empty array element', { kind: 'set', path: ['custom'], value: ['ok', ''] }],
     ['non-string array element', { kind: 'set', path: ['custom'], value: ['ok', 1] }],
-    ['non-finite number', { kind: 'set', path: ['custom'], value: Number.POSITIVE_INFINITY }],
     ['set extra field', { kind: 'set', path: ['custom'], value: true, extra: true }],
     ['remove extra field', { kind: 'remove', path: ['custom'], value: true }],
     [
@@ -367,5 +445,28 @@ describe('renderConfigEdits', () => {
       'INVALID_CONFIG',
     );
     expect(fs.readFileSync(config).equals(source)).toBeTrue();
+  });
+
+  test('preserves a valid UTF-8 BOM in desired bytes', () => {
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const source = Buffer.concat([
+      bom,
+      Buffer.from('custom:\n  keep: true\n', 'utf8'),
+    ]);
+    const config = fixtureBytes(source);
+
+    const result = renderConfigEdits(config, [{
+      kind: 'set',
+      path: ['vault_schema_version'],
+      value: 1,
+    }]);
+
+    expect(result.sourceBytes.equals(source)).toBeTrue();
+    expect(result.desiredBytes.subarray(0, bom.length).equals(bom)).toBeTrue();
+    expect(result.desiredBytes.subarray(bom.length, bom.length * 2).equals(bom))
+      .toBeFalse();
+    expect(readVaultSchemaVersion(
+      result.desiredBytes.subarray(bom.length).toString('utf8'),
+    )).toBe(1);
   });
 });

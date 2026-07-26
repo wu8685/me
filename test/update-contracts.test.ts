@@ -183,4 +183,23 @@ describe('update contracts', () => {
     expect(serialized).toContain('<ME_RUNTIME>/transactions/public.json');
     expect(serialized).toContain('<ABSOLUTE_PATH>');
   });
+
+  test('redacts path tokens after angle brackets and arrows without consuming safe trailing text', () => {
+    const serialized = serializeUpdateResult(result({
+      warnings: [
+        'arrow=>/private/me-runtime/transactions/arrow.json continue here',
+        'html=<code>/private/me-runtime/transactions/html.json</code> preserved',
+        'multi=///private/me-runtime/transactions/multi.json tail',
+        'portable=<ME_RUNTIME>/transactions/public.json keep this text',
+      ],
+    }));
+    const warnings = JSON.parse(serialized).warnings;
+
+    expect(warnings).toEqual([
+      'arrow=><ABSOLUTE_PATH> continue here',
+      'html=<code><ABSOLUTE_PATH></code> preserved',
+      'multi=<ABSOLUTE_PATH> tail',
+      'portable=<ME_RUNTIME>/transactions/public.json keep this text',
+    ]);
+  });
 });

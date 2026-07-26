@@ -55,11 +55,19 @@ function assertSupportedNode(node: unknown): void {
   if (isMap(node)) {
     const keys = new Set<string>();
     for (const pair of node.items) {
+      const isMergeKey = isScalar(pair.key) && (
+        pair.key.tag === 'tag:yaml.org,2002:merge'
+        || (
+          pair.key.type === 'PLAIN'
+          && pair.key.tag === undefined
+          && pair.key.value === '<<'
+        )
+      );
       if (
         !isScalar(pair.key)
         || pair.key.anchor
         || typeof pair.key.value !== 'string'
-        || pair.key.value === '<<'
+        || isMergeKey
         || keys.has(pair.key.value)
       ) {
         invalidConfig();
@@ -162,18 +170,13 @@ function parseSetValue(value: unknown, path: readonly string[]): ConfigEditValue
   }
 
   if (typeof value === 'string') {
-    if (value.length === 0) invalidRequest();
     return value;
   }
   if (typeof value === 'boolean') return value;
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) invalidRequest();
-    return value;
-  }
+  if (typeof value === 'number') return value;
   if (
     Array.isArray(value)
-    && value.length > 0
-    && value.every(item => typeof item === 'string' && item.length > 0)
+    && value.every(item => typeof item === 'string')
   ) {
     return [...value] as string[];
   }
@@ -246,7 +249,15 @@ type ComparableNode =
   | { readonly entries: ReadonlyArray<readonly [string, ComparableNode]> };
 
 function comparableNode(node: unknown): ComparableNode {
-  if (node === null) return null;
+  if (
+    node === null
+    || typeof node === 'string'
+    || typeof node === 'number'
+    || typeof node === 'boolean'
+  ) {
+    return node as null | string | number | boolean;
+  }
+  if (Array.isArray(node)) return node.map(comparableNode);
   if (isAlias(node) || !isNode(node) || node.anchor) invalidConfig();
   if (isScalar(node)) {
     const value = node.value;
@@ -264,8 +275,12 @@ function comparableNode(node: unknown): ComparableNode {
   if (isMap(node)) {
     return {
       entries: node.items.map(pair => {
-        if (!isScalar(pair.key) || typeof pair.key.value !== 'string') invalidConfig();
-        return [pair.key.value, comparableNode(pair.value)] as const;
+        const key = typeof pair.key === 'string'
+          ? pair.key
+          : isScalar(pair.key) && typeof pair.key.value === 'string'
+            ? pair.key.value
+            : invalidConfig();
+        return [key, comparableNode(pair.value)] as const;
       }),
     };
   }
@@ -293,10 +308,6 @@ function comparableEqual(left: ComparableNode, right: ComparableNode): boolean {
       right.entries[index][0] === key
       && comparableEqual(value, right.entries[index][1])
     ));
-}
-
-function pairAt(document: Document, path: readonly string[]): Pair | undefined {
-  return pairFor(parentMap(document, path), path.at(-1)!);
 }
 
 function applySet(
@@ -338,7 +349,7 @@ function applyRename(
   document: Document,
   from: readonly string[],
   to: readonly string[],
-): ComparableNode {
+): void {
   const sourceMap = parentMap(document, from);
   const destinationMap = parentMap(document, to);
   const sourceKey = from.at(-1)!;
@@ -348,80 +359,36 @@ function applyRename(
     throw new UpdateError('MIGRATION_CONFLICT');
   }
 
-  const sourceValue = comparableNode(sourcePair.value);
   if (sourceMap === destinationMap) {
     if (!isScalar(sourcePair.key)) invalidConfig();
     sourcePair.key.value = destinationKey;
-    return sourceValue;
+    return;
   }
 
   sourceMap.items.splice(sourceMap.items.indexOf(sourcePair), 1);
   if (!isScalar(sourcePair.key)) invalidConfig();
   sourcePair.key.value = destinationKey;
   destinationMap.items.push(sourcePair);
-  return sourceValue;
 }
 
-interface AppliedEdit {
-  edit: ConfigEdit;
-  renamedValue?: ComparableNode;
-}
-
-function applyEdits(document: Document, edits: readonly ConfigEdit[]): AppliedEdit[] {
-  return edits.map(edit => {
+function applyEdits(document: Document, edits: readonly ConfigEdit[]): void {
+  for (const edit of edits) {
     if (edit.kind === 'set') {
       applySet(document, edit.path, edit.value);
-      return { edit };
-    }
-    if (edit.kind === 'remove') {
-      applyRemove(document, edit.path);
-      return { edit };
-    }
-    return {
-      edit,
-      renamedValue: applyRename(document, edit.from, edit.to),
-    };
-  });
-}
-
-function comparableEditValue(value: ConfigEditValue): ComparableNode {
-  if (
-    typeof value === 'string'
-    || typeof value === 'number'
-    || typeof value === 'boolean'
-  ) {
-    return value;
-  }
-  return [...value];
-}
-
-function verifyEdits(document: Document, applied: readonly AppliedEdit[]): void {
-  for (const { edit, renamedValue } of applied) {
-    if (edit.kind === 'set') {
-      const pair = pairAt(document, edit.path);
-      if (
-        !pair
-        || !comparableEqual(
-          comparableNode(pair.value),
-          comparableEditValue(edit.value),
-        )
-      ) {
-        throw new UpdateError('VALIDATION_FAILED');
-      }
     } else if (edit.kind === 'remove') {
-      if (pairAt(document, edit.path)) throw new UpdateError('VALIDATION_FAILED');
+      applyRemove(document, edit.path);
     } else {
-      const source = pairAt(document, edit.from);
-      const destination = pairAt(document, edit.to);
-      if (
-        source
-        || !destination
-        || renamedValue === undefined
-        || !comparableEqual(comparableNode(destination.value), renamedValue)
-      ) {
-        throw new UpdateError('VALIDATION_FAILED');
-      }
+      applyRename(document, edit.from, edit.to);
     }
+  }
+}
+
+function verifyRenderedDocument(
+  expected: ComparableNode,
+  rendered: Document,
+): void {
+  if (!comparableEqual(expected, comparableNode(rendered.contents))) {
+    throw new UpdateError('VALIDATION_FAILED');
   }
 }
 
@@ -446,6 +413,13 @@ function sha256(bytes: Buffer): string {
   return createHash('sha256').update(Uint8Array.from(bytes)).digest('hex');
 }
 
+function hasUtf8Bom(bytes: Buffer): boolean {
+  return bytes.length >= 3
+    && bytes[0] === 0xef
+    && bytes[1] === 0xbb
+    && bytes[2] === 0xbf;
+}
+
 export function renderConfigEdits(
   configPath: string,
   edits: readonly ConfigEdit[],
@@ -461,11 +435,16 @@ export function renderConfigEdits(
   try {
     const document = parseConfig(decodeUtf8(sourceBytes));
     const currentVersion = readVersion(document);
-    const applied = applyEdits(document, validatedEdits);
-    const desiredBytes = Buffer.from(renderDocument(document), 'utf8');
+    applyEdits(document, validatedEdits);
+    const expected = comparableNode(document.contents);
+    const rendered = renderDocument(document);
+    const desiredBytes = Buffer.from(
+      hasUtf8Bom(sourceBytes) ? `\u{feff}${rendered}` : rendered,
+      'utf8',
+    );
     const verified = parseConfig(decodeUtf8(desiredBytes));
     readVersion(verified);
-    verifyEdits(verified, applied);
+    verifyRenderedDocument(expected, verified);
 
     return {
       currentVersion,
