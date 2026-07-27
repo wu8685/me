@@ -205,6 +205,61 @@ describe('preview and successful journaled create', () => {
     expect(fs.existsSync(path.join(vault, '.me/locks'))).toBeFalse();
   });
 
+  test('lowers note and README publication into shared portable mutation fingerprints', () => {
+    const vault = makeVault('# Existing\n');
+    let mutations: Array<Record<string, unknown>> = [];
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      hooks: {
+        afterStaging() {
+          const [operation] = fs.readdirSync(transactionRoot(vault));
+          const fingerprint = JSON.parse(fs.readFileSync(path.join(
+            transactionRoot(vault),
+            operation,
+            'fingerprint.json',
+          ), 'utf8'));
+          mutations = fingerprint.mutations;
+        },
+      },
+    });
+
+    expect(result.status).toBe('committed');
+    expect(mutations).toHaveLength(2);
+    expect(mutations.map(mutation => ({
+      kind: mutation.kind,
+      path: mutation.vaultRelativePath,
+      source: mutation.source,
+      desiredMode: mutation.desiredMode,
+      desiredSha256: mutation.desiredSha256,
+    }))).toEqual([
+      {
+        kind: 'write-file',
+        path: 'practices/decisions/2026-07-26-orchid-choice.md',
+        source: {
+          vaultRelativePath: 'practices/decisions/2026-07-26-orchid-choice.md',
+          type: 'missing',
+        },
+        desiredMode: 0o666 & ~process.umask(),
+        desiredSha256: crypto.createHash('sha256')
+          .update(Buffer.from(request().markdown, 'utf8'))
+          .digest('hex'),
+      },
+      {
+        kind: 'write-file',
+        path: 'practices/README.md',
+        source: {
+          vaultRelativePath: 'practices/README.md',
+          type: 'file',
+          sha256: crypto.createHash('sha256').update('# Existing\n').digest('hex'),
+          mode: 0o640,
+        },
+        desiredMode: 0o640,
+        desiredSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    ]);
+  });
+
   test('preserves an existing README inode and permission bits when replacing it', () => {
     const vault = makeVault('# Existing\n');
     const before = fs.statSync(path.join(vault, 'practices/README.md'));

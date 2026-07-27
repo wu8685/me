@@ -1,3 +1,14 @@
+export {
+  fingerprintMutationSource,
+  validatePlannedMutations,
+} from '../mutation/contracts';
+export type {
+  PlannedMutation,
+  SourceFingerprint,
+} from '../mutation/contracts';
+
+import type { PlannedMutation } from '../mutation/contracts';
+
 export const CURRENT_VAULT_SCHEMA_VERSION = 1;
 
 export type UpdateStatus =
@@ -24,36 +35,6 @@ export type UpdateErrorCode =
   | 'VALIDATION_FAILED'
   | 'RECOVERY_REQUIRED'
   | 'INTERNAL_ERROR';
-
-export interface SourceFingerprint {
-  vaultRelativePath: string;
-  type: 'missing' | 'file' | 'directory';
-  sha256?: string;
-  mode?: number;
-}
-
-export type PlannedMutation =
-  | {
-      kind: 'write-file';
-      vaultRelativePath: string;
-      source: SourceFingerprint;
-      desiredBytes: Buffer;
-      desiredSha256: string;
-      publishOrder: number;
-    }
-  | {
-      kind: 'mkdir';
-      vaultRelativePath: string;
-      source: SourceFingerprint;
-      publishOrder: number;
-    }
-  | {
-      kind: 'rename';
-      vaultRelativePath: string;
-      destinationVaultRelativePath: string;
-      source: SourceFingerprint;
-      publishOrder: number;
-    };
 
 export interface UpdatePlan {
   status: 'up_to_date' | 'preview';
