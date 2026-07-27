@@ -637,6 +637,15 @@ checked `link`, `rename`, `unlink`, `mkdir`, `rmdir`, and directory-fsync
 behavior from the existing vault-write transaction into
 `bin/mutation/executor.ts`.
 
+The physical executor must not perform a final name-only delete after an
+ownership check. Publish `link` and `rename` destinations as descriptor-written
+independent-inode temporary copies followed by a no-replace rename. Implement
+`unlink`, `rmdir`, and the source side of `rename` as no-replace logical
+retirement into a persistent private `<ME_RUNTIME>/retired/` root outside
+operation directories. Zero and fsync regular tombstones through their owned
+descriptors; retain only empty directory tombstones; never automatically
+garbage-collect either kind.
+
 The executor receives path-safety and journal adapters. It does not know about
 note schemas, indexes, migrations, vault schema versions, domain journal
 states, or public JSON results. It emits only typed `MutationFailure` values.
@@ -1343,9 +1352,12 @@ try {
 
 Before the first mutation, create a private operation directory and
 `journal.json`, stage desired files with mode `0600`, fsync them, and verify
-their SHA-256 digests. Use same-filesystem hard links/renames and record
-`pendingMutation` before every filesystem change. Move or link originals into
-`originals/` before replacement. Publish `.me/config.yaml` last.
+their SHA-256 digests. Publish each file as an independent-inode copy through
+an exclusive random temporary file in the opened destination directory,
+followed by a no-replace rename. Record `pendingMutation` before every
+filesystem change. Logically retire replaced originals into the persistent
+`<ME_RUNTIME>/retired/` namespace before replacement. Publish
+`.me/config.yaml` last.
 
 After staged bytes validate, set each staged descriptor to the planned
 `desiredMode` and fsync it before publication; the private operation directory
@@ -1358,6 +1370,14 @@ publication and rollback boundaries must pass through it. This module may use
 raw filesystem APIs for read-only inspection, opening/fsyncing staged bytes,
 and journal descriptor writes, but must not call raw mutation primitives for
 vault publication, preservation, rollback, or cleanup.
+
+Shared `link` and `rename` journal vocabulary stays stable, but their physical
+publication uses the independent-inode copy protocol above. Shared `unlink`
+and `rmdir` are logical retirement operations: no-replace move the owned entry
+to the descriptor-bound mode-`0700` retirement root, truncate and fsync owned
+regular-file tombstones through their descriptors, retain empty directory
+tombstones, and never perform a final name-only unlink/rmdir or automatic
+tombstone garbage collection.
 
 Map shared failures explicitly:
 

@@ -22,6 +22,12 @@ interface OpenedDirectory {
   mode: number;
 }
 
+interface OpenedFile {
+  descriptor: number;
+  fingerprint: OwnedFileFingerprint;
+  bytes: Buffer;
+}
+
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
 }
@@ -34,11 +40,14 @@ function defaultFileOperations(): MutationFileOperations {
   return {
     openSync: fs.openSync,
     closeSync: fs.closeSync,
+    fchmodSync: fs.fchmodSync,
     fstatSync: fs.fstatSync,
+    ftruncateSync: fs.ftruncateSync,
     fsyncSync: fs.fsyncSync,
     lstatSync: fs.lstatSync,
     statSync: fs.statSync,
     readFileSync: fs.readFileSync,
+    writeFileSync: fs.writeFileSync,
     readdirSync: fs.readdirSync,
     linkSync: fs.linkSync,
     renameSync: fs.renameSync,
@@ -141,7 +150,7 @@ export function createMutationExecutor(options: {
   };
   fileOps?: MutationFileOperations;
   atomicOps?: MutationAtomicOperations;
-  quarantineDirectory?: string;
+  retirementDirectory?: string;
   directoryFsync?(directory: string): void;
 }): MutationExecutor {
   const operations = options.fileOps ?? defaultFileOperations();
@@ -211,19 +220,18 @@ export function createMutationExecutor(options: {
     }
   };
 
-  const captureFileAt = (
+  const openFileAt = (
     parent: OpenedDirectory,
     name: string,
     logicalPath: string,
-  ): OwnedFileFingerprint => {
+    flags: number,
+  ): OpenedFile => {
     let descriptor: number | undefined;
     try {
       descriptor = atomic.openAt(
         parent.descriptor,
         name,
-        fs.constants.O_RDONLY
-          | fs.constants.O_NOFOLLOW
-          | fs.constants.O_NONBLOCK,
+        flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
       );
       const before = operations.fstatSync(
         descriptor,
@@ -236,20 +244,48 @@ export function createMutationExecutor(options: {
         { bigint: true },
       ) as fs.BigIntStats;
       if (!stableDescriptor(before, after)) failure('UNSAFE_PATH');
+      const named = operations.lstatSync(
+        logicalPath,
+        { bigint: true },
+      ) as fs.BigIntStats;
+      if (
+        !named.isFile()
+        || named.isSymbolicLink()
+        || named.dev !== after.dev
+        || named.ino !== after.ino
+        || named.mode !== after.mode
+        || named.nlink !== after.nlink
+      ) failure('UNSAFE_PATH');
       return {
-        path: logicalPath,
-        device: after.dev,
-        inode: after.ino,
-        mode: Number(after.mode & 0o777n),
-        linkCount: after.nlink,
-        sha256: sha256(bytes),
+        descriptor,
+        bytes,
+        fingerprint: {
+          path: logicalPath,
+          device: after.dev,
+          inode: after.ino,
+          mode: Number(after.mode & 0o777n),
+          linkCount: after.nlink,
+          sha256: sha256(bytes),
+        },
       };
     } catch (error) {
+      if (descriptor !== undefined) closeDescriptor(descriptor);
       if (error instanceof MutationFailure) throw error;
       if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
       failure('UNSAFE_PATH');
+    }
+  };
+
+  const captureFileAt = (
+    parent: OpenedDirectory,
+    name: string,
+    logicalPath: string,
+  ): OwnedFileFingerprint => {
+    const opened = openFileAt(parent, name, logicalPath, fs.constants.O_RDONLY);
+    try {
+      return opened.fingerprint;
     } finally {
-      if (descriptor !== undefined) closeDescriptor(descriptor);
+      closeDescriptor(opened.descriptor);
     }
   };
 
@@ -272,6 +308,17 @@ export function createMutationExecutor(options: {
         { bigint: true },
       ) as fs.BigIntStats;
       if (!stat.isDirectory()) failure('UNSAFE_PATH');
+      const named = operations.lstatSync(
+        logicalPath,
+        { bigint: true },
+      ) as fs.BigIntStats;
+      if (
+        !named.isDirectory()
+        || named.isSymbolicLink()
+        || named.dev !== stat.dev
+        || named.ino !== stat.ino
+        || named.mode !== stat.mode
+      ) failure('UNSAFE_PATH');
       return {
         path: logicalPath,
         device: stat.dev,
@@ -405,49 +452,49 @@ export function createMutationExecutor(options: {
     return result;
   };
 
-  const requireQuarantine = (): string => {
-    if (!options.quarantineDirectory) failure('UNSUPPORTED_FILESYSTEM');
-    assertSafe(options.pathPolicy, options.quarantineDirectory);
-    return options.quarantineDirectory;
+  const requireRetirement = (): string => {
+    if (!options.retirementDirectory) failure('UNSUPPORTED_FILESYSTEM');
+    assertSafe(options.pathPolicy, options.retirementDirectory);
+    return options.retirementDirectory;
   };
 
-  const openQuarantine = (): OpenedDirectory => {
-    const quarantine = openDirectory(requireQuarantine());
-    if (quarantine.mode !== 0o700) {
-      closeDescriptor(quarantine.descriptor);
+  const openRetirement = (): OpenedDirectory => {
+    const retirement = openDirectory(requireRetirement());
+    if (retirement.mode !== 0o700) {
+      closeDescriptor(retirement.descriptor);
       failure('UNSAFE_PATH');
     }
-    return quarantine;
+    return retirement;
   };
 
-  const quarantineName = (): string =>
-    `.me-quarantine-${crypto.randomBytes(16).toString('hex')}`;
+  const retirementName = (): string =>
+    `.me-retired-${crypto.randomBytes(16).toString('hex')}`;
 
-  const moveToQuarantine = (
-    kind: 'rename' | 'unlink' | 'rmdir',
+  const moveToRetirement = (
+    kind: FilesystemMutationKind,
     sourceParent: OpenedDirectory,
     sourcePath: string,
-    quarantine: OpenedDirectory,
+    retirement: OpenedDirectory,
     additionallySync?: OpenedDirectory,
   ): { name: string; logicalPath: string } => {
     for (let attempt = 0; attempt < 128; attempt += 1) {
-      const name = quarantineName();
-      const logicalPath = path.join(quarantine.path, name);
+      const name = retirementName();
+      const logicalPath = path.join(retirement.path, name);
       try {
         aroundAtomic(
           kind,
-          'quarantine',
+          'retirement',
           [sourcePath, logicalPath],
           () => atomic.renameNoReplaceAt(
             sourceParent.descriptor,
             entryName(sourcePath),
-            quarantine.descriptor,
+            retirement.descriptor,
             name,
           ),
           () => {
             const opened = additionallySync
-              ? [sourceParent, quarantine, additionallySync]
-              : [sourceParent, quarantine];
+              ? [sourceParent, retirement, additionallySync]
+              : [sourceParent, retirement];
             for (const directory of new Map(
               opened.map(item => [item.descriptor, item]),
             ).values()) {
@@ -463,84 +510,295 @@ export function createMutationExecutor(options: {
         if (['ENOENT', 'ENOTDIR', 'EISDIR'].includes(errno(error) ?? '')) {
           failure('OWNERSHIP_LOST');
         }
-        throw error;
+        failure('OWNERSHIP_LOST');
       }
     }
     failure('OWNERSHIP_LOST');
   };
 
-  const quarantineFile = (
-    kind: 'rename' | 'unlink',
+  const retireFile = (
+    kind: FilesystemMutationKind,
     sourceParent: OpenedDirectory,
     source: OwnedFileFingerprint,
     additionallySync?: OpenedDirectory,
   ): void => {
-    const quarantine = openQuarantine();
+    if (source.linkCount !== 1n) failure('OWNERSHIP_LOST');
+    const retirement = openRetirement();
+    let opened: OpenedFile | undefined;
     try {
-      const { name, logicalPath: logicalQuarantine } = moveToQuarantine(
+      try {
+        opened = openFileAt(
+          sourceParent,
+          entryName(source.path),
+          source.path,
+          fs.constants.O_RDWR,
+        );
+      } catch {
+        failure('OWNERSHIP_LOST');
+      }
+      if (!sameOwnedFile(opened.fingerprint, source)) failure('OWNERSHIP_LOST');
+      const { name, logicalPath } = moveToRetirement(
         kind,
         sourceParent,
         source.path,
-        quarantine,
+        retirement,
         additionallySync,
       );
-      let quarantined: OwnedFileFingerprint;
+      let retired: OwnedFileFingerprint;
       try {
-        quarantined = captureFileAt(quarantine, name, logicalQuarantine);
+        retired = captureFileAt(retirement, name, logicalPath);
       } catch {
         failure('OWNERSHIP_LOST');
       }
       if (
-        !sameOwnedFile(quarantined, source)
+        !sameOwnedFile(retired, source)
         || !directoryStillNamed(sourceParent)
-        || !directoryStillNamed(quarantine)
+        || !directoryStillNamed(retirement)
       ) failure('OWNERSHIP_LOST');
       try {
-        atomic.unlinkAt(quarantine.descriptor, name, false);
+        operations.ftruncateSync(opened.descriptor, 0);
+        operations.fsyncSync(opened.descriptor);
       } catch {
         failure('OWNERSHIP_LOST');
       }
-      syncDirectory(quarantine.path);
+      let sanitized: fs.BigIntStats;
+      let named: fs.BigIntStats;
+      try {
+        sanitized = operations.fstatSync(
+          opened.descriptor,
+          { bigint: true },
+        ) as fs.BigIntStats;
+        named = operations.lstatSync(logicalPath, { bigint: true }) as fs.BigIntStats;
+      } catch {
+        failure('OWNERSHIP_LOST');
+      }
+      if (
+        !sanitized.isFile()
+        || sanitized.dev !== source.device
+        || sanitized.ino !== source.inode
+        || sanitized.nlink !== 1n
+        || sanitized.size !== 0n
+        || !named.isFile()
+        || named.isSymbolicLink()
+        || named.dev !== sanitized.dev
+        || named.ino !== sanitized.ino
+        || named.size !== 0n
+        || !directoryStillNamed(retirement)
+      ) failure('OWNERSHIP_LOST');
     } finally {
-      closeDescriptor(quarantine.descriptor);
+      if (opened) closeDescriptor(opened.descriptor);
+      closeDescriptor(retirement.descriptor);
     }
   };
 
-  const quarantineDirectory = (
+  const retireDirectory = (
     sourceParent: OpenedDirectory,
     source: OwnedDirectoryFingerprint,
   ): void => {
-    const quarantinePath = requireQuarantine();
-    if (path.resolve(source.path) === path.resolve(quarantinePath)) {
+    const retirementPath = requireRetirement();
+    if (path.resolve(source.path) === path.resolve(retirementPath)) {
       failure('OWNERSHIP_LOST');
     }
-    const quarantine = openQuarantine();
     try {
-      const { name, logicalPath: logicalQuarantine } = moveToQuarantine(
+      if ((operations.readdirSync(source.path) as string[]).length !== 0) {
+        failure('OWNERSHIP_LOST');
+      }
+    } catch (error) {
+      if (error instanceof MutationFailure) throw error;
+      failure('OWNERSHIP_LOST');
+    }
+    const retirement = openRetirement();
+    try {
+      const { name, logicalPath } = moveToRetirement(
         'rmdir',
         sourceParent,
         source.path,
-        quarantine,
+        retirement,
       );
-      let quarantined: OwnedDirectoryFingerprint;
+      let retired: OwnedDirectoryFingerprint;
       try {
-        quarantined = captureDirectoryAt(quarantine, name, logicalQuarantine);
+        retired = captureDirectoryAt(retirement, name, logicalPath);
+      } catch {
+        failure('OWNERSHIP_LOST');
+      }
+      let remainsEmpty: boolean;
+      try {
+        remainsEmpty = (operations.readdirSync(logicalPath) as string[]).length === 0;
       } catch {
         failure('OWNERSHIP_LOST');
       }
       if (
-        !sameOwnedDirectory(quarantined, source)
+        !sameOwnedDirectory(retired, source)
+        || !remainsEmpty
         || !directoryStillNamed(sourceParent)
-        || !directoryStillNamed(quarantine)
+        || !directoryStillNamed(retirement)
       ) failure('OWNERSHIP_LOST');
+    } finally {
+      closeDescriptor(retirement.descriptor);
+    }
+  };
+
+  const publishCopy = (
+    kind: 'link' | 'rename',
+    sourceParent: OpenedDirectory,
+    source: OwnedFileFingerprint,
+    destinationParent: OpenedDirectory,
+    destination: string,
+  ): OwnedFileFingerprint => {
+    let openedSource: OpenedFile;
+    try {
+      openedSource = openFileAt(
+        sourceParent,
+        entryName(source.path),
+        source.path,
+        fs.constants.O_RDONLY,
+      );
+    } catch (error) {
+      if (
+        error instanceof MutationFailure
+        && error.code === 'UNSUPPORTED_FILESYSTEM'
+      ) throw error;
+      failure('SOURCE_CHANGED');
+    }
+    let temporaryDescriptor: number | undefined;
+    let temporaryName: string | undefined;
+    let temporaryPath: string | undefined;
+    let published = false;
+    try {
+      if (!sameOwnedFile(openedSource.fingerprint, source)) {
+        failure('SOURCE_CHANGED');
+      }
+      if (openedSource.fingerprint.device !== destinationParent.device) {
+        failure('UNSUPPORTED_FILESYSTEM');
+      }
+
+      for (let attempt = 0; attempt < 128; attempt += 1) {
+        temporaryName = `.me-publish-${crypto.randomBytes(16).toString('hex')}`;
+        temporaryPath = path.join(destinationParent.path, temporaryName);
+        try {
+          temporaryDescriptor = atomic.openAt(
+            destinationParent.descriptor,
+            temporaryName,
+            fs.constants.O_WRONLY
+              | fs.constants.O_CREAT
+              | fs.constants.O_EXCL
+              | fs.constants.O_NOFOLLOW,
+            0o600,
+          );
+          break;
+        } catch (error) {
+          if (errno(error) === 'EEXIST') continue;
+          if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
+          throw error;
+        }
+      }
+      if (
+        temporaryDescriptor === undefined
+        || temporaryName === undefined
+        || temporaryPath === undefined
+      ) failure('OWNERSHIP_LOST');
+
       try {
-        atomic.unlinkAt(quarantine.descriptor, name, true);
+        operations.fchmodSync(temporaryDescriptor, source.mode);
+        operations.writeFileSync(
+          temporaryDescriptor,
+          Uint8Array.from(openedSource.bytes),
+        );
+        operations.fsyncSync(temporaryDescriptor);
+      } catch {
+        failure('OWNERSHIP_LOST');
+      } finally {
+        closeDescriptor(temporaryDescriptor);
+        temporaryDescriptor = undefined;
+      }
+
+      const temporary = captureFileAt(
+        destinationParent,
+        temporaryName,
+        temporaryPath,
+      );
+      if (
+        temporary.device !== source.device
+        || temporary.mode !== source.mode
+        || temporary.linkCount !== 1n
+        || temporary.sha256 !== source.sha256
+      ) failure('OWNERSHIP_LOST');
+
+      try {
+        aroundAtomic(
+          kind,
+          'publish',
+          [source.path, destination],
+          () => {
+            atomic.renameNoReplaceAt(
+              destinationParent.descriptor,
+              temporaryName!,
+              destinationParent.descriptor,
+              entryName(destination),
+            );
+            published = true;
+          },
+          () => syncOpenedDirectory(destinationParent),
+        );
+      } catch (error) {
+        if (error instanceof MutationFailure) throw error;
+        if (errno(error) === 'EEXIST') failure('TARGET_EXISTS');
+        if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
+        failure('OWNERSHIP_LOST');
+      }
+
+      let currentSource: OwnedFileFingerprint;
+      let copied: OwnedFileFingerprint;
+      try {
+        currentSource = captureFileAt(
+          sourceParent,
+          entryName(source.path),
+          source.path,
+        );
+        copied = captureFileAt(
+          destinationParent,
+          entryName(destination),
+          destination,
+        );
       } catch {
         failure('OWNERSHIP_LOST');
       }
-      syncDirectory(quarantine.path);
+      if (
+        !sameOwnedFile(currentSource, source)
+        || copied.device !== source.device
+        || copied.inode === source.inode
+        || copied.mode !== source.mode
+        || copied.linkCount !== 1n
+        || copied.sha256 !== source.sha256
+        || !directoryStillNamed(sourceParent)
+        || !directoryStillNamed(destinationParent)
+      ) failure('OWNERSHIP_LOST');
+      return copied;
+    } catch (error) {
+      if (
+        !published
+        && temporaryName !== undefined
+        && temporaryPath !== undefined
+      ) {
+        try {
+          if (temporaryDescriptor !== undefined) {
+            closeDescriptor(temporaryDescriptor);
+            temporaryDescriptor = undefined;
+          }
+          const temporary = captureFileAt(
+            destinationParent,
+            temporaryName,
+            temporaryPath,
+          );
+          retireFile(kind, destinationParent, temporary);
+        } catch {
+          failure('OWNERSHIP_LOST');
+        }
+      }
+      throw error;
     } finally {
-      closeDescriptor(quarantine.descriptor);
+      if (temporaryDescriptor !== undefined) closeDescriptor(temporaryDescriptor);
+      closeDescriptor(openedSource.descriptor);
     }
   };
 
@@ -591,52 +849,13 @@ export function createMutationExecutor(options: {
         let destinationParent: OpenedDirectory | undefined;
         try {
           destinationParent = openDirectory(path.dirname(destination));
-          const current = captureFileAt(
+          return publishCopy(
+            'link',
             sourceParent,
-            entryName(source.path),
-            source.path,
-          );
-          if (!sameOwnedFile(current, source)) failure('SOURCE_CHANGED');
-          const sourceStat = operations.statSync(
-            source.path,
-            { bigint: true },
-          ) as fs.BigIntStats;
-          const destinationStat = operations.statSync(
-            path.dirname(destination),
-            { bigint: true },
-          ) as fs.BigIntStats;
-          if (sourceStat.dev !== destinationStat.dev) failure('UNSUPPORTED_FILESYSTEM');
-          try {
-            aroundAtomic('link', 'publish', [source.path, destination], () =>
-              atomic.linkAt(
-                sourceParent.descriptor,
-                entryName(source.path),
-                destinationParent.descriptor,
-                entryName(destination),
-              ));
-          } catch (error) {
-            if (errno(error) === 'EEXIST') failure('TARGET_EXISTS');
-            if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
-            throw error;
-          }
-          const expected = { ...source, linkCount: source.linkCount + 1n };
-          const updatedSource = captureFileAt(
-            sourceParent,
-            entryName(source.path),
-            source.path,
-          );
-          const linked = captureFileAt(
+            source,
             destinationParent,
-            entryName(destination),
             destination,
           );
-          if (
-            !sameOwnedFile(updatedSource, expected)
-            || !sameOwnedFile(linked, { ...expected, path: destination })
-            || !directoryStillNamed(sourceParent)
-            || !directoryStillNamed(destinationParent)
-          ) failure('OWNERSHIP_LOST');
-          return linked;
         } finally {
           closeDescriptor(sourceParent.descriptor);
           if (destinationParent) closeDescriptor(destinationParent.descriptor);
@@ -650,61 +869,23 @@ export function createMutationExecutor(options: {
         let destinationParent: OpenedDirectory | undefined;
         try {
           destinationParent = openDirectory(path.dirname(destination));
-          const current = captureFileAt(
+          const copied = publishCopy(
+            'rename',
             sourceParent,
-            entryName(source.path),
-            source.path,
+            source,
+            destinationParent,
+            destination,
           );
-          if (!sameOwnedFile(current, source)) failure('SOURCE_CHANGED');
-          const sourceStat = operations.statSync(
-            source.path,
-            { bigint: true },
-          ) as fs.BigIntStats;
-          const destinationStat = operations.statSync(
-            path.dirname(destination),
-            { bigint: true },
-          ) as fs.BigIntStats;
-          if (sourceStat.dev !== destinationStat.dev) failure('UNSUPPORTED_FILESYSTEM');
-          try {
-            aroundAtomic('rename', 'publish', [source.path, destination], () =>
-              atomic.linkAt(
-                sourceParent.descriptor,
-                entryName(source.path),
-                destinationParent.descriptor,
-                entryName(destination),
-              ));
-          } catch (error) {
-            if (errno(error) === 'EEXIST') failure('TARGET_EXISTS');
-            if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
-            throw error;
-          }
-          const linkedSource = { ...source, linkCount: source.linkCount + 1n };
+          retireFile('rename', sourceParent, source, destinationParent);
           const published = captureFileAt(
             destinationParent,
             entryName(destination),
             destination,
           );
-          const sourceAfterLink = captureFileAt(
-            sourceParent,
-            entryName(source.path),
-            source.path,
-          );
-          if (
-            !sameOwnedFile(published, { ...linkedSource, path: destination })
-            || !sameOwnedFile(sourceAfterLink, linkedSource)
-            || !directoryStillNamed(sourceParent)
-            || !directoryStillNamed(destinationParent)
-          ) failure('OWNERSHIP_LOST');
-          quarantineFile('rename', sourceParent, linkedSource, destinationParent);
-          const moved = captureFileAt(
-            destinationParent,
-            entryName(destination),
-            destination,
-          );
-          if (!sameOwnedFile(moved, { ...source, path: destination })) {
+          if (!sameOwnedFile(published, copied)) {
             failure('OWNERSHIP_LOST');
           }
-          return moved;
+          return published;
         } finally {
           closeDescriptor(sourceParent.descriptor);
           if (destinationParent) closeDescriptor(destinationParent.descriptor);
@@ -718,7 +899,7 @@ export function createMutationExecutor(options: {
         try {
           const current = captureFileAt(parent, entryName(source.path), source.path);
           if (!sameOwnedFile(current, source)) failure('OWNERSHIP_LOST');
-          quarantineFile('unlink', parent, source);
+          retireFile('unlink', parent, source);
         } finally {
           closeDescriptor(parent.descriptor);
         }
@@ -731,7 +912,7 @@ export function createMutationExecutor(options: {
         try {
           const current = captureDirectoryAt(parent, entryName(source.path), source.path);
           if (!sameOwnedDirectory(current, source)) failure('OWNERSHIP_LOST');
-          quarantineDirectory(parent, source);
+          retireDirectory(parent, source);
         } finally {
           closeDescriptor(parent.descriptor);
         }

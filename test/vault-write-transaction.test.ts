@@ -177,7 +177,7 @@ describe('preview and successful journaled create', () => {
     expect(fs.existsSync(layout.runtimeRoot)).toBeFalse();
   });
 
-  test('publishes a note and a new README through staged hard links then detaches staging', () => {
+  test('publishes a note and a new README through independent staged copies then retires staging', () => {
     const vault = makeVault();
     const mutations: string[] = [];
     const result = write(vault, {
@@ -203,6 +203,60 @@ describe('preview and successful journaled create', () => {
     expect(fs.statSync(path.join(operation, 'journal.json')).mode & 0o777).toBe(0o600);
     expect(fs.existsSync(path.join(vault, '.me/tmp'))).toBeFalse();
     expect(fs.existsSync(path.join(vault, '.me/locks'))).toBeFalse();
+  });
+
+  test('uses one persistent private retirement root without blocking operation cleanup', () => {
+    const vault = makeVault();
+    const layout = resolveVaultLayout(vault);
+    const first = executeVaultWrite(vault, requestAt(
+      'decisions/2026-07-26-first-retirement.md',
+      'First Retirement',
+    ), { pluginRoot, mode: 'write' });
+    expect(first.status).toBe('committed');
+    const firstRoot = fs.statSync(layout.retirementDir, { bigint: true });
+    const firstNames = fs.readdirSync(layout.retirementDir);
+    const expectHarmlessTombstones = (names: string[]): void => {
+      for (const name of names) {
+        const tombstone = path.join(layout.retirementDir, name);
+        const stat = fs.statSync(tombstone);
+        if (stat.isFile()) expect(stat.size).toBe(0);
+        else {
+          expect(stat.isDirectory()).toBeTrue();
+          expect(fs.readdirSync(tombstone)).toEqual([]);
+        }
+      }
+    };
+    expect(path.relative(layout.transactionDir, layout.retirementDir).startsWith('..'))
+      .toBeTrue();
+    expect(Number(firstRoot.mode & 0o777n)).toBe(0o700);
+    expect(firstNames.length).toBeGreaterThan(0);
+    expectHarmlessTombstones(firstNames);
+    expect(fs.readdirSync(path.join(
+      layout.transactionDir,
+      `vault-write-${first.operationId}`,
+    ))).toEqual(['journal.json']);
+
+    const second = executeVaultWrite(vault, requestAt(
+      'decisions/2026-07-27-second-retirement.md',
+      'Second Retirement',
+    ), { pluginRoot, mode: 'write' });
+    expect(second.status).toBe('committed');
+    const secondRoot = fs.statSync(layout.retirementDir, { bigint: true });
+    const secondNames = fs.readdirSync(layout.retirementDir);
+    expect(secondRoot.dev).toBe(firstRoot.dev);
+    expect(secondRoot.ino).toBe(firstRoot.ino);
+    expect(secondNames.length).toBeGreaterThan(firstNames.length);
+    for (const name of firstNames) expect(secondNames).toContain(name);
+    expectHarmlessTombstones(secondNames);
+    expect(fs.readdirSync(path.join(
+      layout.transactionDir,
+      `vault-write-${second.operationId}`,
+    )).sort()).toEqual(['journal.json', 'originals']);
+    expect(fs.existsSync(path.join(
+      layout.transactionDir,
+      `vault-write-${second.operationId}`,
+      'staging',
+    ))).toBeFalse();
   });
 
   test('lowers note and README publication into shared portable mutation fingerprints', () => {
@@ -260,7 +314,7 @@ describe('preview and successful journaled create', () => {
     ]);
   });
 
-  test('preserves an existing README inode and permission bits when replacing it', () => {
+  test('preserves existing README bytes and permission bits when replacing it', () => {
     const vault = makeVault('# Existing\n');
     const before = fs.statSync(path.join(vault, 'practices/README.md'));
     const result = write(vault);
@@ -274,7 +328,7 @@ describe('preview and successful journaled create', () => {
       'originals/README.md',
     );
     expect(fs.readFileSync(original, 'utf8')).toBe('# Existing\n');
-    expect(fs.statSync(original).ino).toBe(before.ino);
+    expect(fs.statSync(original).ino).not.toBe(before.ino);
     expect(fs.statSync(path.join(vault, 'practices/README.md')).mode & 0o777).toBe(0o640);
     expect(result.warnings.join(' ')).toContain('uid/gid');
     expect(result.recoveries[0].actions.map(action => action.kind)).toEqual([
@@ -699,7 +753,11 @@ describe('lock precedence and operation discovery', () => {
         beforeFsMutation(kind, paths) {
           if (
             kind === 'mkdir'
-            && (paths[0] === layout.lockDir || paths[0] === layout.transactionDir)
+            && (
+              paths[0] === layout.lockDir
+              || paths[0] === layout.transactionDir
+              || paths[0] === layout.retirementDir
+            )
           ) {
             events.push(`hook:${paths[0]}`);
           }
@@ -714,10 +772,12 @@ describe('lock precedence and operation discovery', () => {
     });
 
     expect(result.status).toBe('committed');
-    expect(events.slice(0, 5)).toEqual([
+    expect(events.slice(0, 7)).toEqual([
       `hook:${layout.lockDir}`,
       `fsync:${layout.runtimeRoot}`,
       `hook:${layout.transactionDir}`,
+      `fsync:${layout.runtimeRoot}`,
+      `hook:${layout.retirementDir}`,
       `fsync:${layout.runtimeRoot}`,
       'afterLock',
     ]);
@@ -945,7 +1005,7 @@ describe('fingerprint, no-clobber, and rollback windows', () => {
     ))).toBeFalse();
   });
 
-  test.each(['EXDEV', 'EPERM'])('fails closed when hard links return %s', code => {
+  test.each(['EXDEV', 'EPERM'])('fails closed when copy publication returns %s', code => {
     const vault = makeVault();
     const result = executeVaultWrite(vault, request(), {
       pluginRoot,
@@ -1087,13 +1147,8 @@ describe('fingerprint, no-clobber, and rollback windows', () => {
           );
         },
       });
-      if (internal === 'transactions') {
-        expect(result.status).toBe('manual_recovery');
-        expect(result.error?.code).toBe('RECOVERY_REQUIRED');
-      } else {
-        expect(result.status).toBe('conflict');
-        expect(result.error?.code).toBe('INPUT_CHANGED');
-      }
+      expect(result.status).toBe('conflict');
+      expect(result.error?.code).toBe('INPUT_CHANGED');
     },
   );
 

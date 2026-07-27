@@ -346,6 +346,7 @@ function makeFingerprint(
     ...Object.values(layout.layers),
     layout.meDir,
     layout.transactionDir,
+    layout.retirementDir,
     layout.lockDir,
     path.join(layout.lockDir, 'vault.lock'),
     path.dirname(target.notePath),
@@ -898,7 +899,7 @@ class Transaction {
       },
       fileOps: this.operations,
       atomicHooks: options.atomicHooks,
-      quarantineDirectory: this.plan.layout.transactionDir,
+      retirementDirectory: this.plan.layout.retirementDir,
       directoryFsync: options.directoryFsync,
     });
   }
@@ -975,9 +976,8 @@ class Transaction {
     try {
       const current = this.executor.captureFile(destination);
       return current.device === expected.device
-        && current.inode === expected.inode
         && current.mode === expected.mode
-        && current.linkCount === expected.linkCount
+        && current.linkCount === 1n
         && current.sha256 === expected.sha256;
     } catch {
       return false;
@@ -1214,13 +1214,16 @@ function makeFileOperations(options: VaultWriterOptions): FileOperations {
   return {
     openSync: fs.openSync,
     closeSync: fs.closeSync,
+    fchmodSync: fs.fchmodSync,
     fstatSync: fs.fstatSync,
+    ftruncateSync: fs.ftruncateSync,
     fsyncSync: fs.fsyncSync,
     readdirSync: options.fileOps?.readdirSync ?? fs.readdirSync,
     lstatSync: options.fileOps?.lstatSync ?? fs.lstatSync,
     statSync: fs.statSync,
     realpathSync: options.fileOps?.realpathSync ?? fs.realpathSync,
     readFileSync: options.fileOps?.readFileSync ?? fs.readFileSync,
+    writeFileSync: fs.writeFileSync,
     linkSync: options.fileOps?.linkSync ?? fs.linkSync,
     renameSync: options.fileOps?.renameSync ?? fs.renameSync,
     unlinkSync: options.fileOps?.unlinkSync ?? fs.unlinkSync,
@@ -1427,6 +1430,7 @@ export function executeVaultWrite(
     bootstrapRuntimeRoot(layout);
     bootstrapDirectory(layout, layout.lockDir, options, operations);
     bootstrapDirectory(layout, layout.transactionDir, options, operations);
+    bootstrapDirectory(layout, layout.retirementDir, options, operations);
     assertSafeMutationPath(layout, lockPath, 'lock');
     if (lockExists(lockPath, operations)) {
       return codeResult(operationId, digest, 'LOCK_HELD');
@@ -1745,7 +1749,7 @@ export function executeVaultWrite(
       snapshotFingerprintPaths(initialPlan),
       new Set([initialPlan.target.vaultRelativePath]),
     );
-    if (!tx.sameFile(notePublished, 2n)) {
+    if (!tx.sameFile(notePublished)) {
       throw new VaultWriterError('RECOVERY_REQUIRED');
     }
     verifyStaticInputs(initialPlan, options.pluginRoot);
@@ -1815,12 +1819,12 @@ export function executeVaultWrite(
     );
     verifyStaticInputs(initialPlan, options.pluginRoot);
     verifyExternalGraph(initialPlan);
-    if (!tx.sameFile(notePublished, 2n)) {
+    if (!tx.sameFile(notePublished)) {
       throw new VaultWriterError('RECOVERY_REQUIRED');
     }
     if (
       initialPlan.index.action !== 'none'
-      && !tx.sameFile(indexPublished!, 2n)
+      && !tx.sameFile(indexPublished!)
     ) {
       throw new VaultWriterError('RECOVERY_REQUIRED');
     }
@@ -1838,8 +1842,8 @@ export function executeVaultWrite(
       if (
         !tx.sameLineage(staged)
         || !tx.sameFile(published)
-        || !tx.sameInode(staged.path, published.path)
-        || links !== 2n
+        || tx.sameInode(staged.path, published.path)
+        || links !== 1n
       ) {
         markPreserved(staged.path, `Inspect changed staging link ${displayRelative(layout, staged.path)}.`);
         return;
@@ -1851,7 +1855,7 @@ export function executeVaultWrite(
         if (
           publishedBefore.dev !== publishedAfter.dev
           || publishedBefore.ino !== publishedAfter.ino
-          || publishedBefore.nlink !== 2n
+          || publishedBefore.nlink !== 1n
           || publishedAfter.nlink !== 1n
           || sha256(fs.readFileSync(published.path)) !== published.sha256
         ) {

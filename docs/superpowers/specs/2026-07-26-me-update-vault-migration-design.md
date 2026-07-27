@@ -222,6 +222,26 @@ fingerprint. A rename fingerprints both its source and destination state.
 Runtime-only inode and device ownership proofs remain internal and are never
 placed in public results or portable configuration.
 
+Publication and cleanup use identity-safe physical semantics beneath that
+contract. `link` and `rename` publish an independent-inode copy by creating an
+exclusive random temporary file relative to the opened destination directory,
+writing and fsyncing exact source bytes through its descriptor, applying the
+planned mode, and no-replace renaming it to the final name. `rename` then
+logically retires its source. This prevents later source sanitization from
+mutating the independently published destination.
+
+`unlink` and `rmdir` mean logical retirement, not eager physical deletion.
+The executor no-replace moves the owned entry out of its business namespace
+into a stable per-vault `<ME_RUNTIME>/retired/` directory. That root is
+descriptor-bound, mode `0700`, outside operation directories, and is never
+itself retired. A regular-file tombstone is truncated to zero and fsynced
+through the already-owned descriptor; only an empty directory may become a
+directory tombstone. No final name-only `unlinkat` or `rmdir` is allowed.
+Tombstones are durable, never automatically garbage-collected by the shared
+executor, and may only be removed by a future explicitly reviewed maintenance
+migration. Any publication, move, ownership, sanitization, or durability
+ambiguity keeps the domain journal pending and maps to lost ownership.
+
 ## 7. Configuration preservation
 
 `.me/config.yaml` is portable user configuration. Migration uses a

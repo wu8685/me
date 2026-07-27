@@ -35,19 +35,19 @@ function fixture(options: {
     Parameters<typeof createMutationExecutor>[0]['atomicHooks']
   >;
   directoryFsync?(directory: string): void;
-  quarantine?: boolean;
+  retirement?: boolean;
 } = {}): {
   root: string;
   executor: MutationExecutor;
   policy: MutationPathPolicy;
-  quarantineDirectory?: string;
+  retirementDirectory?: string;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-mutation-executor-'));
   temporaryDirectories.push(root);
-  const quarantineDirectory = options.quarantine !== false
-    ? path.join(root, 'quarantine')
+  const retirementDirectory = options.retirement !== false
+    ? path.join(root, 'retired')
     : undefined;
-  if (quarantineDirectory) fs.mkdirSync(quarantineDirectory, { mode: 0o700 });
+  if (retirementDirectory) fs.mkdirSync(retirementDirectory, { mode: 0o700 });
   const policy: MutationPathPolicy = {
     assertSafe(candidate) {
       const absolute = path.resolve(candidate);
@@ -71,11 +71,14 @@ function fixture(options: {
   const defaults: MutationFileOperations = {
     openSync: fs.openSync,
     closeSync: fs.closeSync,
+    fchmodSync: fs.fchmodSync,
     fstatSync: fs.fstatSync,
+    ftruncateSync: fs.ftruncateSync,
     fsyncSync: fs.fsyncSync,
     lstatSync: fs.lstatSync,
     statSync: fs.statSync,
     readFileSync: fs.readFileSync,
+    writeFileSync: fs.writeFileSync,
     readdirSync: fs.readdirSync,
     linkSync: fs.linkSync,
     renameSync: fs.renameSync,
@@ -100,9 +103,9 @@ function fixture(options: {
       atomicHooks: options.atomicHooks,
       atomicOps: options.atomicOps,
       directoryFsync: options.directoryFsync,
-      quarantineDirectory,
+      retirementDirectory,
     } as Parameters<typeof createMutationExecutor>[0]),
-    quarantineDirectory,
+    retirementDirectory,
   };
 }
 
@@ -204,6 +207,37 @@ describe('shared filesystem mutation executor', () => {
     expect(fs.readFileSync(source, 'utf8')).toBe('source');
   });
 
+  test.each(['link', 'rename'] as const)(
+    '%s publishes exact bytes and mode to an independent inode',
+    primitive => {
+      const { root, executor, retirementDirectory } = fixture({
+        directoryFsync() {},
+      });
+      const source = path.join(root, 'source.md');
+      const destination = path.join(root, 'destination.md');
+      fs.writeFileSync(source, 'private source bytes', { mode: 0o640 });
+      const sourceOwned = executor.captureFile(source);
+
+      const published = executor[primitive](sourceOwned, destination);
+
+      expect(fs.readFileSync(destination, 'utf8')).toBe('private source bytes');
+      expect(fs.statSync(destination).mode & 0o777).toBe(0o640);
+      expect(published.inode).not.toBe(sourceOwned.inode);
+      if (primitive === 'link') {
+        expect(fs.readFileSync(source, 'utf8')).toBe('private source bytes');
+        expect(fs.statSync(source, { bigint: true }).nlink).toBe(1n);
+      } else {
+        expect(fs.existsSync(source)).toBeFalse();
+        const tombstones = fs.readdirSync(retirementDirectory!);
+        expect(tombstones.length).toBeGreaterThan(0);
+        expect(tombstones.some(name =>
+          fs.statSync(path.join(retirementDirectory!, name)).isFile()
+          && fs.statSync(path.join(retirementDirectory!, name)).size === 0
+        )).toBeTrue();
+      }
+    },
+  );
+
   test('rename remains no-clobber when the destination appears inside the primitive', () => {
     let logicalDestination = '';
     const injectDestination = (): void => {
@@ -282,7 +316,7 @@ describe('shared filesystem mutation executor', () => {
     expect(fs.statSync(directory).isDirectory()).toBeTrue();
   });
 
-  test('quarantines and preserves a foreign file replacement instead of unlinking it', () => {
+  test('retires and preserves a foreign file replacement instead of unlinking it', () => {
     let source = '';
     let replaced = false;
     const replaceSource = (): void => {
@@ -291,14 +325,14 @@ describe('shared filesystem mutation executor', () => {
       fs.unlinkSync(source);
       fs.writeFileSync(source, 'foreign');
     };
-    const { root, executor, quarantineDirectory } = fixture({
+    const { root, executor, retirementDirectory } = fixture({
       atomicHooks: {
         beforeAtomicMutation(kind, phase) {
-          if (kind === 'unlink' && phase === 'quarantine') replaceSource();
+          if (kind === 'unlink' && phase === 'retirement') replaceSource();
         },
       },
       directoryFsync() {},
-      quarantine: true,
+      retirement: true,
     });
     source = path.join(root, 'owned.md');
     fs.writeFileSync(source, 'owned');
@@ -306,19 +340,19 @@ describe('shared filesystem mutation executor', () => {
 
     expect(() => executor.unlink(owned))
       .toThrow(new MutationFailure('OWNERSHIP_LOST'));
-    const preserved = fs.readdirSync(quarantineDirectory!);
+    const preserved = fs.readdirSync(retirementDirectory!);
     expect(preserved).toHaveLength(1);
-    expect(fs.readFileSync(path.join(quarantineDirectory!, preserved[0]), 'utf8'))
+    expect(fs.readFileSync(path.join(retirementDirectory!, preserved[0]), 'utf8'))
       .toBe('foreign');
   });
 
-  test('quarantines and preserves a foreign directory replacement instead of removing it', () => {
+  test('retires and preserves a foreign directory replacement instead of removing it', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-mutation-rmdir-race-'));
     temporaryDirectories.push(root);
     const source = path.join(root, 'owned');
-    const quarantine = path.join(root, 'quarantine');
+    const retirement = path.join(root, 'retired');
     fs.mkdirSync(source);
-    fs.mkdirSync(quarantine, { mode: 0o700 });
+    fs.mkdirSync(retirement, { mode: 0o700 });
     let replaced = false;
     const replaceSource = (): void => {
       if (replaced) return;
@@ -340,32 +374,36 @@ describe('shared filesystem mutation executor', () => {
       journal: { beforeMutation() {}, afterMutation() {} },
       atomicHooks: {
         beforeAtomicMutation(kind, phase) {
-          if (kind === 'rmdir' && phase === 'quarantine') replaceSource();
+          if (kind === 'rmdir' && phase === 'retirement') replaceSource();
         },
       },
       fileOps: {
         openSync: fs.openSync,
         closeSync: fs.closeSync,
+        fchmodSync: fs.fchmodSync,
         fstatSync: fs.fstatSync,
+        ftruncateSync: fs.ftruncateSync,
         fsyncSync: fs.fsyncSync,
         lstatSync: fs.lstatSync,
         statSync: fs.statSync,
         readFileSync: fs.readFileSync,
+        writeFileSync: fs.writeFileSync,
         readdirSync: fs.readdirSync,
         linkSync: fs.linkSync,
         renameSync: fs.renameSync,
         unlinkSync: fs.unlinkSync,
+        mkdirSync: fs.mkdirSync,
         rmdirSync: fs.rmdirSync,
       },
       directoryFsync() {},
-      quarantineDirectory: quarantine,
+      retirementDirectory: retirement,
     } as Parameters<typeof createMutationExecutor>[0]);
     const owned = guarded.captureDirectory(source);
 
     expect(() => guarded.rmdir(owned))
       .toThrow(new MutationFailure('OWNERSHIP_LOST'));
-    const [preserved] = fs.readdirSync(quarantine);
-    expect(fs.readFileSync(path.join(quarantine, preserved, 'foreign.txt'), 'utf8'))
+    const [preserved] = fs.readdirSync(retirement);
+    expect(fs.readFileSync(path.join(retirement, preserved, 'foreign.txt'), 'utf8'))
       .toBe('foreign');
   });
 
@@ -433,11 +471,11 @@ describe('shared filesystem mutation executor', () => {
     },
   );
 
-  test('fails closed when quarantine rename is unsupported', () => {
-    const { root, executor, quarantineDirectory } = fixture({
+  test('fails closed when retirement rename is unsupported', () => {
+    const { root, executor, retirementDirectory } = fixture({
       atomicHooks: {
         beforeAtomicMutation(kind, phase) {
-          if (kind === 'unlink' && phase === 'quarantine') throw errno('ENOTSUP');
+          if (kind === 'unlink' && phase === 'retirement') throw errno('ENOTSUP');
         },
       },
       directoryFsync() {},
@@ -448,11 +486,11 @@ describe('shared filesystem mutation executor', () => {
     expect(() => executor.unlink(executor.captureFile(source)))
       .toThrow(new MutationFailure('UNSUPPORTED_FILESYSTEM'));
     expect(fs.readFileSync(source, 'utf8')).toBe('owned');
-    expect(fs.readdirSync(quarantineDirectory!)).toEqual([]);
+    expect(fs.readdirSync(retirementDirectory!)).toEqual([]);
   });
 
   test.each(['file', 'directory'] as const)(
-    'native quarantine no-replace preserves a colliding foreign %s',
+    'native retirement no-replace preserves a colliding foreign %s',
     entryType => {
       const native = createNativeMutationAtomicOperations();
       let collisionName = '';
@@ -487,7 +525,7 @@ describe('shared filesystem mutation executor', () => {
           );
         },
       };
-      const { root, executor, quarantineDirectory } = fixture({
+      const { root, executor, retirementDirectory } = fixture({
         atomicOps,
         directoryFsync() {},
       });
@@ -500,9 +538,9 @@ describe('shared filesystem mutation executor', () => {
 
       expect(renameNames).toHaveLength(2);
       expect(renameNames[0]).not.toBe(renameNames[1]);
-      expect(renameNames.every(name => /^\.me-quarantine-[a-f0-9]{32}$/.test(name)))
+      expect(renameNames.every(name => /^\.me-retired-[a-f0-9]{32}$/.test(name)))
         .toBeTrue();
-      const collision = path.join(quarantineDirectory!, collisionName);
+      const collision = path.join(retirementDirectory!, collisionName);
       if (entryType === 'file') expect(fs.readFileSync(collision, 'utf8')).toBe('foreign');
       else expect(fs.statSync(collision).isDirectory()).toBeTrue();
     },
@@ -555,14 +593,14 @@ describe('shared filesystem mutation executor', () => {
   test.each([
     ['link', 'publish'],
     ['rename', 'publish'],
-    ['unlink', 'quarantine'],
+    ['unlink', 'retirement'],
     ['mkdir', 'create'],
-    ['rmdir', 'quarantine'],
+    ['rmdir', 'retirement'],
   ] as const)(
     'maps %s success followed by a post-success hook failure to ownership recovery',
     (primitive, failurePhase) => {
       const boundaries: string[] = [];
-      const { root, executor, quarantineDirectory } = fixture({
+      const { root, executor, retirementDirectory } = fixture({
         journal: {
           beforeMutation: kind => boundaries.push(`before:${kind}`),
           afterMutation: kind => boundaries.push(`after:${kind}`),
@@ -594,7 +632,7 @@ describe('shared filesystem mutation executor', () => {
       if (primitive === 'rename') expect(fs.existsSync(source)).toBeTrue();
       if (primitive === 'unlink' || primitive === 'rmdir') {
         expect(fs.existsSync(source)).toBeFalse();
-        expect(fs.readdirSync(quarantineDirectory!)).toHaveLength(1);
+        expect(fs.readdirSync(retirementDirectory!)).toHaveLength(1);
       }
     },
   );
@@ -648,12 +686,12 @@ describe('shared filesystem mutation executor', () => {
     expect(closed).toBe(1);
   });
 
-  test('fsyncs source and quarantine immediately after quarantine rename', () => {
+  test('fsyncs source and retirement roots immediately after retirement rename', () => {
     const native = createNativeMutationAtomicOperations();
     const events: string[] = [];
     let source = '';
     let replaced = false;
-    const { root, executor, quarantineDirectory } = fixture({
+    const { root, executor, retirementDirectory } = fixture({
       atomicOps: {
         ...native,
         renameNoReplaceAt(sourceParent, sourceName, destinationParent, destinationName) {
@@ -668,7 +706,7 @@ describe('shared filesystem mutation executor', () => {
       },
       atomicHooks: {
         beforeAtomicMutation(kind, phase) {
-          if (kind === 'unlink' && phase === 'quarantine' && !replaced) {
+          if (kind === 'unlink' && phase === 'retirement' && !replaced) {
             replaced = true;
             fs.unlinkSync(source);
             fs.writeFileSync(source, 'foreign');
@@ -687,15 +725,15 @@ describe('shared filesystem mutation executor', () => {
     expect(events.slice(0, 3)).toEqual([
       'rename',
       `fsync:${root}`,
-      `fsync:${quarantineDirectory}`,
+      `fsync:${retirementDirectory}`,
     ]);
   });
 
-  test('requires a 0700 owned quarantine directory', () => {
-    const { root, executor, quarantineDirectory } = fixture({
+  test('requires a 0700 owned retirement directory', () => {
+    const { root, executor, retirementDirectory } = fixture({
       directoryFsync() {},
     });
-    fs.chmodSync(quarantineDirectory!, 0o755);
+    fs.chmodSync(retirementDirectory!, 0o755);
     const source = path.join(root, 'owned.md');
     fs.writeFileSync(source, 'owned');
 
@@ -704,26 +742,27 @@ describe('shared filesystem mutation executor', () => {
     expect(fs.readFileSync(source, 'utf8')).toBe('owned');
   });
 
-  test('never directly removes the quarantine root', () => {
-    const { executor, quarantineDirectory } = fixture({
+  test('never directly removes the retirement root', () => {
+    const { executor, retirementDirectory } = fixture({
       directoryFsync() {},
     });
-    const owned = executor.captureDirectory(quarantineDirectory!);
+    const owned = executor.captureDirectory(retirementDirectory!);
 
     expect(() => executor.rmdir(owned))
       .toThrow(new MutationFailure('OWNERSHIP_LOST'));
-    expect(fs.statSync(quarantineDirectory!).isDirectory()).toBeTrue();
+    expect(fs.statSync(retirementDirectory!).isDirectory()).toBeTrue();
   });
 
   test.each(['file', 'directory'] as const)(
-    'preserves quarantined %s when its final atomic delete is uncertain',
+    'never calls final native unlinkat for a retired %s',
     entryType => {
       const native = createNativeMutationAtomicOperations();
-      const { root, executor, quarantineDirectory } = fixture({
+      let unlinkCalls = 0;
+      const { root, executor, retirementDirectory } = fixture({
         atomicOps: {
           ...native,
           unlinkAt(parentDescriptor, name, directory) {
-            if (name.startsWith('.me-quarantine-')) throw errno('EIO');
+            unlinkCalls += 1;
             native.unlinkAt(parentDescriptor, name, directory);
           },
         },
@@ -737,24 +776,205 @@ describe('shared filesystem mutation executor', () => {
         if (entryType === 'file') executor.unlink(executor.captureFile(source));
         else executor.rmdir(executor.captureDirectory(source));
       };
-      expect(action).toThrow(new MutationFailure('OWNERSHIP_LOST'));
+      expect(action).not.toThrow();
       expect(fs.existsSync(source)).toBeFalse();
-      expect(fs.readdirSync(quarantineDirectory!)).toHaveLength(1);
+      expect(unlinkCalls).toBe(0);
+      expect(fs.readdirSync(retirementDirectory!)).toHaveLength(1);
     },
   );
+
+  test.each(['file', 'directory'] as const)(
+    'native retired-name replacement preserves both foreign and owned %s entries',
+    entryType => {
+      const native = createNativeMutationAtomicOperations();
+      let retirementDirectory = '';
+      let displaced = '';
+      let injected = false;
+      const built = fixture({
+        atomicOps: {
+          ...native,
+          openAt(parentDescriptor, name, flags, mode) {
+            const descriptor = native.openAt(parentDescriptor, name, flags, mode);
+            if (!injected && name.startsWith('.me-retired-')) {
+              injected = true;
+              const retired = path.join(retirementDirectory, name);
+              displaced = path.join(retirementDirectory, `.owned-displaced-${name}`);
+              fs.renameSync(retired, displaced);
+              if (entryType === 'file') fs.writeFileSync(retired, 'foreign');
+              else fs.mkdirSync(retired, { mode: 0o700 });
+            }
+            return descriptor;
+          },
+        },
+        directoryFsync() {},
+      });
+      retirementDirectory = built.retirementDirectory!;
+      const source = path.join(
+        built.root,
+        entryType === 'file' ? 'owned.md' : 'owned-dir',
+      );
+      if (entryType === 'file') fs.writeFileSync(source, 'owned');
+      else fs.mkdirSync(source);
+
+      const action = (): void => {
+        if (entryType === 'file') built.executor.unlink(built.executor.captureFile(source));
+        else built.executor.rmdir(built.executor.captureDirectory(source));
+      };
+      expect(action).toThrow(new MutationFailure('OWNERSHIP_LOST'));
+      expect(fs.existsSync(displaced)).toBeTrue();
+      const foreign = fs.readdirSync(retirementDirectory)
+        .find(name => name.startsWith('.me-retired-'))!;
+      expect(foreign).toBeDefined();
+      if (entryType === 'file') {
+        expect(fs.readFileSync(path.join(retirementDirectory, foreign), 'utf8'))
+          .toBe('foreign');
+        expect(fs.readFileSync(displaced, 'utf8')).toBe('owned');
+      } else {
+        expect(fs.statSync(path.join(retirementDirectory, foreign)).isDirectory())
+          .toBeTrue();
+        expect(fs.statSync(displaced).isDirectory()).toBeTrue();
+      }
+    },
+  );
+
+  test('sanitizes a retired file through its owned descriptor and fsyncs it', () => {
+    const truncated: Array<{ descriptor: number; length: number; inode: bigint }> = [];
+    const fileFsyncs: bigint[] = [];
+    const { root, executor, retirementDirectory } = fixture({
+      fileOps: {
+        ftruncateSync(descriptor: number, length?: number) {
+          truncated.push({
+            descriptor,
+            length: length ?? 0,
+            inode: fs.fstatSync(descriptor, { bigint: true }).ino,
+          });
+          fs.ftruncateSync(descriptor, length);
+        },
+        fsyncSync(descriptor) {
+          fileFsyncs.push(fs.fstatSync(descriptor, { bigint: true }).ino);
+          fs.fsyncSync(descriptor);
+        },
+      } as Partial<MutationFileOperations>,
+      directoryFsync() {},
+    });
+    const source = path.join(root, 'owned.md');
+    fs.writeFileSync(source, 'sensitive bytes', { mode: 0o640 });
+    const owned = executor.captureFile(source);
+
+    executor.unlink(owned);
+
+    const [tombstoneName] = fs.readdirSync(retirementDirectory!);
+    const tombstone = path.join(retirementDirectory!, tombstoneName);
+    const stat = fs.statSync(tombstone, { bigint: true });
+    expect(stat.size).toBe(0n);
+    expect(Number(stat.mode & 0o777n)).toBe(0o640);
+    expect(truncated).toHaveLength(1);
+    expect(truncated[0].length).toBe(0);
+    expect(truncated[0].inode).toBe(owned.inode);
+    expect(fileFsyncs).toContain(owned.inode);
+  });
+
+  test('retains recovery bytes when owned-descriptor sanitization is ambiguous', () => {
+    const { root, executor, retirementDirectory } = fixture({
+      fileOps: {
+        ftruncateSync() {
+          throw errno('EIO');
+        },
+      } as Partial<MutationFileOperations>,
+      directoryFsync() {},
+    });
+    const source = path.join(root, 'owned.md');
+    fs.writeFileSync(source, 'recovery bytes');
+
+    expect(() => executor.unlink(executor.captureFile(source)))
+      .toThrow(new MutationFailure('OWNERSHIP_LOST'));
+    expect(fs.existsSync(source)).toBeFalse();
+    const [retired] = fs.readdirSync(retirementDirectory!);
+    expect(fs.readFileSync(path.join(retirementDirectory!, retired), 'utf8'))
+      .toBe('recovery bytes');
+  });
+
+  test.each(['link', 'rename', 'unlink', 'rmdir'] as const)(
+    'maps an ambiguous native %s result to ownership recovery',
+    primitive => {
+      const { root, executor } = fixture({
+        atomicHooks: {
+          beforeAtomicMutation(kind, phase) {
+            if (
+              kind === primitive
+              && (phase === 'publish' || phase === 'retirement')
+            ) throw errno('EIO');
+          },
+        },
+        directoryFsync() {},
+      });
+      const source = path.join(root, 'owned');
+      const destination = path.join(root, 'destination');
+      if (primitive === 'rmdir') fs.mkdirSync(source);
+      else fs.writeFileSync(source, 'owned');
+
+      const action = (): void => {
+        if (primitive === 'unlink') executor.unlink(executor.captureFile(source));
+        else if (primitive === 'rmdir') executor.rmdir(executor.captureDirectory(source));
+        else executor[primitive](executor.captureFile(source), destination);
+      };
+      expect(action).toThrow(new MutationFailure('OWNERSHIP_LOST'));
+    },
+  );
+
+  test('retains an empty directory tombstone and rejects a non-empty source', () => {
+    const { root, executor, retirementDirectory } = fixture({
+      directoryFsync() {},
+    });
+    const empty = path.join(root, 'empty');
+    const nonEmpty = path.join(root, 'non-empty');
+    fs.mkdirSync(empty, { mode: 0o750 });
+    fs.mkdirSync(nonEmpty);
+    fs.writeFileSync(path.join(nonEmpty, 'keep'), 'owned');
+
+    executor.rmdir(executor.captureDirectory(empty));
+    expect(() => executor.rmdir(executor.captureDirectory(nonEmpty)))
+      .toThrow(new MutationFailure('OWNERSHIP_LOST'));
+
+    const tombstones = fs.readdirSync(retirementDirectory!);
+    expect(tombstones).toHaveLength(1);
+    const tombstone = path.join(retirementDirectory!, tombstones[0]);
+    expect(fs.readdirSync(tombstone)).toEqual([]);
+    expect(fs.statSync(tombstone).mode & 0o777).toBe(0o750);
+    expect(fs.readFileSync(path.join(nonEmpty, 'keep'), 'utf8')).toBe('owned');
+  });
 
   test.each(['link', 'rename'] as const)(
     'checks source and destination devices before %s',
     primitive => {
+      let destinationParent = '';
+      let destinationDescriptor: number | undefined;
+      const onOtherDevice = (stat: fs.BigIntStats): fs.BigIntStats =>
+        new Proxy(stat, {
+          get(target, property) {
+            if (property === 'dev') return target.dev + 1n;
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
       const { root, executor } = fixture({
         fileOps: {
-          statSync(candidate, options?: fs.StatSyncOptions) {
-            const stat = fs.statSync(candidate, options as never);
-            if (
-              typeof candidate === 'string'
-              && fs.statSync(candidate).isDirectory()
-            ) {
-              return { ...stat, dev: (stat as fs.BigIntStats).dev + 1n } as fs.BigIntStats;
+          openSync(candidate, flags, mode) {
+            const descriptor = fs.openSync(candidate, flags, mode);
+            if (candidate === destinationParent) destinationDescriptor = descriptor;
+            return descriptor;
+          },
+          lstatSync(candidate, options?: fs.StatSyncOptions) {
+            const stat = fs.lstatSync(candidate, options as never);
+            if (candidate === destinationParent) {
+              return onOtherDevice(stat as unknown as fs.BigIntStats);
+            }
+            return stat;
+          },
+          fstatSync(descriptor, options?: fs.StatSyncOptions) {
+            const stat = fs.fstatSync(descriptor, options as never);
+            if (descriptor === destinationDescriptor) {
+              return onOtherDevice(stat as unknown as fs.BigIntStats);
             }
             return stat;
           },
@@ -762,11 +982,13 @@ describe('shared filesystem mutation executor', () => {
         directoryFsync() {},
       });
       const source = path.join(root, 'source.md');
+      destinationParent = path.join(root, 'destination');
       fs.writeFileSync(source, 'source');
+      fs.mkdirSync(destinationParent);
 
       expect(() => executor[primitive](
         executor.captureFile(source),
-        path.join(root, 'destination.md'),
+        path.join(destinationParent, 'destination.md'),
       )).toThrow(new MutationFailure('UNSUPPORTED_FILESYSTEM'));
     },
   );

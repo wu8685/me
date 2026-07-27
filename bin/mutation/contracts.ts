@@ -96,11 +96,14 @@ export interface MutationExecutorHooks {
 export interface MutationFileOperations {
   openSync: typeof fs.openSync;
   closeSync: typeof fs.closeSync;
+  fchmodSync: typeof fs.fchmodSync;
   fstatSync: typeof fs.fstatSync;
+  ftruncateSync: typeof fs.ftruncateSync;
   fsyncSync: typeof fs.fsyncSync;
   lstatSync: typeof fs.lstatSync;
   statSync: typeof fs.statSync;
   readFileSync: typeof fs.readFileSync;
+  writeFileSync: typeof fs.writeFileSync;
   readdirSync: typeof fs.readdirSync;
   linkSync: typeof fs.linkSync;
   renameSync: typeof fs.renameSync;
@@ -134,7 +137,7 @@ export interface MutationAtomicOperations {
 
 export type AtomicMutationPhase =
   | 'publish'
-  | 'quarantine'
+  | 'retirement'
   | 'remove'
   | 'create';
 
@@ -224,11 +227,14 @@ export function fingerprintMutationSource(options: {
   const operations: MutationFileOperations = {
     openSync: fs.openSync,
     closeSync: fs.closeSync,
+    fchmodSync: fs.fchmodSync,
     fstatSync: fs.fstatSync,
+    ftruncateSync: fs.ftruncateSync,
     fsyncSync: fs.fsyncSync,
     lstatSync: fs.lstatSync,
     statSync: fs.statSync,
     readFileSync: fs.readFileSync,
+    writeFileSync: fs.writeFileSync,
     readdirSync: fs.readdirSync,
     linkSync: fs.linkSync,
     renameSync: fs.renameSync,
