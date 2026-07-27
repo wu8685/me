@@ -191,44 +191,49 @@ describe('managed asset ownership strategies', () => {
         path.join(pluginRoot, 'templates/CLAUDE-template.md'),
         'utf8',
       )));
+
+    fs.writeFileSync(
+      path.join(vault, 'CLAUDE.md'),
+      Buffer.concat([legacy, Buffer.from('\n## Project Rules\n\nKeep me.\n')]),
+    );
+    expectConflict(() => planManagedAsset(vault, pluginRoot, intent({
+      knownTemplatePaths: ['templates/migration-history/0000/CLAUDE-template.md'],
+      onUnmarked: 'append-marked-block',
+    })));
   });
 
-  test('adopts recognized legacy sections and preserves nested project instructions', () => {
+  test('adopt-known-legacy requires an exact known historical document', () => {
     const desired = fs.readFileSync(
       path.join(pluginRoot, 'templates/CLAUDE-template.md'),
       'utf8',
     );
-    const current = [
-      '# Knowledge Base',
-      '',
-      'legacy intro',
-      '',
-      '## Configuration',
-      '',
-      'legacy config text',
-      '',
-      '## Project Rules',
-      '',
-      'Never overwrite this.',
-      '',
-      '### Nested Rule',
-      '',
-      'Still user-owned.',
-      '',
-      '```md',
-      '## Configuration',
-      'fenced headings are opaque',
-      '```',
-      '',
-    ].join('\n');
-
-    const merged = mergeMeOwnedSections(current, desired, 'adopt-known-legacy');
-    expect(merged.adoptedLegacySections).toEqual(['knowledge-base', 'configuration']);
-    expect(merged.content).toContain('<!-- me:managed:start configuration -->');
-    expect(merged.content).toContain(
-      '## Project Rules\n\nNever overwrite this.\n\n### Nested Rule\n\nStill user-owned.',
+    const legacy = fs.readFileSync(
+      path.join(pluginRoot, 'templates/migration-history/0000/CLAUDE-template.md'),
+      'utf8',
     );
-    expect(merged.content).toContain('```md\n## Configuration\nfenced headings are opaque\n```');
+    const merged = mergeMeOwnedSections(
+      legacy,
+      desired,
+      'adopt-known-legacy',
+      [legacy],
+    );
+    expect(merged.content).toBe(desired);
+    expect(merged.adoptedLegacySections).toEqual(markerIds(desired));
+
+    for (const modified of [
+      legacy.replace(
+        'No directional constraint.',
+        'No directional constraint.\n\nCustom project body.',
+      ),
+      `${legacy}\n## Project Rules\n\nNever overwrite this.\n\n### Nested Rule\n`,
+    ]) {
+      expectConflict(() => mergeMeOwnedSections(
+        modified,
+        desired,
+        'adopt-known-legacy',
+        [legacy],
+      ));
+    }
   });
 
   test('appends the complete marked template without changing existing AGENTS bytes', () => {
@@ -264,6 +269,9 @@ describe('managed asset ownership strategies', () => {
       '# Knowledge Base\n\nUser-authored but colliding.\n',
       '## Configuration\n\nOnly one legacy-looking heading.\n',
       '# Knowledge Base Extra\n\nPartial title.\n',
+      '## Configuration:\n\nPunctuation must not bypass ownership collision.\n',
+      '## Configuration {#vault}\n\nHeading attributes must fail closed.\n',
+      '## Configuration <!-- local -->\n\nInline metadata must fail closed.\n',
     ]) {
       expectConflict(() => mergeMeOwnedSections(
         current,
@@ -276,6 +284,69 @@ describe('managed asset ownership strategies', () => {
       desired,
       'conflict',
     ));
+  });
+
+  test('rejects unclosed backtick and tilde fences deterministically before append or merge', () => {
+    const desired = fs.readFileSync(
+      path.join(pluginRoot, 'templates/CLAUDE-template.md'),
+      'utf8',
+    );
+    const cases = [
+      {
+        current: '# Project Rules\n\n```md\n## Configuration\n',
+        policy: 'append-marked-block' as const,
+      },
+      {
+        current: [
+          '<!-- me:managed:start configuration -->',
+          '## Configuration',
+          'old',
+          '<!-- me:managed:end configuration -->',
+          '',
+          '~~~md',
+          '## Commands',
+          '',
+        ].join('\n'),
+        policy: 'conflict' as const,
+      },
+    ];
+    for (const fixture of cases) {
+      const action = () => mergeMeOwnedSections(
+        fixture.current,
+        desired,
+        fixture.policy,
+      );
+      expectConflict(action);
+      expectConflict(action);
+    }
+  });
+
+  test('treats headings in closed fences and nested user headings as opaque', () => {
+    const desired = fs.readFileSync(
+      path.join(pluginRoot, 'templates/AGENTS-template.md'),
+      'utf8',
+    );
+    const current = [
+      '# Project Rules',
+      '',
+      '### Configuration',
+      '',
+      '```md',
+      '## Configuration',
+      '```',
+      '',
+      '~~~md',
+      '# Knowledge Base',
+      '~~~',
+      '',
+    ].join('\n');
+    const merged = mergeMeOwnedSections(
+      current,
+      desired,
+      'append-marked-block',
+    );
+    expect(merged.content.startsWith(current)).toBeTrue();
+    expect(merged.content.slice(current.length)).toBe(`\n${desired}`);
   });
 
   test('rejects duplicate, nested, mismatched, and unknown markers', () => {

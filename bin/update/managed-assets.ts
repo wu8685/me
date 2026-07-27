@@ -261,14 +261,13 @@ export function planManagedAsset(
     );
   }
 
-  const exactLegacy = knownBytes.some(known => known.equals(currentBytes));
-  const merged = exactLegacy
-    ? desiredText as string
-    : mergeMeOwnedSections(
-        utf8(currentBytes, false),
-        desiredText as string,
-        intent.onUnmarked,
-      ).content;
+  const knownLegacyContents = knownBytes.map(known => utf8(known, true));
+  const merged = mergeMeOwnedSections(
+    utf8(currentBytes, false),
+    desiredText as string,
+    intent.onUnmarked,
+    knownLegacyContents,
+  ).content;
   const mergedBytes = Buffer.from(merged);
   if (currentBytes.equals(mergedBytes)) return undefined;
   return writeMutation(

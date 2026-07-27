@@ -129,6 +129,7 @@ function parseManagedBlocks(source: string): ManagedBlock[] {
       open = undefined;
     }
   }
+  if (fence) conflict();
   if (open) conflict();
   return blocks;
 }
@@ -153,6 +154,7 @@ function parseHeadings(source: string): Heading[] {
       .trim();
     headings.push({ level: match[1].length, title, start: line.start });
   }
+  if (fence) conflict();
   return headings;
 }
 
@@ -166,8 +168,11 @@ function resemblesOwnedHeading(heading: Heading): boolean {
     if (heading.level !== owned.level) return false;
     const expected = normalizedHeading(owned.title);
     return current === expected
-      || current.startsWith(`${expected} `)
-      || expected.startsWith(`${current} `);
+      || (
+        current.startsWith(expected)
+        && /^[^a-z0-9]/i.test(current.slice(expected.length))
+      )
+      || (current.length >= 4 && expected.startsWith(current));
   });
 }
 
@@ -200,20 +205,6 @@ function legacySections(source: string): LegacySection[] {
 function appendMarkedTemplate(current: string, desiredTemplate: string): string {
   if (!current) return desiredTemplate;
   return `${current}${current.endsWith('\n') ? '\n' : '\n\n'}${desiredTemplate}`;
-}
-
-function replaceRanges(
-  current: string,
-  ranges: ReadonlyArray<{ id: string; start: number; end: number }>,
-  desired: ReadonlyMap<string, ManagedBlock>,
-): string {
-  let result = current;
-  for (const range of [...ranges].sort((left, right) => right.start - left.start)) {
-    const replacement = desired.get(range.id);
-    if (!replacement) conflict();
-    result = result.slice(0, range.start) + replacement.content + result.slice(range.end);
-  }
-  return result;
 }
 
 function mergeMarkedBlocks(
@@ -260,6 +251,7 @@ export function mergeMeOwnedSections(
   current: string,
   desiredTemplate: string,
   onUnmarked: UnmarkedManagedAssetPolicy,
+  knownLegacyContents: readonly string[] = [],
 ): ManagedSectionMergeResult {
   const desiredBlocks = parseManagedBlocks(desiredTemplate);
   if (desiredBlocks.length === 0) conflict();
@@ -276,6 +268,19 @@ export function mergeMeOwnedSections(
     };
   }
 
+  if (knownLegacyContents.some(known => known === current)) {
+    const adopted = legacySections(current).map(section => section.id);
+    const desiredIds = desiredBlocks.map(block => block.id);
+    if (
+      adopted.length !== desiredIds.length
+      || adopted.some((id, index) => id !== desiredIds[index])
+    ) conflict();
+    return {
+      content: desiredTemplate,
+      adoptedLegacySections: adopted,
+    };
+  }
+
   if (onUnmarked === 'conflict') conflict();
   const legacy = legacySections(current);
   if (onUnmarked === 'append-marked-block') {
@@ -285,20 +290,7 @@ export function mergeMeOwnedSections(
       adoptedLegacySections: [],
     };
   }
-  if (onUnmarked !== 'adopt-known-legacy' || legacy.length === 0) conflict();
-
-  const presentIds = new Set(legacy.map(section => section.id));
-  const replaced = replaceRanges(current, legacy, desired);
-  const missing = desiredBlocks
-    .filter(block => !presentIds.has(block.id))
-    .map(block => block.content)
-    .join('');
-  return {
-    content: missing
-      ? `${replaced}${replaced.endsWith('\n') ? '\n' : '\n\n'}${missing}`
-      : replaced,
-    adoptedLegacySections: legacy.map(section => section.id),
-  };
+  conflict();
 }
 
 export const ME_OWNED_SECTION_IDS = Object.freeze(
