@@ -35,6 +35,7 @@ import {
   planManagedAsset,
   type ManagedAssetIntent,
 } from './update/managed-assets.ts';
+import { inspectVaultUpdateRecovery } from './update/transaction.ts';
 
 type SetupResult =
   | {
@@ -58,6 +59,12 @@ type SetupResult =
       status: 'blocked';
       error: { code: UpdateErrorCode; message: string };
       recoveryState: 'none' | 'manual';
+      recoveryActions?: Array<{
+        kind: 'inspect';
+        path: string;
+        description: string;
+      }>;
+      preservedPaths?: string[];
     };
 
 export interface SetupOptions {
@@ -69,6 +76,7 @@ export interface SetupOptions {
   hooks?: {
     beforePublish?(vaultRelativePath: string): void;
     afterPublish?(vaultRelativePath: string): void;
+    beforeLockRelease?(lockPath: string): void;
   };
   atomicHooks?: {
     beforeAtomicMutation?(
@@ -445,6 +453,21 @@ function existingConfig(vaultDir: string): boolean {
   }
 }
 
+function hasSetupOperation(layout: RuntimeLayout): boolean {
+  try {
+    const entry = fs.lstatSync(layout.transactionDir);
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new UpdateError('UNSAFE_PATH');
+    }
+    return fs.readdirSync(layout.transactionDir)
+      .some(name => name.startsWith('me-setup-'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    if (error instanceof UpdateError) throw error;
+    throw new UpdateError('UNSAFE_PATH');
+  }
+}
+
 function fsyncDirectory(candidate: string): void {
   let descriptor: number | undefined;
   try {
@@ -475,45 +498,6 @@ function fsyncDirectory(candidate: string): void {
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
-}
-
-function setupRecoveryPresent(layout: RuntimeLayout): boolean {
-  let transactionEntry: fs.Stats;
-  try {
-    transactionEntry = fs.lstatSync(layout.transactionDir);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw new UpdateError('UNSAFE_PATH');
-  }
-  if (!transactionEntry.isDirectory() || transactionEntry.isSymbolicLink()) {
-    throw new UpdateError('UNSAFE_PATH');
-  }
-  let names: string[];
-  try {
-    names = fs.readdirSync(layout.transactionDir);
-  } catch {
-    throw new UpdateError('UNSAFE_PATH');
-  }
-  for (const name of names) {
-    if (!name.startsWith('me-setup-')) continue;
-    if (!/^me-setup-[0-9a-f-]{36}$/.test(name)) {
-      throw new UpdateError('RECOVERY_REQUIRED');
-    }
-    const candidate = path.join(layout.transactionDir, name);
-    let entry: fs.Stats;
-    try {
-      entry = fs.lstatSync(candidate);
-    } catch {
-      throw new UpdateError('RECOVERY_REQUIRED');
-    }
-    if (!entry.isDirectory() || entry.isSymbolicLink()) {
-      throw new UpdateError('RECOVERY_REQUIRED');
-    }
-    // Any retained setup operation is authoritative recovery state, including
-    // committed-but-not-cleaned state after config publication.
-    return true;
-  }
-  return false;
 }
 
 class SetupJournal {
@@ -621,8 +605,37 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
   let initialLayout: RuntimeLayout;
   try {
     initialLayout = resolveRuntimeLayout(options.vaultDir, options.environment);
-    if (setupRecoveryPresent(initialLayout)) {
-      throw new UpdateError('RECOVERY_REQUIRED');
+    let recovery = inspectVaultUpdateRecovery(
+      initialLayout.canonicalVault,
+      options.environment,
+    );
+    if (
+      recovery?.code === 'UPDATE_IN_PROGRESS'
+      && hasSetupOperation(initialLayout)
+    ) {
+      recovery = {
+        code: 'RECOVERY_REQUIRED',
+        actions: [{
+          kind: 'inspect',
+          path: '<ME_RUNTIME>/transactions',
+          description: 'Inspect the preserved setup journal and lock before retrying.',
+        }],
+        preservedPaths: ['<ME_RUNTIME>/transactions'],
+      };
+    }
+    if (recovery) {
+      return {
+        version: 1,
+        status: 'blocked',
+        error: { code: recovery.code, message: recovery.code },
+        recoveryState: recovery.code === 'UPDATE_IN_PROGRESS' ? 'none' : 'manual',
+        recoveryActions: recovery.actions.map(action => ({
+          kind: 'inspect',
+          path: action.path,
+          description: action.description,
+        })),
+        preservedPaths: recovery.preservedPaths,
+      };
     }
     // Recovery detection deliberately precedes this fast-path.
     if (existingConfig(initialLayout.canonicalVault)) {
@@ -657,6 +670,7 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
   let executor: ReturnType<typeof createMutationExecutor> | undefined;
   let rollbackComplete = true;
   let vaultCommitted = false;
+  let lockRecovery = false;
   const writes: AppliedWrite[] = [];
   const directories: AppliedDirectory[] = [];
   const transientFiles: OwnedFileFingerprint[] = [];
@@ -684,6 +698,42 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
     journal?.recordAppliedOutcome(kind, paths);
     return true;
   };
+  const releaseOwnedLock = (): void => {
+    if (!lock || !layout) return;
+    const owned = lock;
+    lock = undefined;
+    let hookError: unknown;
+    try {
+      options.hooks?.beforeLockRelease?.(owned.path);
+    } catch (error) {
+      hookError = error;
+    }
+    try {
+      releaseVaultLock(layout, owned);
+    } catch (error) {
+      lockRecovery = true;
+      throw error;
+    }
+    if (hookError) throw hookError;
+  };
+  const cleanupOperation = (): void => {
+    if (!layout || !journal || !operationOwned) {
+      throw new MutationFailure('OWNERSHIP_LOST');
+    }
+    cleanupTransient();
+    journal.close();
+    const policy = setupPathPolicy(layout);
+    const cleanupExecutor = createMutationExecutor({
+      pathPolicy: policy,
+      journal: { beforeMutation() {}, afterMutation() {} },
+      retirementDirectory: layout.retirementDir,
+      atomicHooks: options.atomicHooks,
+      directoryFsync: options.directoryFsync,
+    });
+    cleanupExecutor.unlink(cleanupExecutor.captureFile(journal.journalPath));
+    cleanupExecutor.rmdir(operationOwned);
+    operationDirectory = undefined;
+  };
   try {
     bootstrapRuntimeDirectories(layout, [
       layout.lockDir,
@@ -695,7 +745,6 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
       owner: 'me-update',
     });
 
-    if (setupRecoveryPresent(layout)) throw new UpdateError('RECOVERY_REQUIRED');
     if (existingConfig(layout.canonicalVault)) {
       return { version: 1, status: 'already_initialized', message: EXISTING_MESSAGE };
     }
@@ -874,20 +923,11 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
 
     journal.state('committed');
     vaultCommitted = true;
-    cleanupTransient();
-    journal.close();
-    const cleanupExecutor = createMutationExecutor({
-      pathPolicy: policy,
-      journal: { beforeMutation() {}, afterMutation() {} },
-      retirementDirectory: layout.retirementDir,
-      atomicHooks: options.atomicHooks,
-      directoryFsync: options.directoryFsync,
-    });
-    const journalOwned = cleanupExecutor.captureFile(journal.journalPath);
-    cleanupExecutor.unlink(journalOwned);
-    if (!operationOwned) throw new MutationFailure('OWNERSHIP_LOST');
-    cleanupExecutor.rmdir(operationOwned);
-    operationDirectory = undefined;
+    // The committed journal remains authoritative until the shared lock has
+    // been released successfully. A foreign lock replacement therefore cannot
+    // turn an ambiguous completion into an "already initialized" retry.
+    releaseOwnedLock();
+    cleanupOperation();
     return {
       version: 1,
       status: 'initialized',
@@ -947,24 +987,21 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
         for (const applied of [...directories].reverse()) {
           executor.rmdir(applied.published);
         }
-        cleanupTransient();
         journal?.state('rolled-back');
       }
     } catch {
       rollbackComplete = false;
     }
+    if (lock) {
+      try {
+        releaseOwnedLock();
+      } catch {
+        rollbackComplete = false;
+      }
+    }
     if (rollbackComplete && !vaultCommitted && journal && operationOwned) {
       try {
-        journal.close();
-        const policy = setupPathPolicy(layout!);
-        const cleanupExecutor = createMutationExecutor({
-          pathPolicy: policy,
-          journal: { beforeMutation() {}, afterMutation() {} },
-          retirementDirectory: layout!.retirementDir,
-        });
-        cleanupExecutor.unlink(cleanupExecutor.captureFile(journal.journalPath));
-        cleanupExecutor.rmdir(operationOwned);
-        operationDirectory = undefined;
+        cleanupOperation();
       } catch {
         rollbackComplete = false;
       }
@@ -992,9 +1029,23 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
       status: 'blocked',
       error: { code, message: code },
       recoveryState: recoveryRequired ? 'manual' : 'none',
+      ...(recoveryRequired ? {
+        recoveryActions: [{
+          kind: 'inspect' as const,
+          path: lockRecovery
+            ? '<ME_RUNTIME>/locks/vault.lock'
+            : '<ME_RUNTIME>/transactions',
+          description: lockRecovery
+            ? 'Inspect the unrecognized lock entry before retrying.'
+            : 'Inspect the preserved setup journal and owned artifacts before retrying.',
+        }],
+        preservedPaths: [
+          lockRecovery
+            ? '<ME_RUNTIME>/locks/vault.lock'
+            : '<ME_RUNTIME>/transactions',
+        ],
+      } : {}),
     };
-  } finally {
-    if (lock && layout) releaseVaultLock(layout, lock);
   }
 }
 

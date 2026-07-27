@@ -4,6 +4,14 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
+import {
+  acquireVaultLock,
+  releaseVaultLock,
+} from '../bin/cooperative-lock.ts';
+import {
+  bootstrapRuntimeDirectories,
+  resolveRuntimeLayout,
+} from '../bin/runtime-paths.ts';
 import { executeFreshSetup } from '../bin/setup.ts';
 
 const pluginRoot = path.resolve(import.meta.dir, '..');
@@ -314,5 +322,159 @@ describe('fresh setup transaction', () => {
       status: 'blocked',
       error: { code: 'RECOVERY_REQUIRED' },
     });
+  });
+
+  test('lock replacement after config returns structured recovery and keeps committed journal', () => {
+    const vault = temporaryDirectory('me-setup-lock-replace-vault-');
+    const runtime = path.join(temporaryDirectory('me-setup-lock-replace-root-'), 'runtime');
+    const foreign = 'foreign lock replacement\n';
+
+    const result = executeFreshSetup({
+      ...setupOptions(vault, runtime),
+      hooks: {
+        beforeLockRelease(lockPath) {
+          fs.renameSync(lockPath, `${lockPath}.previous-owner`);
+          fs.writeFileSync(lockPath, foreign);
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: 'blocked',
+      error: { code: 'RECOVERY_REQUIRED' },
+      recoveryState: 'manual',
+      recoveryActions: [{
+        path: '<ME_RUNTIME>/locks/vault.lock',
+      }],
+      preservedPaths: ['<ME_RUNTIME>/locks/vault.lock'],
+    });
+    expect(fs.existsSync(path.join(vault, '.me/config.yaml'))).toBeTrue();
+    expect(setupOperationDirectories(runtime).length).toBe(1);
+
+    const layout = resolveRuntimeLayout(vault, {
+      ...process.env,
+      ME_RUNTIME_ROOT: runtime,
+    });
+    expect(fs.readFileSync(path.join(layout.lockDir, 'vault.lock'), 'utf8'))
+      .toBe(foreign);
+    const beforeVault = manifest(vault);
+    const beforeRuntime = manifest(runtime);
+
+    const retry = executeFreshSetup({
+      ...setupOptions(vault, runtime),
+      preview: true,
+    });
+    expect(retry).toMatchObject({
+      status: 'blocked',
+      error: { code: 'RECOVERY_REQUIRED' },
+      recoveryState: 'manual',
+      recoveryActions: [{
+        path: '<ME_RUNTIME>/locks/vault.lock',
+      }],
+    });
+    expect(manifest(vault)).toEqual(beforeVault);
+    expect(manifest(runtime)).toEqual(beforeRuntime);
+    expect(fs.readFileSync(path.join(layout.lockDir, 'vault.lock'), 'utf8'))
+      .toBe(foreign);
+  });
+
+  test.each([
+    'vault-write',
+    'me-update',
+    'unknown',
+  ] as const)('shared inspector blocks malformed %s transaction residue before fresh writes', kind => {
+    const vault = temporaryDirectory(`me-setup-${kind}-residue-vault-`);
+    const runtime = path.join(
+      temporaryDirectory(`me-setup-${kind}-residue-root-`),
+      'runtime',
+    );
+    const environment = { ...process.env, ME_RUNTIME_ROOT: runtime };
+    const layout = resolveRuntimeLayout(vault, environment);
+    bootstrapRuntimeDirectories(layout, [layout.transactionDir]);
+    const id = crypto.randomUUID();
+    const name = kind === 'unknown' ? `mystery-${id}` : `${kind}-${id}`;
+    const operation = path.join(layout.transactionDir, name);
+    fs.mkdirSync(operation);
+    fs.writeFileSync(path.join(operation, 'journal.json'), '{ malformed');
+    const beforeVault = manifest(vault);
+    const beforeRuntime = manifest(runtime);
+
+    const result = executeFreshSetup({
+      ...setupOptions(vault, runtime),
+      preview: true,
+    });
+
+    expect(result).toMatchObject({
+      status: 'blocked',
+      error: { code: 'RECOVERY_REQUIRED' },
+      recoveryState: 'manual',
+      recoveryActions: [{
+        path: '<ME_RUNTIME>/transactions',
+      }],
+    });
+    expect(manifest(vault)).toEqual(beforeVault);
+    expect(manifest(runtime)).toEqual(beforeRuntime);
+    expect(fs.existsSync(path.join(vault, '.me/config.yaml'))).toBeFalse();
+  });
+
+  test('shared inspector reports a valid active lock without writing', () => {
+    const vault = temporaryDirectory('me-setup-active-lock-vault-');
+    const runtime = path.join(temporaryDirectory('me-setup-active-lock-root-'), 'runtime');
+    const environment = { ...process.env, ME_RUNTIME_ROOT: runtime };
+    const layout = resolveRuntimeLayout(vault, environment);
+    bootstrapRuntimeDirectories(layout, [layout.lockDir]);
+    const lock = acquireVaultLock(layout, {
+      operationId: crypto.randomUUID(),
+      owner: 'ingest',
+    });
+    const beforeVault = manifest(vault);
+    const beforeRuntime = manifest(runtime);
+    try {
+      const result = executeFreshSetup({
+        ...setupOptions(vault, runtime),
+        preview: true,
+      });
+      expect(result).toMatchObject({
+        status: 'blocked',
+        error: { code: 'UPDATE_IN_PROGRESS' },
+        recoveryState: 'none',
+      });
+      expect(manifest(vault)).toEqual(beforeVault);
+      expect(manifest(runtime)).toEqual(beforeRuntime);
+    } finally {
+      releaseVaultLock(layout, lock);
+    }
+  });
+
+  test('shared inspector ignores a valid committed vault-write journal', () => {
+    const vault = temporaryDirectory('me-setup-committed-write-vault-');
+    const runtime = path.join(
+      temporaryDirectory('me-setup-committed-write-root-'),
+      'runtime',
+    );
+    const environment = { ...process.env, ME_RUNTIME_ROOT: runtime };
+    const layout = resolveRuntimeLayout(vault, environment);
+    bootstrapRuntimeDirectories(layout, [layout.transactionDir]);
+    const id = crypto.randomUUID();
+    const operation = path.join(layout.transactionDir, `vault-write-${id}`);
+    fs.mkdirSync(operation, { mode: 0o700 });
+    fs.writeFileSync(path.join(operation, 'journal.json'), `${JSON.stringify({
+      version: 1,
+      operationId: id,
+      state: 'committed',
+      notePath: 'raw/note.md',
+      requestDigest: '0'.repeat(64),
+      plannedNoteSha256: '1'.repeat(64),
+      metadataPolicy:
+        'POSIX mode preserved for replaced README; uid/gid/ACL/xattr/timestamps are not preserved.',
+    })}\n`, { mode: 0o600 });
+
+    const result = executeFreshSetup({
+      ...setupOptions(vault, runtime),
+      preview: true,
+    });
+
+    expect(result.status).toBe('ready');
+    expect(fs.existsSync(path.join(vault, '.me/config.yaml'))).toBeFalse();
   });
 });
