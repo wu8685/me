@@ -108,5 +108,9 @@ warnings, conflicts, and recovery state/actions without inventing success.
   material directly. A later preview performs the same read-only startup
   inspection and must continue to report recovery until the residue is
   resolved; never reinterpret it as `up_to_date`.
+- `UPDATE_IN_PROGRESS` with no recovery actions is a valid active writer lock.
+  An unrecognized or ownership-lost lock is instead `RECOVERY_REQUIRED` and
+  identifies only `<ME_RUNTIME>/locks/vault.lock`; do not suggest restoring
+  already committed migration targets.
 - Any other error is reported from the structured result; do not fall back to
   direct file edits.

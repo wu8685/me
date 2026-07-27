@@ -18,6 +18,10 @@ import {
 } from '../bin/update/contracts.ts';
 import { resolveRuntimeLayout } from '../bin/runtime-paths.ts';
 import { planVaultUpdate } from '../bin/update/planner.ts';
+import {
+  acquireVaultLock,
+  releaseVaultLock,
+} from '../bin/cooperative-lock.ts';
 
 const pluginRoot = path.resolve(import.meta.dir, '..');
 const cli = path.join(pluginRoot, 'bin/update.ts');
@@ -294,6 +298,32 @@ describe('me-update preview CLI', () => {
     }]);
     expect(result.preservedPaths).toEqual(['<ME_RUNTIME>/transactions']);
     expect(manifest(runtimeBase)).toEqual(before);
+  });
+
+  test('preview reports a well-formed active writer without recovery metadata', () => {
+    const vault = makeVault();
+    const runtimeBase = temporaryDirectory('me-update-active-lock-runtime-');
+    const environment = { ME_RUNTIME_ROOT: runtimeBase };
+    const layout = resolveRuntimeLayout(vault, environment);
+    const lock = acquireVaultLock(layout, {
+      operationId: 'active-writer',
+      owner: 'ingest',
+    });
+    const before = manifest(runtimeBase);
+    try {
+      const result = runUpdateCli(
+        ['preview', '--vault-dir', vault],
+        options({ environment }),
+      );
+      expect(result.status).toBe('blocked');
+      expect(result.error?.code).toBe('UPDATE_IN_PROGRESS');
+      expect(result.recoveryState).toBe('none');
+      expect(result.recoveryActions).toEqual([]);
+      expect(result.preservedPaths).toEqual([]);
+      expect(manifest(runtimeBase)).toEqual(before);
+    } finally {
+      releaseVaultLock(layout, lock);
+    }
   });
 
   test('returns blocked conflicts with public paths, reasons, and safe diffs', () => {

@@ -92,6 +92,11 @@ vault 通过 `.me/config.yaml` 的 `vault_schema_version` 记录 managed schema�
 或 recovery state。只有 `committed` 表示迁移成功；ME 不会 stage、commit
 或 push 用户的 vault。
 
+preview 遇到格式和 ownership record 均有效的活动锁时返回
+`UPDATE_IN_PROGRESS`，不把它误报为 recovery；遇到 foreign、损坏或无法稳定
+识别的 lock entry 时返回 `RECOVERY_REQUIRED`，并只公开
+`<ME_RUNTIME>/locks/vault.lock`。
+
 ## 同步与本机运行时
 
 ME vault 可以放进 Obsidian Sync 或 Git。vault 内的 `.me/` 只保存

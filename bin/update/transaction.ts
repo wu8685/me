@@ -4,6 +4,7 @@ import * as path from 'path';
 import {
   acquireVaultLock,
   CooperativeLockError,
+  inspectVaultLock,
   releaseVaultLock,
   type OwnedCooperativeLock,
 } from '../cooperative-lock.ts';
@@ -989,7 +990,10 @@ export function inspectVaultUpdateRecovery(
   vaultDir: string,
   environment?: NodeJS.ProcessEnv,
 ): {
-  code: Extract<UpdateErrorCode, 'LEGACY_RUNTIME_STATE' | 'RECOVERY_REQUIRED'>;
+  code: Extract<
+    UpdateErrorCode,
+    'LEGACY_RUNTIME_STATE' | 'RECOVERY_REQUIRED' | 'UPDATE_IN_PROGRESS'
+  >;
   actions: UpdateResultV1['recoveryActions'];
   preservedPaths: string[];
 } | undefined {
@@ -1003,6 +1007,25 @@ export function inspectVaultUpdateRecovery(
         description: 'Inspect legacy vault-local locks and temporary state before updating.',
       }],
       preservedPaths: ['.me/locks', '.me/tmp'],
+    };
+  }
+  const lockState = inspectVaultLock(layout);
+  if (lockState === 'active') {
+    return {
+      code: 'UPDATE_IN_PROGRESS',
+      actions: [],
+      preservedPaths: [],
+    };
+  }
+  if (lockState === 'recovery-required') {
+    return {
+      code: 'RECOVERY_REQUIRED',
+      actions: [{
+        kind: 'inspect',
+        path: '<ME_RUNTIME>/locks/vault.lock',
+        description: 'Inspect the unrecognized lock entry before retrying.',
+      }],
+      preservedPaths: ['<ME_RUNTIME>/locks/vault.lock'],
     };
   }
   if (!hasIncompleteRuntimeOperation(layout)) return undefined;
@@ -1893,11 +1916,17 @@ export function executeVaultUpdate(
   let stagingDirectory: string | undefined;
   let originalsDirectory: string | undefined;
   let ownershipAmbiguous = false;
+  let lockOwnershipAmbiguous = false;
   let completed = false;
   let primaryError: unknown;
   let finalResult: UpdateResultV1 | undefined;
 
   try {
+    const startupLock = inspectVaultLock(layout);
+    if (startupLock === 'active') throw new UpdateError('UPDATE_IN_PROGRESS');
+    if (startupLock === 'recovery-required') {
+      throw new UpdateError('RECOVERY_REQUIRED');
+    }
     lock = acquireVaultLock(layout, { operationId: id, owner: 'me-update' });
     if (hasIncompleteRuntimeOperation(layout)) {
       throw new UpdateError('RECOVERY_REQUIRED');
@@ -2054,12 +2083,12 @@ export function executeVaultUpdate(
       try {
         releaseVaultLock(layout, lock);
       } catch {
-        ownershipAmbiguous = true;
+        lockOwnershipAmbiguous = true;
       }
     }
   }
 
-  if (finalResult && !ownershipAmbiguous) {
+  if (finalResult && !ownershipAmbiguous && !lockOwnershipAmbiguous) {
     return sanitizePublicUpdateResult(finalResult);
   }
 
@@ -2067,13 +2096,21 @@ export function executeVaultUpdate(
     const code = updateErrorCode(primaryError);
     const result = emptyResult(id, code);
     if (code === 'RECOVERY_REQUIRED') {
-      result.warnings.push('<ME_RUNTIME>/transactions');
+      const lockState = inspectVaultLock(layout);
+      const lockRecovery = lockOwnershipAmbiguous
+        || lockState === 'recovery-required';
+      const recoveryPath = lockRecovery
+        ? '<ME_RUNTIME>/locks/vault.lock'
+        : '<ME_RUNTIME>/transactions';
+      result.warnings.push(recoveryPath);
       result.recoveryActions = [{
         kind: 'inspect',
-        path: '<ME_RUNTIME>/transactions',
-        description: 'Inspect the preserved update journal and owned artifacts before retrying.',
+        path: recoveryPath,
+        description: lockRecovery
+          ? 'Inspect the unrecognized lock entry before retrying.'
+          : 'Inspect the preserved update journal and owned artifacts before retrying.',
       }];
-      result.preservedPaths = ['<ME_RUNTIME>/transactions'];
+      result.preservedPaths = [recoveryPath];
     }
     return sanitizePublicUpdateResult(
       result,
@@ -2083,6 +2120,25 @@ export function executeVaultUpdate(
   const recoveryPath = operationDirectory
     ? runtimeDisplayPath(layout, operationDirectory)
     : '<ME_RUNTIME>/transactions';
+  if (lockOwnershipAmbiguous && !ownershipAmbiguous) {
+    return sanitizePublicUpdateResult(
+      resultFromPlan(id, plan, 'recovery_required', {
+        code: 'RECOVERY_REQUIRED',
+        changedPaths: finalResult?.changedPaths ?? [],
+        warnings: [
+          ...(tx?.warnings ?? []),
+          '<ME_RUNTIME>/locks/vault.lock',
+        ],
+        recoveryState: 'manual',
+        recoveryActions: [{
+          kind: 'inspect',
+          path: '<ME_RUNTIME>/locks/vault.lock',
+          description: 'Inspect the unrecognized lock entry before retrying.',
+        }],
+        preservedPaths: ['<ME_RUNTIME>/locks/vault.lock'],
+      }),
+    );
+  }
   if (ownershipAmbiguous) {
     const preservedOriginals = tx
       ? [...tx.originals.entries()].map(([publishOrder, item]) => ({

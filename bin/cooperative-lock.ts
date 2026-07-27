@@ -26,6 +26,7 @@ export interface CooperativeLockHooks {
 }
 
 export type CooperativeLockErrorCode = 'LOCK_HELD' | 'UNSAFE_PATH' | 'RECOVERY_REQUIRED';
+export type CooperativeLockInspection = 'absent' | 'active' | 'recovery-required';
 
 export class CooperativeLockError extends Error {
   constructor(public readonly code: CooperativeLockErrorCode) {
@@ -82,6 +83,7 @@ type PathOwnershipState =
   | 'unknown';
 
 const lockStates = new WeakMap<OwnedCooperativeLock, CooperativeLockState>();
+const SAFE_OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
@@ -119,6 +121,84 @@ function parseOwnership(
     return typeof parsed === 'object' && parsed !== null ? parsed : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Inspect the public lock namespace without creating runtime directories or
+ * acquiring the lock. A syntactically and identity-stable owned record means
+ * an active writer; every other existing entry is recovery residue.
+ */
+export function inspectVaultLock(
+  layout: RuntimeLayout,
+): CooperativeLockInspection {
+  const lockPath = path.join(layout.lockDir, 'vault.lock');
+  try {
+    assertSafeRuntimePath(layout, lockPath);
+  } catch {
+    return 'recovery-required';
+  }
+
+  let descriptor: number | undefined;
+  try {
+    const namedBefore = fs.lstatSync(lockPath, { bigint: true });
+    if (
+      namedBefore.isSymbolicLink()
+      || !namedBefore.isFile()
+      || Number(namedBefore.mode & 0o777n) !== 0o600
+      || namedBefore.size > 4096n
+    ) return 'recovery-required';
+    descriptor = fs.openSync(
+      lockPath,
+      fs.constants.O_RDONLY
+        | fs.constants.O_NOFOLLOW
+        | fs.constants.O_NONBLOCK,
+    );
+    const openedBefore = fs.fstatSync(descriptor, { bigint: true });
+    const bytes = fs.readFileSync(descriptor);
+    const openedAfter = fs.fstatSync(descriptor, { bigint: true });
+    const namedAfter = fs.lstatSync(lockPath, { bigint: true });
+    if (
+      !openedBefore.isFile()
+      || openedBefore.dev !== namedBefore.dev
+      || openedBefore.ino !== namedBefore.ino
+      || openedAfter.dev !== openedBefore.dev
+      || openedAfter.ino !== openedBefore.ino
+      || openedAfter.size !== openedBefore.size
+      || openedAfter.mtimeNs !== openedBefore.mtimeNs
+      || openedAfter.ctimeNs !== openedBefore.ctimeNs
+      || namedAfter.dev !== openedAfter.dev
+      || namedAfter.ino !== openedAfter.ino
+      || namedAfter.mode !== openedAfter.mode
+      || namedAfter.size !== openedAfter.size
+    ) return 'recovery-required';
+    const value = parseOwnership(bytes);
+    if (!value || Reflect.ownKeys(value).length !== 4) {
+      return 'recovery-required';
+    }
+    const startedAt = (value as { startedAt?: unknown }).startedAt;
+    const validStartedAt = typeof startedAt === 'string'
+      && Number.isFinite(Date.parse(startedAt))
+      && new Date(startedAt).toISOString() === startedAt;
+    return value.version === 1
+      && typeof value.operationId === 'string'
+      && SAFE_OPERATION_ID.test(value.operationId)
+      && (value.owner === 'vault-write'
+        || value.owner === 'ingest'
+        || value.owner === 'me-update')
+      && validStartedAt
+      ? 'active'
+      : 'recovery-required';
+  } catch (error) {
+    return errno(error) === 'ENOENT' ? 'absent' : 'recovery-required';
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // Inspection is already complete; close failure cannot make it active.
+      }
+    }
   }
 }
 

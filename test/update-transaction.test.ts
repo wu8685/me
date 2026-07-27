@@ -14,6 +14,7 @@ import {
   executeVaultUpdate,
   inspectVaultUpdateRecovery,
 } from '../bin/update/transaction.ts';
+import { runUpdateCli } from '../bin/update.ts';
 
 const pluginRoot = path.resolve(import.meta.dir, '..');
 const temporaryDirectories: string[] = [];
@@ -441,6 +442,58 @@ describe('me-update transaction', () => {
       'journal.json',
     ), 'utf8')).toBe('{"foreign":true}\n');
     expect(fs.existsSync(replacement)).toBeTrue();
+  });
+
+  test('surfaces a replaced lock after commit and every later preview remains read-only recovery', () => {
+    const { vault, environment } = makeVault();
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    const layout = resolveRuntimeLayout(vault, environment);
+    const lockPath = path.join(layout.lockDir, 'vault.lock');
+    const ownedLockPath = path.join(layout.lockDir, 'owned-lock-preserved');
+    const foreignBytes = '{"foreign":true}\n';
+    const result = executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+      hooks: {
+        beforeLockRelease(candidate) {
+          fs.renameSync(candidate, ownedLockPath);
+          fs.writeFileSync(candidate, foreignBytes, { mode: 0o600 });
+        },
+      },
+    });
+
+    expect(result.status).toBe('recovery_required');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(configVersion(vault)).toBe(1);
+    expect(result.recoveryActions).toEqual([{
+      kind: 'inspect',
+      path: '<ME_RUNTIME>/locks/vault.lock',
+      description: 'Inspect the unrecognized lock entry before retrying.',
+    }]);
+    expect(result.preservedPaths).toEqual(['<ME_RUNTIME>/locks/vault.lock']);
+    expect(result.recoveryActions.every(action => (
+      !action.description.includes('config')
+      && action.kind !== 'restore'
+    ))).toBeTrue();
+    expect(fs.readFileSync(lockPath, 'utf8')).toBe(foreignBytes);
+    expect(fs.existsSync(ownedLockPath)).toBeTrue();
+
+    const beforeLockEntries = fs.readdirSync(layout.lockDir).sort();
+    const beforeTransactionEntries = fs.readdirSync(layout.transactionDir).sort();
+    const next = runUpdateCli(['preview', '--vault-dir', vault], {
+      pluginRoot,
+      environment,
+      operationIdFactory: () => '00000000-0000-4000-8000-000000000699',
+    });
+
+    expect(next.status).toBe('recovery_required');
+    expect(next.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(next.recoveryActions).toEqual(result.recoveryActions);
+    expect(next.preservedPaths).toEqual(result.preservedPaths);
+    expect(fs.readFileSync(lockPath, 'utf8')).toBe(foreignBytes);
+    expect(fs.readdirSync(layout.lockDir).sort()).toEqual(beforeLockEntries);
+    expect(fs.readdirSync(layout.transactionDir).sort())
+      .toEqual(beforeTransactionEntries);
   });
 
   test('blocks a committed journal that still declares a pending mutation', () => {
