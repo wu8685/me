@@ -553,6 +553,193 @@ describe('me-update transaction', () => {
     expect(result.error?.code).toBe('RECOVERY_REQUIRED');
   });
 
+  test('rejects a committed updater that cannot end with a config mkdir', () => {
+    const { vault, environment } = makeVault();
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    const layout = resolveRuntimeLayout(vault, environment);
+    const id = '00000000-0000-4000-8000-000000000615';
+    const operationName = `me-update-${id}`;
+    const operation = path.join(layout.transactionDir, operationName);
+    const runtimeOperation = `<ME_RUNTIME>/transactions/${operationName}`;
+    fs.mkdirSync(operation, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(operation, 'journal.json'), JSON.stringify({
+      version: 1,
+      operationId: id,
+      state: 'committed',
+      planDigest: '1'.repeat(64),
+      sourceVaultSchemaVersion: 0,
+      targetVaultSchemaVersion: 1,
+      migrationIds: ['0000-to-0001'],
+      mutations: [{
+        kind: 'mkdir',
+        path: '.me/config.yaml',
+        source: {
+          vaultRelativePath: '.me/config.yaml',
+          type: 'missing',
+        },
+        desiredMode: 0o755,
+        publishOrder: 0,
+      }],
+      staged: [],
+      completedMutations: [
+        { kind: 'mkdir', paths: [`${runtimeOperation}/staged`] },
+        { kind: 'mkdir', paths: [`${runtimeOperation}/originals`] },
+        { kind: 'mkdir', paths: ['.me/config.yaml'] },
+        { kind: 'rmdir', paths: [`${runtimeOperation}/staged`] },
+        { kind: 'rmdir', paths: [`${runtimeOperation}/originals`] },
+      ],
+    }), { mode: 0o600 });
+
+    const result = executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+    });
+    expect(result.status).toBe('recovery_required');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(configVersion(vault)).toBeUndefined();
+  });
+
+  test('rejects duplicate and ancestor-overlapping updater targets', () => {
+    for (const [index, forgedPath] of [
+      'AGENTS.md',
+      'AGENTS.md/child',
+    ].entries()) {
+      const { vault, environment } = makeVault();
+      const id = `00000000-0000-4000-8000-${String(616 + index).padStart(12, '0')}`;
+      const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+      expect(executeVaultUpdate(vault, preview.planDigest, {
+        pluginRoot,
+        environment,
+        operationIdFactory: () => id,
+      }).status).toBe('committed');
+
+      const layout = resolveRuntimeLayout(vault, environment);
+      const journalPath = path.join(
+        layout.transactionDir,
+        `me-update-${id}`,
+        'journal.json',
+      );
+      const journal = JSON.parse(
+        fs.readFileSync(journalPath, 'utf8'),
+      ) as {
+        mutations: Array<{
+          path: string;
+          source: { vaultRelativePath: string };
+        }>;
+        staged: Array<{ path: string }>;
+        completedMutations: Array<{ paths: string[] }>;
+      };
+      const mutation = journal.mutations.find(
+        item => item.path === 'CLAUDE.md',
+      );
+      const staged = journal.staged.find(
+        item => item.path === 'CLAUDE.md',
+      );
+      expect(mutation).toBeDefined();
+      expect(staged).toBeDefined();
+      mutation!.path = forgedPath;
+      mutation!.source.vaultRelativePath = forgedPath;
+      staged!.path = forgedPath;
+      for (const completed of journal.completedMutations) {
+        completed.paths = completed.paths.map(
+          item => item === 'CLAUDE.md' ? forgedPath : item,
+        );
+      }
+      fs.writeFileSync(journalPath, `${JSON.stringify(journal, null, 2)}\n`, {
+        mode: 0o600,
+      });
+
+      const next = planVaultUpdate({ vaultDir: vault, pluginRoot });
+      const result = executeVaultUpdate(vault, next.planDigest, {
+        pluginRoot,
+        environment,
+      });
+      expect(result.status).toBe('recovery_required');
+      expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    }
+  });
+
+  test('rejects overlapping endpoints inside an updater rename', () => {
+    const { vault, environment } = makeVault();
+    const id = '00000000-0000-4000-8000-000000000618';
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    expect(executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+      operationIdFactory: () => id,
+    }).status).toBe('committed');
+
+    const layout = resolveRuntimeLayout(vault, environment);
+    const journalPath = path.join(
+      layout.transactionDir,
+      `me-update-${id}`,
+      'journal.json',
+    );
+    const journal = JSON.parse(
+      fs.readFileSync(journalPath, 'utf8'),
+    ) as {
+      mutations: Array<Record<string, unknown>>;
+      staged: Array<{ path: string }>;
+      completedMutations: Array<{ kind: string; paths: string[] }>;
+    };
+    const mutationIndex = journal.mutations.findIndex(
+      item => item.path === 'CLAUDE.md',
+    );
+    expect(mutationIndex).toBeGreaterThanOrEqual(0);
+    const publishOrder = journal.mutations[mutationIndex]
+      .publishOrder as number;
+    const stagedSuffix =
+      `/${String(publishOrder).padStart(6, '0')}.stage`;
+    journal.mutations[mutationIndex] = {
+      kind: 'rename',
+      path: 'notes',
+      destinationPath: 'notes/child',
+      source: {
+        vaultRelativePath: 'notes',
+        type: 'file',
+        sha256: '3'.repeat(64),
+        mode: 0o644,
+      },
+      destinationSource: {
+        vaultRelativePath: 'notes/child',
+        type: 'missing',
+      },
+      publishOrder,
+    };
+    journal.staged = journal.staged.filter(
+      item => item.path !== 'CLAUDE.md',
+    );
+    journal.completedMutations = journal.completedMutations.flatMap(
+      completed => {
+        if (
+          completed.kind === 'link'
+          && completed.paths[1] === 'CLAUDE.md'
+        ) {
+          return [{
+            kind: 'rename',
+            paths: ['notes', 'notes/child'],
+          }];
+        }
+        if (
+          completed.kind === 'unlink'
+          && completed.paths[0]?.endsWith(stagedSuffix)
+        ) return [];
+        return [completed];
+      },
+    );
+    fs.writeFileSync(journalPath, `${JSON.stringify(journal, null, 2)}\n`, {
+      mode: 0o600,
+    });
+
+    const next = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    const result = executeVaultUpdate(vault, next.planDigest, {
+      pluginRoot,
+      environment,
+    });
+    expect(result.status).toBe('recovery_required');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+  });
+
   test('accepts only the full committed vault-write journal contract', () => {
     const { vault, environment } = makeVault();
     const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });

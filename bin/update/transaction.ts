@@ -740,11 +740,29 @@ function validUpdaterCommittedOperation(
   const mutations = value.mutations as Record<string, unknown>[];
   const publishOrders = mutations.map(item => item.publishOrder as number);
   if (
-    new Set(publishOrders).size !== publishOrders.length
-    || [...publishOrders].sort((left, right) => left - right)
-      .some((item, index) => item !== index)
+    publishOrders.some((item, index) => item !== index)
+    || mutations.at(-1)?.kind !== 'write-file'
     || mutations.at(-1)?.path !== CONFIG_PATH
+    || (mutations.at(-1)?.source as SourceFingerprint).type !== 'file'
   ) return false;
+
+  const affectedPaths: string[] = [];
+  for (const mutation of mutations) {
+    const candidates = mutation.kind === 'rename'
+      ? [
+          mutation.path as string,
+          mutation.destinationPath as string,
+        ]
+      : [mutation.path as string];
+    for (const candidate of candidates) {
+      if (affectedPaths.some(existing => (
+        existing === candidate
+        || existing.startsWith(`${candidate}/`)
+        || candidate.startsWith(`${existing}/`)
+      ))) return false;
+      affectedPaths.push(candidate);
+    }
+  }
 
   const stagedExpected = mutations
     .filter(item => item.kind === 'write-file')
