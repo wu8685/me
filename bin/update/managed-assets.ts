@@ -100,12 +100,20 @@ function pathPolicy(root: string): MutationPathPolicy {
 }
 
 function sha256(bytes: Buffer): string {
-  return crypto.createHash('sha256').update(bytes).digest('hex');
+  return crypto.createHash('sha256')
+    .update(Uint8Array.from(bytes))
+    .digest('hex');
+}
+
+function bytesEqual(left: Buffer, right: Buffer): boolean {
+  return left.length === right.length
+    && left.every((byte, index) => right[index] === byte);
 }
 
 function utf8(bytes: Buffer, unsafePluginResource: boolean): string {
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return new TextDecoder('utf-8', { fatal: true })
+      .decode(Uint8Array.from(bytes));
   } catch {
     if (unsafePluginResource) fail('UNSAFE_PATH');
     return fail('MIGRATION_CONFLICT');
@@ -243,14 +251,14 @@ export function planManagedAsset(
   if (source.type !== 'file') fail('UNSAFE_PATH');
   const currentBytes = readRegularFile(vault, intent.vaultRelativePath);
   if (sha256(currentBytes) !== source.sha256) fail('UNSAFE_PATH');
-  if (currentBytes.equals(desiredBytes)) return undefined;
+  if (bytesEqual(currentBytes, desiredBytes)) return undefined;
 
   if (intent.strategy === 'create-if-absent') return undefined;
   const knownBytes = (intent.knownTemplatePaths ?? [])
     .map(knownPath => readRegularFile(plugin, knownPath));
 
   if (intent.strategy === 'replace-known-template') {
-    if (!knownBytes.some(known => known.equals(currentBytes))) {
+    if (!knownBytes.some(known => bytesEqual(known, currentBytes))) {
       fail('MIGRATION_CONFLICT');
     }
     return writeMutation(
@@ -269,7 +277,7 @@ export function planManagedAsset(
     knownLegacyContents,
   ).content;
   const mergedBytes = Buffer.from(merged);
-  if (currentBytes.equals(mergedBytes)) return undefined;
+  if (bytesEqual(currentBytes, mergedBytes)) return undefined;
   return writeMutation(
     intent.vaultRelativePath,
     source,
