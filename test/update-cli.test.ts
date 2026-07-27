@@ -282,7 +282,7 @@ describe('me-update preview CLI', () => {
     expect(exitCodeForUpdateResult(result)).toBe(3);
   });
 
-  test('rejects every partial, apply, duplicate, and unknown argument form exactly', () => {
+  test('rejects every partial, malformed apply, duplicate, and unknown argument form exactly', () => {
     const vault = makeVault();
     const digest = 'a'.repeat(64);
     const invalid = [
@@ -292,6 +292,8 @@ describe('me-update preview CLI', () => {
       ['preview', '--vault-dir', ''],
       ['preview', '--vault-dir', '--unknown'],
       ['apply', '--vault-dir', vault],
+      ['apply', '--vault-dir', vault, '--expected-plan-digest', 'A'.repeat(64)],
+      ['apply', '--vault-dir', vault, '--expected-plan-digest', 'bad'],
       ['preview', '--vault-dir', vault, '--expected-plan-digest', digest],
       ['preview', '--vault-dir', vault, '--vault-dir', vault],
       ['preview', '--vault', vault],
@@ -321,6 +323,30 @@ describe('me-update preview CLI', () => {
       });
       expect(exitCodeForUpdateResult(result)).toBe(2);
     }
+  });
+
+  test('applies only the exact lowercase preview digest', () => {
+    const vault = makeVault();
+    const runtimeBase = path.join(path.dirname(vault), 'runtime');
+    const environment = { ME_RUNTIME_ROOT: runtimeBase };
+    const preview = runUpdateCli(
+      ['preview', '--vault-dir', vault],
+      options({ environment }),
+    );
+    const result = runUpdateCli([
+      'apply',
+      '--vault-dir',
+      vault,
+      '--expected-plan-digest',
+      preview.planDigest!,
+    ], options({ environment }));
+
+    expect(result.status).toBe('committed');
+    expect(result.changedPaths.at(-1)).toBe('.me/config.yaml');
+    expect(runUpdateCli(
+      ['preview', '--vault-dir', vault],
+      options({ environment }),
+    ).status).toBe('up_to_date');
   });
 
   test('maps validation, conflict, recovery, compatibility, and fatal failures to stable exits', () => {

@@ -13,6 +13,7 @@ import {
   type UpdateResultV1,
 } from './update/contracts.ts';
 import { planVaultUpdate } from './update/planner.ts';
+import { executeVaultUpdate } from './update/transaction.ts';
 import { RuntimePathError } from './runtime-paths.ts';
 
 interface PreviewArguments {
@@ -20,11 +21,18 @@ interface PreviewArguments {
   vaultDir: string;
 }
 
+interface ApplyArguments {
+  mode: 'apply';
+  vaultDir: string;
+  expectedPlanDigest: string;
+}
+
 export interface UpdateCliOptions {
   pluginRoot?: string;
   environment?: NodeJS.ProcessEnv;
   operationIdFactory?: () => string;
   planUpdate?: typeof planVaultUpdate;
+  executeUpdate?: typeof executeVaultUpdate;
   signal?: AbortSignal;
 }
 
@@ -37,17 +45,34 @@ function safeOperationId(value: unknown): value is string {
     && PUBLIC_OPERATION_ID.test(value);
 }
 
-function parseArguments(argv: readonly string[]): PreviewArguments {
+function parseArguments(
+  argv: readonly string[],
+): PreviewArguments | ApplyArguments {
   if (
-    argv.length !== 3
-    || argv[0] !== 'preview'
-    || argv[1] !== '--vault-dir'
-    || !argv[2]
-    || argv[2].startsWith('--')
+    argv.length === 3
+    && argv[0] === 'preview'
+    && argv[1] === '--vault-dir'
+    && argv[2]
+    && !argv[2].startsWith('--')
   ) {
-    throw new UpdateError('INVALID_REQUEST');
+    return { mode: 'preview', vaultDir: argv[2] };
   }
-  return { mode: 'preview', vaultDir: argv[2] };
+  if (
+    argv.length === 5
+    && argv[0] === 'apply'
+    && argv[1] === '--vault-dir'
+    && argv[2]
+    && !argv[2].startsWith('--')
+    && argv[3] === '--expected-plan-digest'
+    && /^[a-f0-9]{64}$/.test(argv[4] ?? '')
+  ) {
+    return {
+      mode: 'apply',
+      vaultDir: argv[2],
+      expectedPlanDigest: argv[4],
+    };
+  }
+  throw new UpdateError('INVALID_REQUEST');
 }
 
 function emptyResult(
@@ -143,6 +168,19 @@ export function runUpdateCli(
     if (options.signal?.aborted) throw new UpdateError('INVALID_REQUEST');
 
     const pluginRoot = options.pluginRoot ?? path.resolve(__dirname, '..');
+    if (args.mode === 'apply') {
+      const execute = options.executeUpdate ?? executeVaultUpdate;
+      return sanitizePublicUpdateResult(execute(
+        args.vaultDir,
+        args.expectedPlanDigest,
+        {
+          pluginRoot,
+          environment: options.environment,
+          operationIdFactory: () => operationId,
+          signal: options.signal,
+        },
+      ));
+    }
     const planner = options.planUpdate ?? planVaultUpdate;
     const plan = planner({
       vaultDir: args.vaultDir,
@@ -159,7 +197,11 @@ export function runUpdateCli(
 }
 
 export function exitCodeForUpdateResult(result: UpdateResultV1): number {
-  if (result.status === 'preview' || result.status === 'up_to_date') return 0;
+  if (
+    result.status === 'preview'
+    || result.status === 'up_to_date'
+    || result.status === 'committed'
+  ) return 0;
   const code = result.error?.code;
   return code && UPDATE_ERROR_CATALOG[code]
     ? UPDATE_ERROR_CATALOG[code].exitCode
