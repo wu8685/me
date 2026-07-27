@@ -3919,8 +3919,8 @@ test_setup_skill_no_bin_reference() {
   fi
 }
 
-test_setup_smart_merge_instructions() {
-  # Quick 260406-wx4: Setup should smart-merge CLAUDE.md on version upgrade
+test_setup_agent_templates_and_merge_rules() {
+  # ME Agent templates use explicit ownership markers and preserve user bytes.
   local skill_dir="$PLUGIN_ROOT/skills/setup"
   local f="$skill_dir/SKILL.md"
   local merge_ref="$skill_dir/references/merge-rules.md"
@@ -3931,21 +3931,35 @@ test_setup_smart_merge_instructions() {
     return 1
   fi
 
-  # Should mention smart merge in SKILL.md or reference file
-  if ! grep -rqi "smart.merge\|intelligent merge" "$f" "$merge_ref" 2>/dev/null; then
-    echo -e "    ${RED}FAIL${NC}: setup skill missing smart merge instructions"
+  if ! grep -rqi "managed marker\\|ownership marker" "$f" "$merge_ref" 2>/dev/null; then
+    echo -e "    ${RED}FAIL${NC}: setup skill missing managed marker instructions"
     return 1
   fi
 
-  # Should mention preserving user-added sections (in SKILL.md or merge-rules ref)
-  if ! grep -rqi "user-added\|PRESERVE\|preserv" "$f" "$merge_ref" 2>/dev/null; then
+  if ! grep -rqi "PRESERVE\\|preserv" "$f" "$merge_ref" 2>/dev/null; then
     echo -e "    ${RED}FAIL${NC}: setup skill missing instruction to preserve user customizations"
     return 1
   fi
 
-  # Should list template-owned sections (in SKILL.md or merge-rules ref)
-  if ! grep -rqi "template-owned\|Template-owned" "$f" "$merge_ref" 2>/dev/null; then
-    echo -e "    ${RED}FAIL${NC}: setup skill missing template-owned sections list"
+  for template in CLAUDE-template.md AGENTS-template.md; do
+    if [ ! -f "$PLUGIN_ROOT/templates/$template" ]; then
+      echo -e "    ${RED}FAIL${NC}: missing Agent template $template"
+      return 1
+    fi
+    if ! grep -q '<!-- me:managed:start knowledge-base -->' "$PLUGIN_ROOT/templates/$template"; then
+      echo -e "    ${RED}FAIL${NC}: $template missing ME ownership markers"
+      return 1
+    fi
+  done
+
+  if ! grep -Fq '/me:setup' "$PLUGIN_ROOT/templates/CLAUDE-template.md" \
+    || grep -Fq '$me:setup' "$PLUGIN_ROOT/templates/CLAUDE-template.md"; then
+    echo -e "    ${RED}FAIL${NC}: Claude template must use /me:* commands"
+    return 1
+  fi
+  if ! grep -Fq '$me:setup' "$PLUGIN_ROOT/templates/AGENTS-template.md" \
+    || grep -Fq '/me:setup' "$PLUGIN_ROOT/templates/AGENTS-template.md"; then
+    echo -e "    ${RED}FAIL${NC}: Codex template must use \$me:* commands"
     return 1
   fi
 
@@ -5320,7 +5334,7 @@ main() {
     run_test test_skills_reference_bin_executables
     run_test test_skills_follow_ingest_pattern
     run_test test_setup_skill_no_bin_reference
-    run_test test_setup_smart_merge_instructions
+    run_test test_setup_agent_templates_and_merge_rules
     run_test test_skill_files_under_500_lines
 
     # Phase 4 Plan 01: Search CLI
