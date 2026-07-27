@@ -297,6 +297,37 @@ describe('update contracts', () => {
     expect(serialized).toContain('https://example.test/redirect?next=');
   });
 
+  test('recognizes nested file URI delimiters without matching composite schemes', () => {
+    const privatePath = [
+      '',
+      'Users',
+      'alice',
+      'vault',
+      'secret.json',
+    ].join('/');
+    const unsafe = [
+      `https://example.test/?next=/file://${privatePath}&keep=public`,
+      `/path/file://${privatePath}`,
+      `prefix:file://${privatePath}`,
+    ];
+    const safeSchemes = [
+      'x-file://example.test/resource',
+      'my.file://example.test/resource',
+      'git+file://example.test/resource',
+    ];
+    const serialized = serializeUpdateResult(result({
+      warnings: [...unsafe, ...safeSchemes],
+    }));
+    const warnings = JSON.parse(serialized).warnings as string[];
+
+    for (const warning of warnings.slice(0, unsafe.length)) {
+      expect(warning).not.toContain(privatePath);
+      expect(warning).toContain('<ABSOLUTE_PATH>');
+    }
+    expect(warnings.slice(unsafe.length)).toEqual(safeSchemes);
+    expect(serialized).not.toContain(privatePath);
+  });
+
   test('preserves only explicit ME slash-command grammar while redacting paths', () => {
     const privatePath = [
       '',

@@ -174,7 +174,7 @@ const PATH_TOKEN_END = String.raw`\s,;)}\]"'<>\uE000\uE001`;
 const FILE_URI_TOKEN_END = `${PATH_TOKEN_END}&?#`;
 const ABSOLUTE_PATH_PATTERNS = [
   new RegExp(
-    String.raw`(?<![A-Za-z0-9_:/\\])file:[\\/]{1,3}[^${PATH_TOKEN_END}]+`,
+    String.raw`(?<![A-Za-z0-9+.-])file:[\\/]{1,3}[^${PATH_TOKEN_END}]+`,
     'gi',
   ),
   new RegExp(
@@ -231,7 +231,7 @@ function redactAbsolutePaths(value: string): string {
   // Redact them before protecting ordinary URI tokens.
   let protectedValue = value.replace(
     new RegExp(
-      String.raw`(?<![A-Za-z0-9_:/\\])file:[\\/]{1,3}[^${FILE_URI_TOKEN_END}]+`,
+      String.raw`(?<![A-Za-z0-9+.-])file:[\\/]{1,3}[^${FILE_URI_TOKEN_END}]+`,
       'gi',
     ),
     '<ABSOLUTE_PATH>',
