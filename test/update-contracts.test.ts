@@ -248,4 +248,31 @@ describe('update contracts', () => {
     for (const uri of uris) expect(serialized).toContain(uri);
     expect(serialized).not.toContain('<ABSOLUTE_PATH>');
   });
+
+  test('redacts slash-form Windows drive paths that resemble URI schemes', () => {
+    const doubleSlash = 'C://runtime/transactions/double-slash.json';
+    const tripleSlash = 'C:///runtime/transactions/triple-slash.json';
+    const serialized = serializeUpdateResult(result({
+      warnings: [
+        `bare-double=${doubleSlash}`,
+        `bare-triple=${tripleSlash}`,
+        `quoted-double="${doubleSlash}"`,
+        `quoted-triple='${tripleSlash}'`,
+        `angle-double=<${doubleSlash}>`,
+        `angle-triple=<${tripleSlash}>`,
+      ],
+    }));
+    const warnings = JSON.parse(serialized).warnings;
+
+    expect(warnings).toEqual([
+      'bare-double=<ABSOLUTE_PATH>',
+      'bare-triple=<ABSOLUTE_PATH>',
+      'quoted-double="<ABSOLUTE_PATH>"',
+      "quoted-triple='<ABSOLUTE_PATH>'",
+      'angle-double=<ABSOLUTE_PATH>',
+      'angle-triple=<ABSOLUTE_PATH>',
+    ]);
+    expect(serialized).not.toContain(doubleSlash);
+    expect(serialized).not.toContain(tripleSlash);
+  });
 });

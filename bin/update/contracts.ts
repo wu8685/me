@@ -250,7 +250,7 @@ function redactAbsolutePaths(value: string): string {
   );
   protectedValue = protect(
     protectedValue,
-    /\b(?!file:)[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s,;)}\]"'<>]+/gi,
+    /\b(?!file:)(?![A-Za-z]:[\\/])[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s,;)}\]"'<>]+/gi,
   );
   protectedValue = protect(
     protectedValue,
