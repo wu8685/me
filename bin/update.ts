@@ -13,7 +13,10 @@ import {
   type UpdateResultV1,
 } from './update/contracts.ts';
 import { planVaultUpdate } from './update/planner.ts';
-import { executeVaultUpdate } from './update/transaction.ts';
+import {
+  executeVaultUpdate,
+  inspectVaultUpdateRecovery,
+} from './update/transaction.ts';
 import { RuntimePathError } from './runtime-paths.ts';
 
 interface PreviewArguments {
@@ -98,6 +101,8 @@ function emptyResult(
     warnings: [],
     conflicts: [],
     recoveryState,
+    recoveryActions: [],
+    preservedPaths: [],
     error: { code, message: definition.message },
   };
 }
@@ -120,6 +125,8 @@ function previewResult(
     warnings: [...plan.warnings],
     conflicts: plan.conflicts.map(conflict => ({ ...conflict })),
     recoveryState: 'none',
+    recoveryActions: [],
+    preservedPaths: [],
   };
   if (plan.status === 'blocked') {
     const definition = UPDATE_ERROR_CATALOG.MIGRATION_CONFLICT;
@@ -180,6 +187,16 @@ export function runUpdateCli(
           signal: options.signal,
         },
       ));
+    }
+    const recovery = inspectVaultUpdateRecovery(
+      args.vaultDir,
+      options.environment,
+    );
+    if (recovery) {
+      const result = emptyResult(operationId, recovery.code);
+      result.recoveryActions = recovery.actions;
+      result.preservedPaths = recovery.preservedPaths;
+      return sanitizePublicUpdateResult(result);
     }
     const planner = options.planUpdate ?? planVaultUpdate;
     const plan = planner({

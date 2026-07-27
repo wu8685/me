@@ -19,6 +19,7 @@ function migration(
       configEdits: [],
       managedAssets: [],
       contentTransforms: [],
+      mutations: [],
     }),
   };
 }

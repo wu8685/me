@@ -103,6 +103,10 @@ warnings, conflicts, and recovery state/actions without inventing success.
   again and obtain a new explicit confirmation.
 - `rolled_back` means no migration may be reported as committed.
 - `recovery_required` / `manual` means stop and present every returned recovery
-  action and preserved path. Do not retry or edit recovery material directly.
+  action from `recoveryActions` and every safe vault-relative or
+  `<ME_RUNTIME>/...` entry from `preservedPaths`. Do not retry or edit recovery
+  material directly. A later preview performs the same read-only startup
+  inspection and must continue to report recovery until the residue is
+  resolved; never reinterpret it as `up_to_date`.
 - Any other error is reported from the structured result; do not fall back to
   direct file edits.

@@ -24,6 +24,8 @@ function result(overrides: Partial<UpdateResultV1> = {}): UpdateResultV1 {
     warnings: [],
     conflicts: [],
     recoveryState: 'none',
+    recoveryActions: [],
+    preservedPaths: [],
     ...overrides,
   };
 }
@@ -148,6 +150,35 @@ describe('update contracts', () => {
       status: 'preview',
       plannedPaths: ['.me/config.yaml'],
     });
+  });
+
+  test('sanitizes structured recovery actions and preserved paths', () => {
+    const privatePath = path.join(
+      path.parse(process.cwd()).root,
+      'private',
+      'runtime',
+      'journal.json',
+    );
+    const sanitized = sanitizePublicUpdateResult(result({
+      status: 'recovery_required',
+      recoveryState: 'manual',
+      recoveryActions: [{
+        kind: 'inspect',
+        path: privatePath,
+        description: `Inspect ${privatePath}`,
+      }],
+      preservedPaths: [privatePath, '<ME_RUNTIME>/transactions/op'],
+    }));
+
+    expect(sanitized.recoveryActions[0]).toEqual({
+      kind: 'inspect',
+      path: '<ABSOLUTE_PATH>',
+      description: 'Inspect <ABSOLUTE_PATH>',
+    });
+    expect(sanitized.preservedPaths).toEqual([
+      '<ABSOLUTE_PATH>',
+      '<ME_RUNTIME>/transactions/op',
+    ]);
   });
 
   test('redacts cross-platform, file URL, UNC, and punctuation-adjacent paths', () => {

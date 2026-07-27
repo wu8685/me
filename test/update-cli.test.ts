@@ -149,6 +149,8 @@ function publicFailure(
       : UPDATE_ERROR_CATALOG[code].status === 'recovery_required'
         ? 'manual'
         : 'none',
+    recoveryActions: [],
+    preservedPaths: [],
     error: {
       code,
       message: UPDATE_ERROR_CATALOG[code].message,
@@ -190,6 +192,8 @@ describe('me-update preview CLI', () => {
       warnings: [],
       conflicts: [],
       recoveryState: 'none',
+      recoveryActions: [],
+      preservedPaths: [],
     });
     expect(Object.keys(result).sort()).toEqual([
       'changedPaths',
@@ -200,6 +204,8 @@ describe('me-update preview CLI', () => {
       'operationId',
       'planDigest',
       'plannedPaths',
+      'preservedPaths',
+      'recoveryActions',
       'recoveryState',
       'status',
       'targetVaultSchemaVersion',
@@ -251,10 +257,43 @@ describe('me-update preview CLI', () => {
       warnings: [],
       conflicts: [],
       recoveryState: 'none',
+      recoveryActions: [],
+      preservedPaths: [],
     });
     expect(second).toEqual({ ...first, operationId: operationIds[1] });
     expect(calls).toBe(2);
     expect(exitCodeForUpdateResult(first)).toBe(0);
+  });
+
+  test('preview detects preserved recovery state without creating or changing runtime files', () => {
+    const vault = makeVault();
+    const runtimeBase = temporaryDirectory('me-update-recovery-runtime-');
+    const environment = { ME_RUNTIME_ROOT: runtimeBase };
+    const layout = resolveRuntimeLayout(vault, environment);
+    const operation = path.join(
+      layout.transactionDir,
+      'me-update-00000000-0000-4000-8000-000000000099',
+    );
+    fs.mkdirSync(operation, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(operation, 'journal.json'), '{"state":"mutating"}\n', {
+      mode: 0o600,
+    });
+    const before = manifest(runtimeBase);
+
+    const result = runUpdateCli(
+      ['preview', '--vault-dir', vault],
+      options({ environment }),
+    );
+
+    expect(result.status).toBe('recovery_required');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(result.recoveryActions).toEqual([{
+      kind: 'inspect',
+      path: '<ME_RUNTIME>/transactions',
+      description: 'Inspect the preserved update journal and owned artifacts before retrying.',
+    }]);
+    expect(result.preservedPaths).toEqual(['<ME_RUNTIME>/transactions']);
+    expect(manifest(runtimeBase)).toEqual(before);
   });
 
   test('returns blocked conflicts with public paths, reasons, and safe diffs', () => {
@@ -316,6 +355,8 @@ describe('me-update preview CLI', () => {
         warnings: [],
         conflicts: [],
         recoveryState: 'none',
+        recoveryActions: [],
+        preservedPaths: [],
         error: {
           code: 'INVALID_REQUEST',
           message: UPDATE_ERROR_CATALOG.INVALID_REQUEST.message,

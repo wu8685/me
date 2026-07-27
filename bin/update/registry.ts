@@ -1,6 +1,7 @@
 import type { ConfigEdit } from './config-document.ts';
 import { UpdateError } from './contracts.ts';
 import type { ManagedAssetIntent } from './managed-assets.ts';
+import type { PlannedMutation } from '../mutation/contracts.ts';
 import { migration0000To0001 } from './migrations/0000-to-0001.ts';
 
 export interface ReadonlyMigrationContext {
@@ -14,10 +15,25 @@ export interface ContentTransformIntent {
   transform(vaultRelativePath: string, currentBytes: Buffer): Buffer;
 }
 
+/**
+ * Registry declarations are projections of the shared mutation contract.
+ * The planner supplies fingerprints and publication order from the vault view.
+ */
+export type MigrationMutation =
+  | Pick<
+      Extract<PlannedMutation, { kind: 'mkdir' }>,
+      'kind' | 'vaultRelativePath' | 'desiredMode'
+    >
+  | Pick<
+      Extract<PlannedMutation, { kind: 'rename' }>,
+      'kind' | 'vaultRelativePath' | 'destinationVaultRelativePath'
+    >;
+
 export interface MigrationIntent {
   configEdits: readonly ConfigEdit[];
   managedAssets: readonly ManagedAssetIntent[];
   contentTransforms: readonly ContentTransformIntent[];
+  mutations: readonly MigrationMutation[];
 }
 
 export interface VaultMigration {

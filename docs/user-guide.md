@@ -85,7 +85,10 @@ vault 通过 `.me/config.yaml` 的 `vault_schema_version` 记录 managed schema�
 并再次确认。
 
 发生未完成事务或 `recovery_required` 时，停止更新并按结构化结果列出的
-preserved paths 与 actions 检查恢复材料。不要直接编辑 migration targets
+`preservedPaths` 与 `recoveryActions` 检查恢复材料。这些路径只会是 vault
+相对路径或 `<ME_RUNTIME>/...` 显示路径，不暴露本机绝对路径。后续 preview
+也会以零写入方式先检查 recovery residue；未处理前会继续返回
+`recovery_required`，不会误报 `up_to_date`。不要直接编辑 migration targets
 或 recovery state。只有 `committed` 表示迁移成功；ME 不会 stage、commit
 或 push 用户的 vault。
 

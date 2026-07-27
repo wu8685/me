@@ -27,6 +27,18 @@ const MANAGED_FILES = new Set([
   'AGENTS.md',
   '.gitignore',
 ]);
+const RESERVED_ROOTS = new Set([
+  '.agents',
+  '.claude',
+  '.codex',
+  '.git',
+  '.github',
+  '.gitlab',
+  '.me',
+  '.me-runtime',
+  '.obsidian',
+  '.vscode',
+]);
 
 function fail(code: 'INVALID_REQUEST' | 'MIGRATION_CONFLICT' | 'UNSAFE_PATH'): never {
   throw new UpdateError(code);
@@ -56,6 +68,64 @@ function canonicalDirectory(candidate: string): string {
     if (error instanceof UpdateError) throw error;
     return fail('UNSAFE_PATH');
   }
+}
+
+function overlaps(first: string, second: string): boolean {
+  return first === second
+    || first.startsWith(`${second}/`)
+    || second.startsWith(`${first}/`);
+}
+
+function effectivePermissionBits(entry: fs.Stats): number {
+  const uid = typeof process.geteuid === 'function' ? process.geteuid() : -1;
+  const gid = typeof process.getegid === 'function' ? process.getegid() : -1;
+  const groups = typeof process.getgroups === 'function' ? process.getgroups() : [];
+  if (uid >= 0 && entry.uid === uid) return (entry.mode >> 6) & 0o7;
+  if (gid >= 0 && (entry.gid === gid || groups.includes(entry.gid))) {
+    return (entry.mode >> 3) & 0o7;
+  }
+  return entry.mode & 0o7;
+}
+
+/**
+ * A read-only, fail-closed write-feasibility check. accessSync alone is not
+ * sufficient because privileged test/process users can bypass 0555 mode bits.
+ * ACL denial is still caught by accessSync for ordinary users; an ACL grant
+ * never overrides the conservative POSIX ownership/mode decision here.
+ */
+function assertWritableDirectory(candidate: string): void {
+  let entry: fs.Stats;
+  try {
+    entry = fs.lstatSync(candidate);
+    if (!entry.isDirectory() || entry.isSymbolicLink()) fail('UNSAFE_PATH');
+    if ((effectivePermissionBits(entry) & 0o3) !== 0o3) fail('UNSAFE_PATH');
+    fs.accessSync(candidate, fs.constants.W_OK | fs.constants.X_OK);
+  } catch (error) {
+    if (error instanceof UpdateError) throw error;
+    fail('UNSAFE_PATH');
+  }
+}
+
+function assertMutationParentWritable(
+  root: string,
+  relativePath: string,
+): void {
+  const components = relativePath.split('/');
+  let current = root;
+  let nearestExisting = root;
+  for (let index = 0; index < components.length - 1; index += 1) {
+    current = path.join(current, components[index]);
+    try {
+      const entry = fs.lstatSync(current);
+      if (!entry.isDirectory() || entry.isSymbolicLink()) fail('UNSAFE_PATH');
+      nearestExisting = current;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') break;
+      if (error instanceof UpdateError) throw error;
+      fail('UNSAFE_PATH');
+    }
+  }
+  assertWritableDirectory(nearestExisting);
 }
 
 function inspectPath(
@@ -206,13 +276,25 @@ export function preflightFreshSetup(
 
   const vault = canonicalDirectory(options.vaultDir);
   const plugin = canonicalDirectory(options.pluginRoot);
+  try {
+    if (fs.readdirSync(vault).some(name => name.startsWith('.me-setup-'))) {
+      fail('MIGRATION_CONFLICT');
+    }
+  } catch (error) {
+    if (error instanceof UpdateError) throw error;
+    fail('UNSAFE_PATH');
+  }
   const layerDirectories = [...options.layerDirectories];
   if (
     layerDirectories.some(layer => !safeRelativePath(layer))
     || new Set(layerDirectories).size !== layerDirectories.length
+    || layerDirectories.some((layer, index) => (
+      layerDirectories.some((other, otherIndex) => (
+        index !== otherIndex && overlaps(layer, other)
+      ))
+    ))
     || layerDirectories.some(layer => (
-      layer === '.me'
-      || layer.startsWith('.me/')
+      RESERVED_ROOTS.has(layer.split('/')[0])
       || MANAGED_FILES.has(layer)
       || [...MANAGED_FILES].some(file => file.startsWith(`${layer}/`))
       || [...MANAGED_FILES].some(file => layer.startsWith(`${file}/`))
@@ -221,18 +303,27 @@ export function preflightFreshSetup(
 
   inspectPath(vault, '.me', 'directory');
   assertMissing(vault, '.me/config.yaml');
+  assertWritableDirectory(vault);
+  assertMutationParentWritable(vault, '.me/config.yaml');
 
   const plannedPaths = new Set<string>(['.me/config.yaml']);
   for (const layer of layerDirectories) {
-    inspectPath(vault, layer, 'directory');
-    inspectPath(vault, `${layer}/.gitkeep`, 'file');
+    const layerState = inspectPath(vault, layer, 'directory');
+    const keepState = inspectPath(vault, `${layer}/.gitkeep`, 'file');
+    if (layerState === 'missing') assertMutationParentWritable(vault, layer);
+    if (keepState === 'missing') {
+      assertMutationParentWritable(vault, `${layer}/.gitkeep`);
+    }
     plannedPaths.add(layer);
     plannedPaths.add(`${layer}/.gitkeep`);
   }
 
   for (const asset of ['SCHEMA.md', 'CLAUDE.md', 'AGENTS.md'] as const) {
     const mutation = planManagedAsset(vault, plugin, assetIntent(asset));
-    if (mutation) plannedPaths.add(asset);
+    if (mutation) {
+      assertMutationParentWritable(vault, asset);
+      plannedPaths.add(asset);
+    }
   }
 
   const snippetEntries = countEffectiveObsidianEntries(
@@ -243,6 +334,7 @@ export function preflightFreshSetup(
 
   const gitignore = inspectPath(vault, '.gitignore', 'file');
   if (gitignore === 'missing') {
+    assertMutationParentWritable(vault, '.gitignore');
     plannedPaths.add('.gitignore');
   } else {
     const effectiveEntries = countEffectiveObsidianEntries(
@@ -250,7 +342,10 @@ export function preflightFreshSetup(
       'MIGRATION_CONFLICT',
     );
     if (effectiveEntries > 1) fail('MIGRATION_CONFLICT');
-    if (effectiveEntries === 0) plannedPaths.add('.gitignore');
+    if (effectiveEntries === 0) {
+      assertMutationParentWritable(vault, '.gitignore');
+      plannedPaths.add('.gitignore');
+    }
   }
 
   return {

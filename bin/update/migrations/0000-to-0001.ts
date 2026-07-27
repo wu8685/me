@@ -43,6 +43,7 @@ const legacyMigration: VaultMigration = {
       },
     ],
     contentTransforms: [],
+    mutations: [],
   }),
 };
 

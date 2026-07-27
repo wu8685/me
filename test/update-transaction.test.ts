@@ -10,7 +10,10 @@ import {
 import { MutationFailure } from '../bin/mutation/contracts.ts';
 import { resolveRuntimeLayout } from '../bin/runtime-paths.ts';
 import { planVaultUpdate } from '../bin/update/planner.ts';
-import { executeVaultUpdate } from '../bin/update/transaction.ts';
+import {
+  executeVaultUpdate,
+  inspectVaultUpdateRecovery,
+} from '../bin/update/transaction.ts';
 
 const pluginRoot = path.resolve(import.meta.dir, '..');
 const temporaryDirectories: string[] = [];
@@ -216,7 +219,7 @@ describe('me-update transaction', () => {
     expect(retry.status).toBe('committed');
   });
 
-  test('preserves a journal and requires recovery after post-success ownership loss', () => {
+  test('uses a returned ownership proof to roll back a post-success publication error', () => {
     const { vault, environment } = makeVault();
     const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
     let injected = false;
@@ -238,37 +241,63 @@ describe('me-update transaction', () => {
       },
     });
 
-    expect(result.status).toBe('recovery_required');
-    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(result.status).toBe('rolled_back');
+    expect(result.error?.code).toBe('VALIDATION_FAILED');
     expect(configVersion(vault)).toBeUndefined();
-    expect(result.warnings.some(item => (
-      item.startsWith('<ME_RUNTIME>/transactions/me-update-')
-    ))).toBeTrue();
+    expect(result.recoveryState).toBe('rolled_back');
     expect(JSON.stringify(result)).not.toContain(environment.ME_RUNTIME_ROOT!);
 
     const layout = resolveRuntimeLayout(vault, environment);
     const operation = fs.readdirSync(layout.transactionDir)
       .find(name => name.startsWith('me-update-'));
-    expect(operation).toBeDefined();
-    const journalPath = path.join(
-      layout.transactionDir,
-      operation!,
-      'journal.json',
-    );
-    const journalBytes = fs.readFileSync(journalPath, 'utf8');
-    const journal = JSON.parse(journalBytes) as Record<string, unknown>;
-    expect(journal).toMatchObject({
-      version: 1,
-      state: 'recovery-required',
-      planDigest: preview.planDigest,
-      sourceVaultSchemaVersion: 0,
-      targetVaultSchemaVersion: 1,
-      migrationIds: ['0000-to-0001'],
+    expect(operation).toBeUndefined();
+  });
+
+  test('rolls config back when publication succeeds but its directory fsync is ambiguous', () => {
+    const { vault, environment } = makeVault();
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    const canonicalVault = fs.realpathSync(vault);
+    let configPublished = false;
+    const result = executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+      atomicHooks: {
+        afterAtomicMutation(kind, phase, paths) {
+          if (
+            kind === 'link'
+            && phase === 'publish'
+            && paths.some(candidate => candidate.endsWith('.me/config.yaml'))
+          ) configPublished = true;
+        },
+      },
+      directoryFsync(directory) {
+        if (configPublished && directory === path.join(canonicalVault, '.me')) {
+          throw Object.assign(new Error('durability ambiguous'), { code: 'EIO' });
+        }
+        const descriptor = fs.openSync(directory, fs.constants.O_RDONLY);
+        try {
+          fs.fsyncSync(descriptor);
+        } finally {
+          fs.closeSync(descriptor);
+        }
+      },
     });
-    expect(journalBytes).not.toContain('desiredBytes');
-    expect(journalBytes).not.toContain('keep this user comment');
-    expect(fs.statSync(journalPath).mode & 0o777).toBe(0o600);
-    expect(fs.statSync(path.dirname(journalPath)).mode & 0o777).toBe(0o700);
+
+    expect(configPublished).toBeTrue();
+    expect(result.status).toBe('recovery_required');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    expect(fs.existsSync(path.join(vault, '.me/config.yaml'))
+      ? configVersion(vault)
+      : undefined).toBeUndefined();
+    expect(result.changedPaths).toContain('AGENTS.md');
+    expect(result.changedPaths).toContain('CLAUDE.md');
+    expect(result.recoveryActions[0]?.path)
+      .toStartWith('<ME_RUNTIME>/transactions/me-update-');
+    expect(result.preservedPaths.some(candidate => (
+      candidate.startsWith('<ME_RUNTIME>/transactions/me-update-')
+    ))).toBeTrue();
+    expect(inspectVaultUpdateRecovery(vault, environment)?.code)
+      .toBe('RECOVERY_REQUIRED');
   });
 
   test('fails safely before each vault mutation boundary and can retry immediately', () => {
@@ -308,6 +337,33 @@ describe('me-update transaction', () => {
       });
       expect(retry.status).toBe('committed');
     }
+  });
+
+  test('preserves an explicit failure code after an exact rollback', () => {
+    const { vault, environment } = makeVault();
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    const canonicalVault = fs.realpathSync(vault);
+    let vaultBoundaries = 0;
+    const result = executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+      hooks: {
+        beforeMutation(_kind, paths) {
+          if (!paths.some(candidate => (
+            candidate === canonicalVault
+            || candidate.startsWith(`${canonicalVault}${path.sep}`)
+          ))) return;
+          vaultBoundaries += 1;
+          if (vaultBoundaries === 2) {
+            throw new MutationFailure('UNSUPPORTED_FILESYSTEM');
+          }
+        },
+      },
+    });
+
+    expect(result.status).toBe('rolled_back');
+    expect(result.error?.code).toBe('UNSUPPORTED_FILESYSTEM');
+    expect(configVersion(vault)).toBeUndefined();
   });
 
   test('blocks non-empty legacy vault-local runtime state without applying', () => {

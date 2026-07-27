@@ -363,17 +363,16 @@ function quarantineAndRemoveOwnedLock(
       return false;
     }
 
-    try {
-      operations.unlinkSync(quarantinePath);
-    } catch {
-      return reconcileActualState() === 'removed';
-    }
     /*
-     * Do not trust a successful wrapper return either. Derive the namespace
-     * state after every mutation so post-success wrapper behavior cannot make
-     * stale booleans authoritative.
+     * Never unlink the quarantine name. POSIX has no conditional unlink by
+     * inode, so an ownership check followed by unlink(path) would reintroduce
+     * a TOCTOU window in which a foreign replacement could be deleted. The
+     * private 0600 inode is retained as a harmless release tombstone, exactly
+     * like mutation retirement artifacts. Releasing the public vault.lock
+     * namespace is the only operation required for lock progress.
      */
-    return reconcileActualState() === 'removed';
+    const sourceState = inspect(lockPath);
+    return sourceState === 'missing' || sourceState === 'replacement';
   } catch {
     return reconcileActualState() === 'removed';
   } finally {

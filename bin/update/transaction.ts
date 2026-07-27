@@ -311,6 +311,8 @@ function emptyResult(
       : definition.status === 'recovery_required'
         ? 'manual'
         : 'none',
+    recoveryActions: [],
+    preservedPaths: [],
     error: { code, message: definition.message },
   };
 }
@@ -324,6 +326,8 @@ function resultFromPlan(
     changedPaths?: string[];
     warnings?: string[];
     recoveryState?: UpdateResultV1['recoveryState'];
+    recoveryActions?: UpdateResultV1['recoveryActions'];
+    preservedPaths?: string[];
   } = {},
 ): UpdateResultV1 {
   const result: UpdateResultV1 = {
@@ -340,6 +344,8 @@ function resultFromPlan(
     warnings: [...plan.warnings, ...(options.warnings ?? [])],
     conflicts: plan.conflicts.map(item => ({ ...item })),
     recoveryState: options.recoveryState ?? 'none',
+    recoveryActions: [...(options.recoveryActions ?? [])],
+    preservedPaths: [...(options.preservedPaths ?? [])],
   };
   if (options.code) {
     result.error = {
@@ -975,6 +981,42 @@ function hasIncompleteRuntimeOperation(layout: RuntimeLayout): boolean {
   return false;
 }
 
+/**
+ * Read-only startup inspection shared by preview and apply. It intentionally
+ * does not bootstrap runtime directories, acquire a lock, or create staging.
+ */
+export function inspectVaultUpdateRecovery(
+  vaultDir: string,
+  environment?: NodeJS.ProcessEnv,
+): {
+  code: Extract<UpdateErrorCode, 'LEGACY_RUNTIME_STATE' | 'RECOVERY_REQUIRED'>;
+  actions: UpdateResultV1['recoveryActions'];
+  preservedPaths: string[];
+} | undefined {
+  const layout = resolveRuntimeLayout(vaultDir, environment);
+  if (legacyRuntimeState(layout)) {
+    return {
+      code: 'LEGACY_RUNTIME_STATE',
+      actions: [{
+        kind: 'inspect',
+        path: '.me',
+        description: 'Inspect legacy vault-local locks and temporary state before updating.',
+      }],
+      preservedPaths: ['.me/locks', '.me/tmp'],
+    };
+  }
+  if (!hasIncompleteRuntimeOperation(layout)) return undefined;
+  return {
+    code: 'RECOVERY_REQUIRED',
+    actions: [{
+      kind: 'inspect',
+      path: '<ME_RUNTIME>/transactions',
+      description: 'Inspect the preserved update journal and owned artifacts before retrying.',
+    }],
+    preservedPaths: ['<ME_RUNTIME>/transactions'],
+  };
+}
+
 function journalMutation(
   mutation: PlannedMutation,
 ): UpdateJournalV1['mutations'][number] {
@@ -1468,6 +1510,42 @@ function applyMutation(
   );
 }
 
+function recordAppliedMutationOutcome(
+  tx: UpdateTransaction,
+  mutation: PlannedMutation,
+  error: unknown,
+): boolean {
+  if (!(error instanceof MutationFailure) || !error.applied) return false;
+  const outcome = error.applied;
+  if (outcome.kind === 'mkdir') {
+    tx.createdVaultDirectories.set(
+      mutation.publishOrder,
+      outcome.ownedDirectory,
+    );
+    if (isInside(tx.layout.canonicalVault, outcome.ownedDirectory.path)) {
+      tx.vaultMutationOccurred = true;
+    }
+    return true;
+  }
+
+  const owned = outcome.ownedFile;
+  if (mutation.kind === 'write-file') {
+    if (isInside(tx.layout.canonicalVault, owned.path)) {
+      tx.published.set(mutation.publishOrder, owned);
+      tx.vaultMutationOccurred = true;
+      return true;
+    }
+    tx.originals.set(mutation.publishOrder, owned);
+    // A completed preserve-rename removed the original vault path even though
+    // the returned owned inode now lives below <ME_RUNTIME>.
+    tx.vaultMutationOccurred = true;
+    return true;
+  }
+  tx.published.set(mutation.publishOrder, owned);
+  tx.vaultMutationOccurred = true;
+  return true;
+}
+
 function validatePostconditions(
   tx: UpdateTransaction,
   plan: UpdatePlan,
@@ -1786,8 +1864,15 @@ export function executeVaultUpdate(
   try {
     layout = resolveRuntimeLayout(vaultDir, options.environment);
     if (legacyRuntimeState(layout)) {
+      const result = emptyResult(id, 'LEGACY_RUNTIME_STATE');
+      result.recoveryActions = [{
+        kind: 'inspect',
+        path: '.me',
+        description: 'Inspect legacy vault-local locks and temporary state before updating.',
+      }];
+      result.preservedPaths = ['.me/locks', '.me/tmp'];
       return sanitizePublicUpdateResult(
-        emptyResult(id, 'LEGACY_RUNTIME_STATE'),
+        result,
       );
     }
     bootstrapRuntimeDirectories(layout, [
@@ -1878,6 +1963,7 @@ export function executeVaultUpdate(
           if (
             error instanceof MutationFailure
             && error.code === 'OWNERSHIP_LOST'
+            && !recordAppliedMutationOutcome(tx, mutation, error)
           ) ownershipAmbiguous = true;
           throw error;
         }
@@ -1911,6 +1997,7 @@ export function executeVaultUpdate(
     if (
       error instanceof MutationFailure
       && error.code === 'OWNERSHIP_LOST'
+      && !error.applied
     ) ownershipAmbiguous = true;
   } finally {
     if (!completed && tx && plan) {
@@ -1981,6 +2068,12 @@ export function executeVaultUpdate(
     const result = emptyResult(id, code);
     if (code === 'RECOVERY_REQUIRED') {
       result.warnings.push('<ME_RUNTIME>/transactions');
+      result.recoveryActions = [{
+        kind: 'inspect',
+        path: '<ME_RUNTIME>/transactions',
+        description: 'Inspect the preserved update journal and owned artifacts before retrying.',
+      }];
+      result.preservedPaths = ['<ME_RUNTIME>/transactions'];
     }
     return sanitizePublicUpdateResult(
       result,
@@ -1991,6 +2084,18 @@ export function executeVaultUpdate(
     ? runtimeDisplayPath(layout, operationDirectory)
     : '<ME_RUNTIME>/transactions';
   if (ownershipAmbiguous) {
+    const preservedOriginals = tx
+      ? [...tx.originals.entries()].map(([publishOrder, item]) => ({
+          path: runtimeDisplayPath(layout, item.path),
+          target: plan.mutations.find(mutation => (
+            mutation.publishOrder === publishOrder
+          ))?.vaultRelativePath,
+        }))
+      : [];
+    const preservedPaths = [
+      recoveryPath,
+      ...preservedOriginals.map(item => item.path),
+    ];
     return sanitizePublicUpdateResult(
       resultFromPlan(id, plan, 'recovery_required', {
         code: 'RECOVERY_REQUIRED',
@@ -2000,14 +2105,33 @@ export function executeVaultUpdate(
           recoveryPath,
         ],
         recoveryState: 'manual',
+        recoveryActions: [
+          {
+            kind: 'inspect',
+            path: recoveryPath,
+            description: 'Inspect the preserved journal and owned artifacts before retrying.',
+          },
+          ...preservedOriginals.map(item => ({
+            kind: 'restore' as const,
+            path: item.path,
+            description: item.target
+              ? `Verify this owned original before restoring ${item.target}.`
+              : 'Verify this owned original before restoring its vault target.',
+          })),
+        ],
+        preservedPaths,
       }),
     );
   }
 
   if (tx?.vaultMutationOccurred) {
+    const originalCode = updateErrorCode(primaryError);
     return sanitizePublicUpdateResult(
       resultFromPlan(id, plan, 'rolled_back', {
-        code: 'VALIDATION_FAILED',
+        code: originalCode === 'RECOVERY_REQUIRED'
+          || originalCode === 'INTERNAL_ERROR'
+          ? 'VALIDATION_FAILED'
+          : originalCode,
         warnings: tx?.warnings,
         recoveryState: 'rolled_back',
       }),

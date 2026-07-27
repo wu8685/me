@@ -31,6 +31,7 @@ import {
   validateMigrationRegistry,
   type ContentTransformIntent,
   type MigrationIntent,
+  type MigrationMutation,
   type VaultMigration,
 } from './registry.ts';
 
@@ -50,6 +51,15 @@ interface PluginResource {
   path: string;
   bytes: Buffer;
   sha256: string;
+}
+
+interface StagedPathMutation {
+  declaration: MigrationMutation;
+  source: SourceFingerprint;
+  destinationSource?: SourceFingerprint;
+  lastStage: number;
+  ordinal: number;
+  outcome: 'changed' | 'unchanged' | 'conflict';
 }
 
 type DigestMaterial = Record<string, unknown>;
@@ -98,6 +108,18 @@ function safeRelativePath(value: unknown): value is string {
   return !value.split('/').some(
     component => !component || component === '.' || component === '..',
   );
+}
+
+function safeMode(value: unknown): value is number {
+  return Number.isSafeInteger(value)
+    && (value as number) >= 0
+    && (value as number) <= 0o777;
+}
+
+function overlaps(left: string, right: string): boolean {
+  return left === right
+    || left.startsWith(`${right}/`)
+    || right.startsWith(`${left}/`);
 }
 
 function canonicalDirectory(candidate: string): string {
@@ -431,6 +453,38 @@ function validateContentTransform(
   }
 }
 
+function validatePathMutation(
+  value: unknown,
+): asserts value is MigrationMutation {
+  if (!plainRecord(value)) invalidRegistry();
+  if (value.kind === 'mkdir') {
+    if (
+      !hasExactKeys(value, ['kind', 'vaultRelativePath', 'desiredMode'])
+      || !safeRelativePath(value.vaultRelativePath)
+      || !safeMode(value.desiredMode)
+    ) {
+      invalidRegistry();
+    }
+    return;
+  }
+  if (value.kind === 'rename') {
+    if (
+      !hasExactKeys(value, [
+        'kind',
+        'vaultRelativePath',
+        'destinationVaultRelativePath',
+      ])
+      || !safeRelativePath(value.vaultRelativePath)
+      || !safeRelativePath(value.destinationVaultRelativePath)
+      || value.vaultRelativePath === value.destinationVaultRelativePath
+    ) {
+      invalidRegistry();
+    }
+    return;
+  }
+  invalidRegistry();
+}
+
 function validateIntent(value: unknown): asserts value is MigrationIntent {
   if (
     !plainRecord(value)
@@ -438,6 +492,7 @@ function validateIntent(value: unknown): asserts value is MigrationIntent {
       'configEdits',
       'managedAssets',
       'contentTransforms',
+      'mutations',
     ])
   ) {
     invalidRegistry();
@@ -447,12 +502,14 @@ function validateIntent(value: unknown): asserts value is MigrationIntent {
     !denseArray(intent.configEdits)
     || !denseArray(intent.managedAssets)
     || !denseArray(intent.contentTransforms)
+    || !denseArray(intent.mutations)
   ) {
     invalidRegistry();
   }
   intent.configEdits.forEach(validateConfigEdit);
   intent.managedAssets.forEach(validateManagedAsset);
   intent.contentTransforms.forEach(validateContentTransform);
+  intent.mutations.forEach(validatePathMutation);
 }
 
 function resolveMigrations(options: {
@@ -574,6 +631,7 @@ function assertStableInputs(
   pluginRoot: string,
   files: ReadonlyMap<string, VirtualFile>,
   resources: ReadonlyMap<string, PluginResource>,
+  pathMutations: readonly StagedPathMutation[],
 ): void {
   for (const file of files.values()) {
     if (
@@ -587,6 +645,25 @@ function assertStableInputs(
     const reread = readRegularFile(pluginRoot, resource.path).bytes;
     if (sha256(reread) !== resource.sha256) fail('UNSAFE_PATH');
   }
+  for (const item of pathMutations) {
+    if (
+      canonicalStringify(fingerprint(
+        vaultDir,
+        item.declaration.vaultRelativePath,
+      )) !== canonicalStringify(item.source)
+    ) {
+      fail('UNSAFE_PATH');
+    }
+    if (
+      item.declaration.kind === 'rename'
+      && canonicalStringify(fingerprint(
+        vaultDir,
+        item.declaration.destinationVaultRelativePath,
+      )) !== canonicalStringify(item.destinationSource)
+    ) {
+      fail('UNSAFE_PATH');
+    }
+  }
 }
 
 function renderMigrationStages(options: {
@@ -598,7 +675,36 @@ function renderMigrationStages(options: {
   conflicts: Map<string, string>;
   blockedPaths: Set<string>;
   materials: DigestMaterial[];
+  pathMutations: StagedPathMutation[];
 }): void {
+  const structuralPaths = new Set<string>();
+  const fileIntentPaths = new Set<string>();
+  const claimFileIntentPath = (relativePath: string): void => {
+    if ([...structuralPaths].some(candidate => overlaps(
+      candidate,
+      relativePath,
+    ))) {
+      invalidRegistry();
+    }
+    fileIntentPaths.add(relativePath);
+  };
+  const claimStructuralPath = (relativePath: string): void => {
+    if (
+      overlaps(relativePath, CONFIG_PATH)
+      || [...structuralPaths].some(candidate => overlaps(
+        candidate,
+        relativePath,
+      ))
+      || [...fileIntentPaths].some(candidate => overlaps(
+        candidate,
+        relativePath,
+      ))
+    ) {
+      invalidRegistry();
+    }
+    structuralPaths.add(relativePath);
+  };
+
   for (let stage = 0; stage < options.resolved.length; stage += 1) {
     const { migration, intent } = options.resolved[stage];
     const stageTargets = new Set<string>();
@@ -658,6 +764,7 @@ function renderMigrationStages(options: {
       const managed = intent.managedAssets[ordinal];
       if (stageTargets.has(managed.vaultRelativePath)) invalidRegistry();
       stageTargets.add(managed.vaultRelativePath);
+      claimFileIntentPath(managed.vaultRelativePath);
       const file = loadVirtualFile(
         options.files,
         options.vaultDir,
@@ -745,6 +852,7 @@ function renderMigrationStages(options: {
       for (const relativePath of paths) {
         if (stageTargets.has(relativePath)) invalidRegistry();
         stageTargets.add(relativePath);
+        claimFileIntentPath(relativePath);
         const file = loadVirtualFile(
           options.files,
           options.vaultDir,
@@ -778,6 +886,106 @@ function renderMigrationStages(options: {
           file.lastStage = stage;
         }
         transformOrdinal += 1;
+      }
+    }
+
+    for (
+      let ordinal = 0;
+      ordinal < intent.mutations.length;
+      ordinal += 1
+    ) {
+      const declaration = intent.mutations[ordinal];
+      const affected = declaration.kind === 'rename'
+        ? [
+            declaration.vaultRelativePath,
+            declaration.destinationVaultRelativePath,
+          ]
+        : [declaration.vaultRelativePath];
+      for (const relativePath of affected) {
+        if (stageTargets.has(relativePath)) invalidRegistry();
+        stageTargets.add(relativePath);
+        claimStructuralPath(relativePath);
+      }
+
+      const source = fingerprint(
+        options.vaultDir,
+        declaration.vaultRelativePath,
+      );
+      if (declaration.kind === 'mkdir') {
+        const outcome = source.type === 'missing'
+          ? 'changed'
+          : source.type === 'directory'
+            ? 'unchanged'
+            : 'conflict';
+        options.materials.push({
+          kind: declaration.kind,
+          stage,
+          ordinal,
+          path: declaration.vaultRelativePath,
+          source,
+          desiredMode: declaration.desiredMode,
+          outcome,
+        });
+        options.pathMutations.push({
+          declaration,
+          source,
+          lastStage: stage,
+          ordinal,
+          outcome,
+        });
+        if (outcome === 'conflict') {
+          options.conflicts.set(
+            declaration.vaultRelativePath,
+            'MIGRATION_CONFLICT',
+          );
+          options.blockedPaths.add(declaration.vaultRelativePath);
+        }
+        continue;
+      }
+
+      const destinationSource = fingerprint(
+        options.vaultDir,
+        declaration.destinationVaultRelativePath,
+      );
+      const outcome = source.type === 'file'
+        && destinationSource.type === 'missing'
+        ? 'changed'
+        : 'conflict';
+      options.materials.push({
+        kind: declaration.kind,
+        stage,
+        ordinal,
+        path: declaration.vaultRelativePath,
+        destinationPath: declaration.destinationVaultRelativePath,
+        source,
+        destinationSource,
+        outcome,
+      });
+      options.pathMutations.push({
+        declaration,
+        source,
+        destinationSource,
+        lastStage: stage,
+        ordinal,
+        outcome,
+      });
+      if (outcome === 'conflict') {
+        if (source.type !== 'file') {
+          options.conflicts.set(
+            declaration.vaultRelativePath,
+            'MIGRATION_CONFLICT',
+          );
+          options.blockedPaths.add(declaration.vaultRelativePath);
+        }
+        if (destinationSource.type !== 'missing') {
+          options.conflicts.set(
+            declaration.destinationVaultRelativePath,
+            'MIGRATION_CONFLICT',
+          );
+          options.blockedPaths.add(
+            declaration.destinationVaultRelativePath,
+          );
+        }
       }
     }
   }
@@ -816,8 +1024,9 @@ function mutationDigestRecord(mutation: PlannedMutation): unknown {
 function finalMutations(
   files: ReadonlyMap<string, VirtualFile>,
   blockedPaths: ReadonlySet<string>,
+  pathMutations: readonly StagedPathMutation[],
 ): PlannedMutation[] {
-  const candidates = [...files.values()]
+  const fileCandidates = [...files.values()]
     .filter(file => {
       if (
         blockedPaths.has(file.path)
@@ -841,13 +1050,71 @@ function finalMutations(
       return left.lastStage - right.lastStage
         || codeUnitCompare(left.path, right.path);
     });
-  return candidates.map((file, publishOrder) => ({
-    kind: 'write-file',
-    vaultRelativePath: file.path,
-    source: file.source,
-    desiredBytes: Buffer.from(Uint8Array.from(file.bytes as Buffer)),
-    desiredSha256: sha256(file.bytes as Buffer),
-    desiredMode: file.mode,
+  const candidates: Array<{
+    lastStage: number;
+    primaryPath: string;
+    secondaryPath: string;
+    mutation: PlannedMutation;
+  }> = [
+    ...fileCandidates.map(file => ({
+      lastStage: file.lastStage,
+      primaryPath: file.path,
+      secondaryPath: '',
+      mutation: {
+        kind: 'write-file' as const,
+        vaultRelativePath: file.path,
+        source: file.source,
+        desiredBytes: Buffer.from(Uint8Array.from(file.bytes as Buffer)),
+        desiredSha256: sha256(file.bytes as Buffer),
+        desiredMode: file.mode,
+        publishOrder: 0,
+      },
+    })),
+    ...pathMutations
+      .filter(item => item.outcome === 'changed' && !(
+        blockedPaths.has(item.declaration.vaultRelativePath)
+        || (
+          item.declaration.kind === 'rename'
+          && blockedPaths.has(
+            item.declaration.destinationVaultRelativePath,
+          )
+        )
+      ))
+      .map(item => ({
+        lastStage: item.lastStage,
+        primaryPath: item.declaration.vaultRelativePath,
+        secondaryPath: item.declaration.kind === 'rename'
+          ? item.declaration.destinationVaultRelativePath
+          : '',
+        mutation: item.declaration.kind === 'mkdir'
+          ? {
+              kind: 'mkdir' as const,
+              vaultRelativePath: item.declaration.vaultRelativePath,
+              source: item.source,
+              desiredMode: item.declaration.desiredMode,
+              publishOrder: 0,
+            }
+          : {
+              kind: 'rename' as const,
+              vaultRelativePath: item.declaration.vaultRelativePath,
+              destinationVaultRelativePath:
+                item.declaration.destinationVaultRelativePath,
+              source: item.source,
+              destinationSource: item.destinationSource as SourceFingerprint,
+              publishOrder: 0,
+            },
+      })),
+  ].sort((left, right) => {
+    const leftConfig = left.primaryPath === CONFIG_PATH ? 1 : 0;
+    const rightConfig = right.primaryPath === CONFIG_PATH ? 1 : 0;
+    if (leftConfig !== rightConfig) return leftConfig - rightConfig;
+    return left.lastStage - right.lastStage
+      || codeUnitCompare(left.primaryPath, right.primaryPath)
+      || codeUnitCompare(left.mutation.kind, right.mutation.kind)
+      || codeUnitCompare(left.secondaryPath, right.secondaryPath);
+  });
+  return candidates.map(({ mutation }, publishOrder) => ({
+    ...mutation,
     publishOrder,
   }));
 }
@@ -914,6 +1181,7 @@ export function planVaultUpdate(options: {
   const conflictMap = new Map<string, string>();
   const blockedPaths = new Set<string>();
   const materials: DigestMaterial[] = [];
+  const pathMutations: StagedPathMutation[] = [];
 
   if (resolved.length === 0) {
     materials.push({
@@ -934,11 +1202,18 @@ export function planVaultUpdate(options: {
       conflicts: conflictMap,
       blockedPaths,
       materials,
+      pathMutations,
     });
   }
-  assertStableInputs(vaultDir, pluginRoot, files, resources);
+  assertStableInputs(
+    vaultDir,
+    pluginRoot,
+    files,
+    resources,
+    pathMutations,
+  );
 
-  const mutations = finalMutations(files, blockedPaths);
+  const mutations = finalMutations(files, blockedPaths, pathMutations);
   try {
     validatePlannedMutations(mutations);
   } catch (error) {

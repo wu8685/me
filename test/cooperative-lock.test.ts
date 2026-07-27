@@ -248,7 +248,30 @@ describe('vault-wide cooperative lock', () => {
     })).toThrow(/LOCK_HELD/);
   });
 
-  test('completes release when unlink succeeds before its wrapper throws', () => {
+  test('release preserves a foreign vault.lock replacement created after rename success', () => {
+    const layout = preparedRuntime();
+    const hooks = {
+      __operations: {
+        renameSync(source: string, destination: string) {
+          fs.renameSync(source, destination);
+          fs.writeFileSync(source, 'next owner');
+        },
+      },
+    } as CooperativeLockHooks & {
+      __operations: {
+        renameSync(source: string, destination: string): void;
+      };
+    };
+    const lock = acquireVaultLock(layout, {
+      operationId: 'owned',
+      owner: 'ingest',
+    }, hooks);
+
+    expect(() => releaseVaultLock(layout, lock, hooks)).not.toThrow();
+    expect(fs.readFileSync(lock.path, 'utf8')).toBe('next owner');
+  });
+
+  test('completes release without name-only unlink and retains the owned tombstone', () => {
     const layout = preparedRuntime();
     let postSuccessErrorInjected = false;
     const hooks = {
@@ -272,7 +295,7 @@ describe('vault-wide cooperative lock', () => {
     }, hooks);
 
     expect(() => releaseVaultLock(layout, lock, hooks)).not.toThrow();
-    expect(postSuccessErrorInjected).toBeTrue();
+    expect(postSuccessErrorInjected).toBeFalse();
     expect(fs.existsSync(lock.path)).toBeFalse();
 
     const next = acquireVaultLock(layout, {
@@ -366,7 +389,7 @@ describe('vault-wide cooperative lock', () => {
     })).toThrow(/LOCK_HELD/);
   });
 
-  test('failed acquisition surfaces its original error after post-success unlink error', () => {
+  test('failed acquisition surfaces its original error without name-only unlink', () => {
     const layout = preparedRuntime();
     let postSuccessErrorInjected = false;
     const hooks = {
@@ -393,7 +416,7 @@ describe('vault-wide cooperative lock', () => {
       operationId: 'failed',
       owner: 'vault-write',
     }, hooks)).toThrow(/injected acquisition fsync failure/);
-    expect(postSuccessErrorInjected).toBeTrue();
+    expect(postSuccessErrorInjected).toBeFalse();
     expect(fs.existsSync(path.join(layout.lockDir, 'vault.lock'))).toBeFalse();
 
     const next = acquireVaultLock(layout, {

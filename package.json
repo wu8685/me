@@ -31,6 +31,7 @@
     "move": "bun run bin/move.ts",
     "ingest": "bun run bin/ingest.ts",
     "me-runtime": "bin/runtime.ts",
+    "me-setup": "bin/setup.ts",
     "me-update": "bin/update.ts",
     "vault-write": "bin/vault-write.ts"
   },

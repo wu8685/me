@@ -427,10 +427,42 @@ export function createMutationExecutor(options: {
     options.hooks?.beforeFilesystemMutation?.(kind, paths);
     for (const candidate of paths) assertSafe(options.pathPolicy, candidate);
     const result = mutate();
-    for (const directory of new Set(paths.map(candidate => path.dirname(candidate)))) {
-      syncDirectory(directory);
+    try {
+      for (const directory of new Set(paths.map(candidate => path.dirname(candidate)))) {
+        syncDirectory(directory);
+      }
+      options.journal.afterMutation(kind, paths);
+    } catch {
+      /*
+       * The namespace syscall has already returned successfully. A durability
+       * or after-journal failure is therefore ambiguous, never an ordinary
+       * pre-mutation error. Preserve the exact owned result so a transactional
+       * caller can prove and roll back the publication without guessing.
+       */
+      if (
+        (kind === 'link' || kind === 'rename')
+        && result
+        && typeof result === 'object'
+        && 'sha256' in result
+      ) {
+        throw new MutationFailure('OWNERSHIP_LOST', {
+          kind,
+          ownedFile: result as OwnedFileFingerprint,
+        });
+      }
+      if (
+        kind === 'mkdir'
+        && result
+        && typeof result === 'object'
+        && 'device' in result
+      ) {
+        throw new MutationFailure('OWNERSHIP_LOST', {
+          kind,
+          ownedDirectory: result as OwnedDirectoryFingerprint,
+        });
+      }
+      failure('OWNERSHIP_LOST');
     }
-    options.journal.afterMutation(kind, paths);
     return result;
   };
 
@@ -447,6 +479,17 @@ export function createMutationExecutor(options: {
       afterSuccess?.();
       options.atomicHooks?.afterAtomicMutation?.(kind, phase, paths);
     } catch {
+      if (
+        kind === 'mkdir'
+        && result
+        && typeof result === 'object'
+        && 'device' in result
+      ) {
+        throw new MutationFailure('OWNERSHIP_LOST', {
+          kind: 'mkdir',
+          ownedDirectory: result as OwnedDirectoryFingerprint,
+        });
+      }
       failure('OWNERSHIP_LOST');
     }
     return result;
@@ -811,6 +854,33 @@ export function createMutationExecutor(options: {
           () => syncOpenedDirectory(destinationParent),
         );
       } catch (error) {
+        if (published) {
+          try {
+            const copied = captureFileAt(
+              destinationParent,
+              entryName(destination),
+              destination,
+            );
+            if (
+              copied.inode === temporaryInode
+              && copied.device === temporaryDevice
+              && copied.mode === source.mode
+              && copied.linkCount === 1n
+              && copied.sha256 === source.sha256
+            ) {
+              throw new MutationFailure('OWNERSHIP_LOST', {
+                kind,
+                ownedFile: copied,
+              });
+            }
+          } catch (captureError) {
+            if (
+              captureError instanceof MutationFailure
+              && captureError.applied
+            ) throw captureError;
+          }
+          failure('OWNERSHIP_LOST');
+        }
         if (error instanceof MutationFailure) throw error;
         if (errno(error) === 'EEXIST') failure('TARGET_EXISTS');
         if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
@@ -875,9 +945,16 @@ export function createMutationExecutor(options: {
       return boundary('mkdir', [candidate], () => {
         const parent = openDirectory(path.dirname(candidate));
         try {
+          let created: OwnedDirectoryFingerprint;
           try {
-            aroundAtomic('mkdir', 'create', [candidate], () =>
-              atomic.mkdirAt(parent.descriptor, entryName(candidate), mode));
+            created = aroundAtomic('mkdir', 'create', [candidate], () => {
+              atomic.mkdirAt(parent.descriptor, entryName(candidate), mode);
+              return captureDirectoryAt(
+                parent,
+                entryName(candidate),
+                candidate,
+              );
+            });
           } catch (error) {
             if (errno(error) === 'EEXIST') failure('TARGET_EXISTS');
             if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
@@ -896,6 +973,7 @@ export function createMutationExecutor(options: {
           if (
             !named.isDirectory()
             || named.isSymbolicLink()
+            || !sameOwnedDirectory(owned, created)
             || named.dev !== owned.device
             || named.ino !== owned.inode
             || Number(named.mode & 0o777n) !== owned.mode
@@ -934,23 +1012,60 @@ export function createMutationExecutor(options: {
         let destinationParent: OpenedDirectory | undefined;
         try {
           destinationParent = openDirectory(path.dirname(destination));
-          const copied = publishCopy(
-            'rename',
-            sourceParent,
-            source,
-            destinationParent,
-            destination,
-          );
-          retireFile('rename', sourceParent, source, destinationParent);
-          const published = captureFileAt(
-            destinationParent,
-            entryName(destination),
-            destination,
-          );
-          if (!sameOwnedFile(published, copied)) {
-            failure('OWNERSHIP_LOST');
+          let copied: OwnedFileFingerprint | undefined;
+          try {
+            copied = publishCopy(
+              'rename',
+              sourceParent,
+              source,
+              destinationParent,
+              destination,
+            );
+            retireFile('rename', sourceParent, source, destinationParent);
+            const published = captureFileAt(
+              destinationParent,
+              entryName(destination),
+              destination,
+            );
+            if (!sameOwnedFile(published, copied)) {
+              failure('OWNERSHIP_LOST');
+            }
+            return published;
+          } catch (error) {
+            if (
+              error instanceof MutationFailure
+              && error.applied?.kind === 'rename'
+            ) throw error;
+            try {
+              const published = captureFileAt(
+                destinationParent,
+                entryName(destination),
+                destination,
+              );
+              let sourceMissing = false;
+              try {
+                operations.lstatSync(source.path);
+              } catch (sourceError) {
+                sourceMissing = errno(sourceError) === 'ENOENT';
+              }
+              if (
+                sourceMissing
+                && copied
+                && sameOwnedFile(published, copied)
+              ) {
+                throw new MutationFailure('OWNERSHIP_LOST', {
+                  kind: 'rename',
+                  ownedFile: published,
+                });
+              }
+            } catch (captureError) {
+              if (
+                captureError instanceof MutationFailure
+                && captureError.applied
+              ) throw captureError;
+            }
+            throw error;
           }
-          return published;
         } finally {
           closeDescriptor(sourceParent.descriptor);
           if (destinationParent) closeDescriptor(destinationParent.descriptor);

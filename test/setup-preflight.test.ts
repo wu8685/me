@@ -228,4 +228,58 @@ describe('fresh setup preflight', () => {
     expect(result.status).toBe('ready');
     expect(result.plannedPaths).not.toContain('.gitignore');
   });
+
+  test('rejects a 0555 vault even when the test process is privileged', () => {
+    const { vault } = makeVault();
+    fs.chmodSync(vault, 0o555);
+    try {
+      expect(() => preflight(vault)).toThrow(
+        expect.objectContaining({ code: 'UNSAFE_PATH' }),
+      );
+    } finally {
+      fs.chmodSync(vault, 0o755);
+    }
+  });
+
+  test('rejects a non-writable existing layer before creating gitkeep', () => {
+    const { vault } = makeVault();
+    const raw = path.join(vault, 'raw');
+    fs.mkdirSync(raw, { mode: 0o555 });
+    try {
+      expect(() => preflight(vault)).toThrow(
+        expect.objectContaining({ code: 'UNSAFE_PATH' }),
+      );
+      expect(fs.existsSync(path.join(raw, '.gitkeep'))).toBeFalse();
+    } finally {
+      fs.chmodSync(raw, 0o755);
+    }
+  });
+
+  test.each([
+    ['layer ancestor', ['knowledge', 'knowledge/practices', 'cognition']],
+    ['layer descendant', ['knowledge/raw', 'knowledge', 'cognition']],
+    ['git control path', ['.git/raw', 'practices', 'cognition']],
+    ['me control path', ['raw', '.me/practices', 'cognition']],
+    ['obsidian control path', ['raw', 'practices', '.obsidian/cognition']],
+    ['agent control path', ['.agents/raw', 'practices', 'cognition']],
+    ['github control path', ['.github/raw', 'practices', 'cognition']],
+    ['editor control path', ['raw', '.vscode/practices', 'cognition']],
+    ['managed file ancestor', ['SCHEMA.md/raw', 'practices', 'cognition']],
+  ] as const)('rejects %s layer mapping', (_name, layers) => {
+    const { vault } = makeVault();
+    const before = manifest(vault);
+    expect(() => preflightFreshSetup({
+      vaultDir: vault,
+      pluginRoot,
+      layerDirectories: [...layers],
+    })).toThrow(expect.objectContaining({ code: 'INVALID_REQUEST' }));
+    expect(manifest(vault)).toEqual(before);
+  });
+
+  test('rejects an unresolved setup staging namespace without writing', () => {
+    expectZeroWriteFailure(
+      vault => fs.mkdirSync(path.join(vault, '.me-setup-interrupted')),
+      'MIGRATION_CONFLICT',
+    );
+  });
 });

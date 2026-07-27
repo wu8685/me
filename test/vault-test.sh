@@ -146,6 +146,7 @@ test_plugin_structure() {
   fi
   assert_file_exists "$PLUGIN_ROOT/skills/setup/SKILL.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/skills/update/SKILL.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/setup.ts" || return 1
   assert_file_exists "$PLUGIN_ROOT/bin/setup-preflight.ts" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/SCHEMA.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/CLAUDE-template.md" || return 1
@@ -170,6 +171,7 @@ test_update_release_contract() {
   assert_file_contains "$setup_skill" 'Run \$me:update (Codex) or /me:update (Claude Code)' || return 1
   assert_file_contains "$setup_skill" 'AGENTS-template.md' || return 1
   assert_file_contains "$setup_skill" 'bin/setup-preflight.ts' || return 1
+  assert_file_contains "$setup_skill" 'bin/setup.ts" apply' || return 1
   assert_file_contains "$setup_skill" 'no writes at all' || return 1
   assert_file_contains "$setup_skill" 'Before the first `mkdir`' || return 1
   assert_file_contains "$setup_skill" 'duplicate, nested, mismatched, unknown, or incomplete' || return 1
@@ -249,27 +251,17 @@ test_skill_root_resolution_without_claude_env() {
 test_setup_current_contract_and_existing_zero_write() {
   local v="$MOCK_VAULT"
 
-  env -u CLAUDE_PLUGIN_ROOT bun run "$PLUGIN_ROOT/bin/setup-preflight.ts" \
+  local setup_result
+  setup_result=$(env -u CLAUDE_PLUGIN_ROOT bun run "$PLUGIN_ROOT/bin/setup.ts" apply \
     --vault-dir "$v" \
     --raw-dir raw \
     --practices-dir practices \
-    --cognition-dir cognition >/dev/null || return 1
-
-  # Execute the deterministic fresh setup writes described by the Skill.
-  mkdir -p "$v/.me" "$v/raw" "$v/practices" "$v/cognition"
-  touch "$v/raw/.gitkeep" "$v/practices/.gitkeep" "$v/cognition/.gitkeep"
-  {
-    echo '# me plugin configuration'
-    echo 'vault_schema_version: 1'
-    echo
-    echo 'layers:'
-    echo '  raw: "raw"'
-    echo '  practices: "practices"'
-    echo '  cognition: "cognition"'
-  } > "$v/.me/config.yaml"
-  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$v/SCHEMA.md"
-  cp "$PLUGIN_ROOT/templates/CLAUDE-template.md" "$v/CLAUDE.md"
-  cp "$PLUGIN_ROOT/templates/AGENTS-template.md" "$v/AGENTS.md"
+    --cognition-dir cognition) || return 1
+  node -e '
+    const result=JSON.parse(process.argv[1]);
+    if (result.status !== "initialized") process.exit(1);
+    if (result.changedPaths.at(-1) !== ".me/config.yaml") process.exit(1);
+  ' "$setup_result" || return 1
 
   assert_file_contains "$v/.me/config.yaml" '^vault_schema_version: 1$' || return 1
   assert_file_contains "$v/CLAUDE.md" '<!-- me:managed:start knowledge-base -->' || return 1
@@ -279,9 +271,18 @@ test_setup_current_contract_and_existing_zero_write() {
   local before after runtime_before runtime_after
   before=$(find "$v" -type f -exec cksum {} \; | sort)
   runtime_before=$(find "$ME_RUNTIME_ROOT" -type f -exec cksum {} \; | sort)
-  if [ -f "$v/.me/config.yaml" ]; then
-    : # setup stops and reports update guidance
-  fi
+  setup_result=$(env -u CLAUDE_PLUGIN_ROOT bun run "$PLUGIN_ROOT/bin/setup.ts" apply \
+    --vault-dir "$v" \
+    --raw-dir ignored \
+    --practices-dir ignored-too \
+    --cognition-dir ignored-also) || return 1
+  node -e '
+    const result=JSON.parse(process.argv[1]);
+    if (result.status !== "already_initialized") process.exit(1);
+    if (!result.message.includes("$me:update") || !result.message.includes("/me:update")) {
+      process.exit(1);
+    }
+  ' "$setup_result" || return 1
   after=$(find "$v" -type f -exec cksum {} \; | sort)
   [ "$after" = "$before" ] || {
     echo -e "    ${RED}FAIL${NC}: existing setup route changed vault bytes"
@@ -370,11 +371,13 @@ test_vault_writer_public_binary() {
   assert_file_exists "$PLUGIN_ROOT/bin/vault-write.ts" || return 1
   assert_file_exists "$PLUGIN_ROOT/bin/runtime.ts" || return 1
   assert_file_exists "$PLUGIN_ROOT/bin/update.ts" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/setup.ts" || return 1
   assert_file_exists "$PLUGIN_ROOT/bin/setup-preflight.ts" || return 1
   node -e '
     const p=require(process.argv[1]);
     if (p.bin["vault-write"] !== "bin/vault-write.ts") process.exit(1)
     if (p.bin["me-runtime"] !== "bin/runtime.ts") process.exit(1)
+    if (p.bin["me-setup"] !== "bin/setup.ts") process.exit(1)
     if (p.bin["me-update"] !== "bin/update.ts") process.exit(1)
   ' "$PLUGIN_ROOT/package.json" || return 1
   if [ ! -x "$PLUGIN_ROOT/bin/vault-write.ts" ]; then
@@ -390,7 +393,7 @@ test_vault_writer_public_binary() {
     return 1
   fi
 
-  local pack_dir install_dir tarball binary runtime_binary update_binary result
+  local pack_dir install_dir tarball binary runtime_binary setup_binary update_binary result
   pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-pack.XXXXXX")
   install_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-install.XXXXXX")
   tarball=$(npm pack --silent --pack-destination "$pack_dir" "$PLUGIN_ROOT") || return 1
@@ -406,6 +409,11 @@ test_vault_writer_public_binary() {
     echo -e "    ${RED}FAIL${NC}: packed me-runtime binary is not executable"
     return 1
   fi
+  setup_binary="$install_dir/node_modules/.bin/me-setup"
+  if [ ! -x "$setup_binary" ]; then
+    echo -e "    ${RED}FAIL${NC}: packed me-setup binary is not executable"
+    return 1
+  fi
   update_binary="$install_dir/node_modules/.bin/me-update"
   if [ ! -x "$update_binary" ]; then
     echo -e "    ${RED}FAIL${NC}: packed me-update binary is not executable"
@@ -415,6 +423,7 @@ test_vault_writer_public_binary() {
   local required_release_path
   for required_release_path in \
     skills/update/SKILL.md \
+    bin/setup.ts \
     bin/setup-preflight.ts \
     bin/update.ts \
     bin/update/transaction.ts \
@@ -4187,14 +4196,13 @@ test_skills_follow_ingest_pattern() {
   done
 }
 
-test_setup_skill_no_bin_reference() {
-  # Setup has no bin/*.ts executable (manual process)
+test_setup_skill_uses_transaction_runner() {
+  # Setup delegates preview and apply to the executable transaction runner.
   local f="$PLUGIN_ROOT/skills/setup/SKILL.md"
-  # Should NOT reference bin/setup.ts
-  if grep -q "bin/setup.ts" "$f" 2>/dev/null; then
-    echo -e "    ${RED}FAIL${NC}: setup skill should not reference bin/setup.ts (manual process)"
-    return 1
-  fi
+  assert_file_contains "$f" 'bin/setup.ts" preview' || return 1
+  assert_file_contains "$f" 'bin/setup.ts" apply' || return 1
+  assert_file_contains "$f" 'unified mutation executor' || return 1
+  assert_file_contains "$f" 'config.yaml` is always last' || return 1
 }
 
 test_setup_agent_templates_and_merge_rules() {
@@ -5616,7 +5624,7 @@ main() {
     run_test test_skill_descriptions_codex_aware
     run_test test_skills_reference_bin_executables
     run_test test_skills_follow_ingest_pattern
-    run_test test_setup_skill_no_bin_reference
+    run_test test_setup_skill_uses_transaction_runner
     run_test test_setup_agent_templates_and_merge_rules
     run_test test_skill_files_under_500_lines
 

@@ -23,7 +23,8 @@ Resolve `PLUGIN_ROOT` without writing:
    `skills/setup/SKILL.md` to the plugin root. Concretely, canonicalize
    `dirname(<absolute-SKILL.md>)/../..`; do not derive it from cwd.
 3. Verify that `<PLUGIN_ROOT>/skills/setup/SKILL.md`,
-   `<PLUGIN_ROOT>/bin/setup-preflight.ts`, and both Agent templates exist.
+   `<PLUGIN_ROOT>/bin/setup.ts`, `<PLUGIN_ROOT>/bin/setup-preflight.ts`, and
+   both Agent templates exist.
 
 Never expand an unset `CLAUDE_PLUGIN_ROOT` into `/bin/...` or `/templates/...`.
 If neither trusted source yields a verified absolute plugin root, stop without
@@ -57,10 +58,11 @@ found, use the defaults.
 
 ## Step 4: Preflight every mutation target (fresh only)
 
-Before the first `mkdir`, temp file, copy, append, or other write, run:
+Before the first `mkdir`, temp file, copy, append, or other write, run the real
+setup runner in read-only preview mode:
 
 ```bash
-bun run "<PLUGIN_ROOT>/bin/setup-preflight.ts" \
+bun run "<PLUGIN_ROOT>/bin/setup.ts" preview \
   --vault-dir "<target>" \
   --raw-dir "<raw_dir>" \
   --practices-dir "<practices_dir>" \
@@ -82,12 +84,34 @@ The entire vault and runtime must remain byte-for-byte unchanged. Do not create
 schema v1 config, directories, or any partial managed file before all targets
 pass.
 
-## Step 5: Write the preflighted current vault (fresh only)
+## Step 5: Apply the preflighted current vault (fresh only)
 
-Only after the complete preflight succeeds, perform the exact preflighted
-actions below. Do not rewrite a target that preflight found already current.
-If a target no longer matches its preflighted state, stop instead of
-overwriting it.
+After the preview succeeds, run the same executable implementation in apply
+mode. Do not reproduce its writes with shell commands:
+
+```bash
+bun run "<PLUGIN_ROOT>/bin/setup.ts" apply \
+  --vault-dir "<target>" \
+  --raw-dir "<raw_dir>" \
+  --practices-dir "<practices_dir>" \
+  --cognition-dir "<cognition_dir>"
+```
+
+The runner repeats the complete read-only preflight under the shared vault
+lock, stages exact bytes, and routes every publication and rollback through
+the unified mutation executor. It rejects any target that changed after
+preview. Managed files are published in deterministic order and
+`.me/config.yaml` is always last. A normal failure rolls every published vault
+path back; an ownership ambiguity returns `RECOVERY_REQUIRED` and preserves
+recovery material instead of guessing.
+
+An interrupted pre-config apply cannot claim schema v1 because config is last.
+On a later run, an unresolved `.me-setup-*` staging namespace is a conflict:
+inspect it and the already-published paths before removing anything, then
+rerun preview. Never delete an unfamiliar staging namespace automatically.
+
+The runner implements the actions below. They are the result contract, not
+instructions to execute manually.
 
 ### Layer directories
 
@@ -125,8 +149,8 @@ Do not ignore `.me/`; portable config belongs in version control.
 
 ### Config — publish last
 
-Only after every other preflighted target has been written successfully,
-create `.me/` and publish `.me/config.yaml` last:
+Only after every other preflighted target has been written successfully does
+the runner create `.me/` and publish `.me/config.yaml` last:
 
 ```yaml
 # me plugin configuration
@@ -143,7 +167,8 @@ version 1.
 
 ## Step 6: Validate the fresh vault
 
-Before reporting success, read back the created files and verify:
+The runner reads back the created files before returning `initialized` and
+verifies:
 
 - `.me/config.yaml` parses with `vault_schema_version: 1` and the confirmed
   three-layer mapping;
@@ -153,8 +178,8 @@ Before reporting success, read back the created files and verify:
   preserve all pre-existing bytes outside those markers;
 - `.gitignore` contains exactly one effective `.obsidian/` entry.
 
-If validation fails, report the failure and do not claim initialization
-succeeded.
+If it returns `blocked`, report its structured error and recovery state; do
+not claim initialization succeeded.
 
 ## Step 7: Report
 
@@ -164,7 +189,11 @@ Codex. Do not run Git and do not commit the vault.
 
 ## Constraints
 
-- Setup writes only portable vault content and does not create runtime directories.
+- Existing-vault and failed-preflight routes create no runtime directories.
+- Fresh apply uses the external runtime only for the shared lock and persistent
+  mutation-retirement tombstones; it never writes host-local state into the
+  portable vault.
+- Setup does not create runtime directories inside the vault.
 - Host-local locks, staging, inbox, and recovery state live under
   `~/.me/runtime/vault-<path-hash>/`.
 - Never store an absolute runtime path in `.me/config.yaml`.

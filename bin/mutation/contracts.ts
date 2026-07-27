@@ -49,13 +49,25 @@ export type MutationFailureCode =
   | 'UNSAFE_PATH'
   | 'UNSUPPORTED_FILESYSTEM';
 
+export type AppliedMutationOutcome =
+  | {
+      kind: 'link' | 'rename';
+      ownedFile: OwnedFileFingerprint;
+    }
+  | {
+      kind: 'mkdir';
+      ownedDirectory: OwnedDirectoryFingerprint;
+    };
+
 export class MutationFailure extends Error {
   readonly code: MutationFailureCode;
+  readonly applied?: AppliedMutationOutcome;
 
-  constructor(code: MutationFailureCode) {
+  constructor(code: MutationFailureCode, applied?: AppliedMutationOutcome) {
     super(code);
     this.name = 'MutationFailure';
     this.code = code;
+    this.applied = applied;
   }
 }
 

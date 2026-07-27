@@ -63,6 +63,12 @@ export interface UpdateResultV1 {
   warnings: string[];
   conflicts: Array<{ path: string; reason: string }>;
   recoveryState: 'none' | 'rolled_back' | 'manual';
+  recoveryActions: Array<{
+    kind: 'inspect' | 'restore' | 'remove';
+    path: string;
+    description: string;
+  }>;
+  preservedPaths: string[];
   error?: { code: UpdateErrorCode; message: string };
 }
 

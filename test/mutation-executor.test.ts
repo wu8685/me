@@ -1078,8 +1078,14 @@ describe('shared filesystem mutation executor', () => {
         throw errno('EIO');
       },
     });
-    expect(() => failing.executor.mkdir(path.join(failing.root, 'created'), 0o700))
-      .toThrow('EIO');
+    try {
+      failing.executor.mkdir(path.join(failing.root, 'created'), 0o700);
+      throw new Error('expected typed ambiguity');
+    } catch (error) {
+      expect(error).toBeInstanceOf(MutationFailure);
+      expect((error as MutationFailure).code).toBe('OWNERSHIP_LOST');
+      expect((error as MutationFailure).applied?.kind).toBe('mkdir');
+    }
   });
 
   test('fsyncs parent directories before recording the after boundary', () => {
@@ -1116,7 +1122,8 @@ describe('shared filesystem mutation executor', () => {
       },
     });
 
-    expect(() => executor.mkdir(path.join(root, 'created'), 0o700)).toThrow('EIO');
+    expect(() => executor.mkdir(path.join(root, 'created'), 0o700))
+      .toThrow(new MutationFailure('OWNERSHIP_LOST'));
     expect(events).toEqual(['before:mkdir', 'fsync']);
   });
 
@@ -1156,7 +1163,11 @@ describe('shared filesystem mutation executor', () => {
         }
       };
 
-      expect(action).toThrow(`${phase} injected`);
+      expect(action).toThrow(
+        phase === 'before'
+          ? 'before injected'
+          : new MutationFailure('OWNERSHIP_LOST'),
+      );
       expect(boundaries).toEqual(
         phase === 'before'
           ? [`before:${primitive}`]
