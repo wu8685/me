@@ -103,6 +103,9 @@ Map these directories? (Press Enter for defaults)
 fresh setup 写入 `vault_schema_version: 1`。如果 `.me/config.yaml` 已存在，
 setup 完全零写并提示运行 `/me:update`（Claude Code）或 `$me:update`
 （Codex）；既有 vault 的 managed files 不由 setup 直接刷新。
+fresh setup 在首次写入前一次性 preflight 全部目标，包括双 Agent marker
+结构、target type/symlink 与 `.gitignore`；冲突时 vault/runtime 零变化，
+成功路径最后发布 config。
 
 ## /me:update - 升级 vault managed schema
 

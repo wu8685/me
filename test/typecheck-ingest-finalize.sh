@@ -5,7 +5,7 @@ typecheck_output="$(mktemp)"
 trap 'rm -f "$typecheck_output"' EXIT
 
 set +e
-./node_modules/.bin/tsc \
+"${TSC_BIN:-./node_modules/.bin/tsc}" \
   --noEmit \
   --allowImportingTsExtensions \
   --moduleResolution bundler \
@@ -18,8 +18,8 @@ typecheck_exit=$?
 set -e
 
 unexpected="$(
-  grep -E '^bin/ingest/(finalize|handout)\.ts.*error TS' "$typecheck_output" \
-    | grep -Ev "error TS2307: Cannot find module '(fs|path|os|crypto)'|error TS2304: Cannot find name 'URL'\\." \
+  grep -E 'error TS' "$typecheck_output" \
+    | grep -Ev "^bin/ingest/(finalize|handout)\\.ts.*(error TS2307: Cannot find module '(fs|path|os|crypto)'|error TS2304: Cannot find name 'URL'\\.)" \
     || true
 )"
 if [[ -n "$unexpected" ]]; then
@@ -29,11 +29,11 @@ fi
 
 if [[ "$typecheck_exit" -ne 0 ]]; then
   baseline_count="$(
-    { grep -E 'error TS' "$typecheck_output" || true; } \
+    { grep -E "^bin/ingest/(finalize|handout)\\.ts.*(error TS2307: Cannot find module '(fs|path|os|crypto)'|error TS2304: Cannot find name 'URL'\\.)" "$typecheck_output" || true; } \
       | wc -l \
       | tr -d ' '
   )"
-  printf 'PASS: no finalize/handout type errors; ignored %s transitive environment diagnostics\n' "$baseline_count"
+  printf 'PASS: no task-local type errors; ignored %s missing Node/URL typing diagnostics\n' "$baseline_count"
 else
   printf 'PASS: focused TypeScript check is clean\n'
 fi

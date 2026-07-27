@@ -18,6 +18,7 @@ me/
 │   ├── runtime-paths.ts          # Runtime resolution and containment
 │   ├── vault-write.ts            # Generic transactional vault writer CLI
 │   ├── vault-write/              # Validation, graph planning and transaction modules
+│   ├── setup-preflight.ts        # Read-only fresh setup safety preflight
 │   ├── update.ts                 # Versioned vault migration CLI
 │   ├── update/                   # Registry, planner, contracts and transaction modules
 │   ├── mutation/                 # Shared no-clobber mutation executor

@@ -146,6 +146,7 @@ test_plugin_structure() {
   fi
   assert_file_exists "$PLUGIN_ROOT/skills/setup/SKILL.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/skills/update/SKILL.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/setup-preflight.ts" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/SCHEMA.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/CLAUDE-template.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/AGENTS-template.md" || return 1
@@ -168,7 +169,15 @@ test_update_release_contract() {
   assert_file_contains "$setup_skill" 'vault_schema_version: 1' || return 1
   assert_file_contains "$setup_skill" 'Run \$me:update (Codex) or /me:update (Claude Code)' || return 1
   assert_file_contains "$setup_skill" 'AGENTS-template.md' || return 1
+  assert_file_contains "$setup_skill" 'bin/setup-preflight.ts' || return 1
   assert_file_contains "$setup_skill" 'no writes at all' || return 1
+  assert_file_contains "$setup_skill" 'Before the first `mkdir`' || return 1
+  assert_file_contains "$setup_skill" 'duplicate, nested, mismatched, unknown, or incomplete' || return 1
+  assert_file_contains "$setup_skill" 'Config — publish last' || return 1
+  assert_file_contains "$setup_skill" 'skill catalog' || return 1
+  assert_file_contains "$update_skill" 'skill catalog' || return 1
+  assert_file_not_contains "$setup_skill" '\${CLAUDE_PLUGIN_ROOT}/bin/' || return 1
+  assert_file_not_contains "$update_skill" '\${CLAUDE_PLUGIN_ROOT}/bin/' || return 1
   assert_file_contains "$PLUGIN_ROOT/templates/CLAUDE-template.md" '/me:update' || return 1
   assert_file_contains "$PLUGIN_ROOT/templates/AGENTS-template.md" '\$me:update' || return 1
   assert_file_contains "$PLUGIN_ROOT/.codex-plugin/plugin.json" '\$me:update' || return 1
@@ -178,8 +187,73 @@ test_update_release_contract() {
   ' "$PLUGIN_ROOT/package.json" || return 1
 }
 
+test_typecheck_allowlist_rejects_unrelated_errors() {
+  local fake_tsc="$MOCK_VAULT/fake-tsc"
+  cat > "$fake_tsc" <<'EOF'
+#!/usr/bin/env bash
+echo "bin/ingest.ts(1,1): error TS2345: unrelated true error"
+exit 2
+EOF
+  chmod +x "$fake_tsc"
+  if TSC_BIN="$fake_tsc" bash "$PLUGIN_ROOT/test/typecheck-ingest-finalize.sh" \
+    >/dev/null 2>&1; then
+    echo -e "    ${RED}FAIL${NC}: focused typecheck swallowed an unrelated error"
+    return 1
+  fi
+
+  cat > "$fake_tsc" <<'EOF'
+#!/usr/bin/env bash
+echo "bin/ingest/finalize.ts(1,1): error TS2307: Cannot find module 'fs' or its corresponding type declarations."
+exit 2
+EOF
+  chmod +x "$fake_tsc"
+  TSC_BIN="$fake_tsc" bash "$PLUGIN_ROOT/test/typecheck-ingest-finalize.sh" \
+    >/dev/null || return 1
+}
+
+test_skill_root_resolution_without_claude_env() {
+  local resolved_setup_root resolved_update_root
+  resolved_setup_root=$(cd "$(dirname "$PLUGIN_ROOT/skills/setup/SKILL.md")/../.." && pwd -P)
+  resolved_update_root=$(cd "$(dirname "$PLUGIN_ROOT/skills/update/SKILL.md")/../.." && pwd -P)
+  [ "$resolved_setup_root" = "$PLUGIN_ROOT" ] || return 1
+  [ "$resolved_update_root" = "$PLUGIN_ROOT" ] || return 1
+
+  local fresh="$MOCK_VAULT/fresh"
+  mkdir -p "$fresh"
+  local preflight
+  preflight=$(env -u CLAUDE_PLUGIN_ROOT bun run \
+    "$resolved_setup_root/bin/setup-preflight.ts" \
+    --vault-dir "$fresh" \
+    --raw-dir raw \
+    --practices-dir practices \
+    --cognition-dir cognition) || return 1
+  node -e '
+    const result=JSON.parse(process.argv[1]);
+    if (result.status !== "ready") process.exit(1);
+  ' "$preflight" || return 1
+
+  local legacy="$MOCK_VAULT/legacy"
+  mkdir -p "$legacy/.me"
+  printf 'layers:\n  raw: raw\n  practices: practices\n  cognition: cognition\n' \
+    > "$legacy/.me/config.yaml"
+  cp "$PLUGIN_ROOT/templates/migration-history/0000/SCHEMA.md" "$legacy/SCHEMA.md"
+  local preview
+  preview=$(env -u CLAUDE_PLUGIN_ROOT bun run \
+    "$resolved_update_root/bin/update.ts" preview --vault-dir "$legacy") || return 1
+  node -e '
+    const result=JSON.parse(process.argv[1]);
+    if (result.status !== "preview" || !result.planDigest) process.exit(1);
+  ' "$preview" || return 1
+}
+
 test_setup_current_contract_and_existing_zero_write() {
   local v="$MOCK_VAULT"
+
+  env -u CLAUDE_PLUGIN_ROOT bun run "$PLUGIN_ROOT/bin/setup-preflight.ts" \
+    --vault-dir "$v" \
+    --raw-dir raw \
+    --practices-dir practices \
+    --cognition-dir cognition >/dev/null || return 1
 
   # Execute the deterministic fresh setup writes described by the Skill.
   mkdir -p "$v/.me" "$v/raw" "$v/practices" "$v/cognition"
@@ -296,6 +370,7 @@ test_vault_writer_public_binary() {
   assert_file_exists "$PLUGIN_ROOT/bin/vault-write.ts" || return 1
   assert_file_exists "$PLUGIN_ROOT/bin/runtime.ts" || return 1
   assert_file_exists "$PLUGIN_ROOT/bin/update.ts" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/setup-preflight.ts" || return 1
   node -e '
     const p=require(process.argv[1]);
     if (p.bin["vault-write"] !== "bin/vault-write.ts") process.exit(1)
@@ -340,6 +415,7 @@ test_vault_writer_public_binary() {
   local required_release_path
   for required_release_path in \
     skills/update/SKILL.md \
+    bin/setup-preflight.ts \
     bin/update.ts \
     bin/update/transaction.ts \
     bin/update/migrations/0000-to-0001.ts \
@@ -5366,6 +5442,8 @@ main() {
     run_test test_plugin_structure
     run_test test_plugin_manifest
     run_test test_update_release_contract
+    run_test test_typecheck_allowlist_rejects_unrelated_errors
+    run_test test_skill_root_resolution_without_claude_env
     run_test test_setup_current_contract_and_existing_zero_write
     run_test test_update_cli_legacy_round_trip_preserves_user_agents
     run_test test_vault_writer_public_binary

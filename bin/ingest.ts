@@ -1004,10 +1004,10 @@ function isInside(root: string, candidate: string): boolean {
 const MAX_PROCESSED_MARKDOWN_BYTES = 4 * 1024 * 1024;
 
 function readLimitedDescriptor(descriptor: number): Buffer {
-  const chunks: Buffer[] = [];
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
   let total = 0;
   while (true) {
-    const chunk = Buffer.allocUnsafe(
+    const chunk = new Uint8Array(
       Math.min(64 * 1024, MAX_PROCESSED_MARKDOWN_BYTES - total + 1),
     );
     const count = fs.readSync(descriptor, chunk, 0, chunk.length, null);
@@ -1016,14 +1016,15 @@ function readLimitedDescriptor(descriptor: number): Buffer {
     if (total > MAX_PROCESSED_MARKDOWN_BYTES) {
       throw new Error('--processed-markdown exceeds 4 MiB');
     }
-    chunks.push(chunk.subarray(0, count));
+    chunks.push(chunk.slice(0, count));
   }
   return Buffer.concat(chunks, total);
 }
 
 function decodeProcessedMarkdown(bytes: Buffer): string {
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return new TextDecoder('utf-8', { fatal: true })
+      .decode(Uint8Array.from(bytes));
   } catch {
     throw new Error('--processed-markdown must be valid UTF-8');
   }
@@ -1459,7 +1460,7 @@ export async function runRichIngest(
 
 // ── CLI Entry Point ───────────────────────────────────────────────────────────
 
-if (import.meta.main) {
+if (require.main === module) {
   const args = process.argv.slice(2);
 
   if (args.length === 0 || args.includes('--help')) {

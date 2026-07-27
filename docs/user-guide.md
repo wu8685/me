@@ -58,6 +58,9 @@ Next steps:
 
 `setup` 只初始化新 vault。若 `.me/config.yaml` 已存在，它不会写 vault 或
 runtime，只会提示改用 `/me:update` 或 `$me:update`。
+fresh setup 会在首次写入前对 config、layer、SCHEMA、双 Agent markers、
+symlink/type 和 `.gitignore` 做完整只读 preflight；任一目标冲突则保持
+vault/runtime 不变。所有目标成功后才最后发布 schema v1 config。
 
 ## 升级插件与 vault
 

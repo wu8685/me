@@ -24,16 +24,28 @@ files, push, or otherwise commit the user's vault.
 Use cwd when no path is supplied. Otherwise accept one explicit vault path.
 Reject multiple paths. The target must contain `.me/config.yaml`.
 
-Resolve the plugin executable as
-`${CLAUDE_PLUGIN_ROOT}/bin/update.ts`. Run it with Bun; do not reproduce its
-planning or mutation logic in shell or edit a migration target yourself.
+Resolve `PLUGIN_ROOT` without writing:
+
+1. In Claude Code, if `CLAUDE_PLUGIN_ROOT` is non-empty, canonicalize it and
+   use it.
+2. Otherwise, in Codex, take the absolute path shown for this loaded
+   `skills/update/SKILL.md` by the skill catalog and walk up from
+   `skills/update/SKILL.md` to the plugin root. Concretely, canonicalize
+   `dirname(<absolute-SKILL.md>)/../..`; do not derive it from cwd.
+3. Verify `<PLUGIN_ROOT>/skills/update/SKILL.md`,
+   `<PLUGIN_ROOT>/bin/update.ts`, and `<PLUGIN_ROOT>/bin/update/` exist.
+
+Never expand an unset `CLAUDE_PLUGIN_ROOT` into `/bin/update.ts`. If neither
+trusted source yields a verified absolute plugin root, stop without preview or
+apply. Run the verified executable with Bun; do not reproduce its planning or
+mutation logic in shell or edit a migration target yourself.
 
 ## Step 2: Preview
 
 Run:
 
 ```bash
-bun run "${CLAUDE_PLUGIN_ROOT}/bin/update.ts" preview --vault-dir "<target>"
+bun run "<PLUGIN_ROOT>/bin/update.ts" preview --vault-dir "<target>"
 ```
 
 Parse the single structured JSON result.
@@ -73,7 +85,7 @@ does not affirm, report `not written` and stop without calling `apply`.
 After an affirmative response, pass the exact digest from Step 2:
 
 ```bash
-bun run "${CLAUDE_PLUGIN_ROOT}/bin/update.ts" apply \
+bun run "<PLUGIN_ROOT>/bin/update.ts" apply \
   --vault-dir "<target>" \
   --expected-plan-digest "<planDigest>"
 ```
