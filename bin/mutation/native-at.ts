@@ -20,11 +20,12 @@ interface NativeLibrary {
       destinationName: Buffer,
       flags: number,
     ): number;
-    renameat(
+    renameNoReplace(
       sourceParentDescriptor: number,
       sourceName: Buffer,
       destinationParentDescriptor: number,
       destinationName: Buffer,
+      flags: number,
     ): number;
     unlinkat(parentDescriptor: number, name: Buffer, flags: number): number;
     mkdirat(parentDescriptor: number, name: Buffer, mode: number): number;
@@ -32,7 +33,8 @@ interface NativeLibrary {
   };
 }
 
-const AT_REMOVEDIR = 0x0080;
+const AT_REMOVEDIR = process.platform === 'darwin' ? 0x0080 : 0x0200;
+const RENAME_NOREPLACE = process.platform === 'darwin' ? 0x0004 : 0x0001;
 let library: NativeLibrary | undefined;
 
 function unsupported(): never {
@@ -52,6 +54,7 @@ function loadLibrary(): NativeLibrary {
       : undefined;
   if (!libraryPath) unsupported();
   const errnoSymbol = process.platform === 'darwin' ? '__error' : '__errno_location';
+  const renameSymbol = process.platform === 'darwin' ? 'renameatx_np' : 'renameat2';
   try {
     const loaded = dlopen(libraryPath, {
       openat: {
@@ -68,8 +71,14 @@ function loadLibrary(): NativeLibrary {
         ],
         returns: FFIType.i32,
       },
-      renameat: {
-        args: [FFIType.i32, FFIType.cstring, FFIType.i32, FFIType.cstring],
+      [renameSymbol]: {
+        args: [
+          FFIType.i32,
+          FFIType.cstring,
+          FFIType.i32,
+          FFIType.cstring,
+          FFIType.i32,
+        ],
         returns: FFIType.i32,
       },
       unlinkat: {
@@ -85,10 +94,15 @@ function loadLibrary(): NativeLibrary {
     const symbols = loaded.symbols as unknown as NativeLibrary['symbols'] & {
       __error?: () => number;
       __errno_location?: () => number;
+      renameatx_np?: NativeLibrary['symbols']['renameNoReplace'];
+      renameat2?: NativeLibrary['symbols']['renameNoReplace'];
     };
     symbols.errnoLocation = process.platform === 'darwin'
       ? symbols.__error!
       : symbols.__errno_location!;
+    symbols.renameNoReplace = process.platform === 'darwin'
+      ? symbols.renameatx_np!
+      : symbols.renameat2!;
     library = { handle: loaded, symbols };
     return library;
   } catch {
@@ -139,14 +153,22 @@ export function createNativeMutationAtomicOperations(): MutationAtomicOperations
       );
       if (result < 0) nativeFailure('linkat');
     },
-    renameAt(sourceParentDescriptor, sourceName, destinationParentDescriptor, destinationName) {
-      const result = loadLibrary().symbols.renameat(
+    renameNoReplaceAt(
+      sourceParentDescriptor,
+      sourceName,
+      destinationParentDescriptor,
+      destinationName,
+    ) {
+      const result = loadLibrary().symbols.renameNoReplace(
         sourceParentDescriptor,
         cString(sourceName),
         destinationParentDescriptor,
         cString(destinationName),
+        RENAME_NOREPLACE,
       );
-      if (result < 0) nativeFailure('renameat');
+      if (result < 0) nativeFailure(
+        process.platform === 'darwin' ? 'renameatx_np' : 'renameat2',
+      );
     },
     unlinkAt(parentDescriptor, name, directory) {
       const result = loadLibrary().symbols.unlinkat(

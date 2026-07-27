@@ -147,7 +147,6 @@ export function createMutationExecutor(options: {
   const operations = options.fileOps ?? defaultFileOperations();
   const atomic = options.atomicOps ?? createNativeMutationAtomicOperations();
   let warnedDirectoryFsync = false;
-  let quarantineSequence = 0;
 
   const closeDescriptor = (descriptor: number): void => {
     try {
@@ -247,6 +246,7 @@ export function createMutationExecutor(options: {
       };
     } catch (error) {
       if (error instanceof MutationFailure) throw error;
+      if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
       failure('UNSAFE_PATH');
     } finally {
       if (descriptor !== undefined) closeDescriptor(descriptor);
@@ -280,6 +280,7 @@ export function createMutationExecutor(options: {
       };
     } catch (error) {
       if (error instanceof MutationFailure) throw error;
+      if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
       failure('UNSAFE_PATH');
     } finally {
       if (descriptor !== undefined) closeDescriptor(descriptor);
@@ -343,16 +344,12 @@ export function createMutationExecutor(options: {
     }
   };
 
-  const syncDirectory = (directory: string): void => {
-    let descriptor: number | undefined;
+  const syncOpenedDirectory = (opened: OpenedDirectory): void => {
     try {
       if (options.directoryFsync) {
-        options.directoryFsync(directory);
+        options.directoryFsync(opened.path);
       } else {
-        const opened = openDirectory(directory);
-        descriptor = opened.descriptor;
-        operations.fsyncSync(descriptor);
-        if (!directoryStillNamed(opened)) failure('UNSAFE_PATH');
+        operations.fsyncSync(opened.descriptor);
       }
     } catch (error) {
       if (error instanceof MutationFailure) throw error;
@@ -361,8 +358,16 @@ export function createMutationExecutor(options: {
         warnedDirectoryFsync = true;
         options.hooks?.onWarning?.('DIRECTORY_FSYNC_UNSUPPORTED');
       }
+    }
+    if (!directoryStillNamed(opened)) failure('UNSAFE_PATH');
+  };
+
+  const syncDirectory = (directory: string): void => {
+    const opened = openDirectory(directory);
+    try {
+      syncOpenedDirectory(opened);
     } finally {
-      if (descriptor !== undefined) closeDescriptor(descriptor);
+      closeDescriptor(opened.descriptor);
     }
   };
 
@@ -387,10 +392,16 @@ export function createMutationExecutor(options: {
     phase: AtomicMutationPhase,
     paths: readonly string[],
     action: () => T,
+    afterSuccess?: () => void,
   ): T => {
     options.atomicHooks?.beforeAtomicMutation?.(kind, phase, paths);
     const result = action();
-    options.atomicHooks?.afterAtomicMutation?.(kind, phase, paths);
+    try {
+      afterSuccess?.();
+      options.atomicHooks?.afterAtomicMutation?.(kind, phase, paths);
+    } catch {
+      failure('OWNERSHIP_LOST');
+    }
     return result;
   };
 
@@ -400,36 +411,79 @@ export function createMutationExecutor(options: {
     return options.quarantineDirectory;
   };
 
-  const quarantineName = (source: string): string => {
-    quarantineSequence += 1;
-    return `.me-quarantine-${process.pid}-${quarantineSequence}-${entryName(source)}`;
+  const openQuarantine = (): OpenedDirectory => {
+    const quarantine = openDirectory(requireQuarantine());
+    if (quarantine.mode !== 0o700) {
+      closeDescriptor(quarantine.descriptor);
+      failure('UNSAFE_PATH');
+    }
+    return quarantine;
   };
 
-  const quarantineFile = (
-    kind: 'rename' | 'unlink',
+  const quarantineName = (): string =>
+    `.me-quarantine-${crypto.randomBytes(16).toString('hex')}`;
+
+  const moveToQuarantine = (
+    kind: 'rename' | 'unlink' | 'rmdir',
     sourceParent: OpenedDirectory,
-    source: OwnedFileFingerprint,
-  ): void => {
-    const quarantinePath = requireQuarantine();
-    const quarantine = openDirectory(quarantinePath);
-    const name = quarantineName(source.path);
-    const logicalQuarantine = path.join(quarantinePath, name);
-    try {
+    sourcePath: string,
+    quarantine: OpenedDirectory,
+    additionallySync?: OpenedDirectory,
+  ): { name: string; logicalPath: string } => {
+    for (let attempt = 0; attempt < 128; attempt += 1) {
+      const name = quarantineName();
+      const logicalPath = path.join(quarantine.path, name);
       try {
-        aroundAtomic(kind, 'quarantine', [source.path, logicalQuarantine], () =>
-          atomic.renameAt(
+        aroundAtomic(
+          kind,
+          'quarantine',
+          [sourcePath, logicalPath],
+          () => atomic.renameNoReplaceAt(
             sourceParent.descriptor,
-            entryName(source.path),
+            entryName(sourcePath),
             quarantine.descriptor,
             name,
-          ));
+          ),
+          () => {
+            const opened = additionallySync
+              ? [sourceParent, quarantine, additionallySync]
+              : [sourceParent, quarantine];
+            for (const directory of new Map(
+              opened.map(item => [item.descriptor, item]),
+            ).values()) {
+              syncOpenedDirectory(directory);
+            }
+          },
+        );
+        return { name, logicalPath };
       } catch (error) {
+        if (error instanceof MutationFailure) throw error;
+        if (errno(error) === 'EEXIST') continue;
         if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
         if (['ENOENT', 'ENOTDIR', 'EISDIR'].includes(errno(error) ?? '')) {
           failure('OWNERSHIP_LOST');
         }
         throw error;
       }
+    }
+    failure('OWNERSHIP_LOST');
+  };
+
+  const quarantineFile = (
+    kind: 'rename' | 'unlink',
+    sourceParent: OpenedDirectory,
+    source: OwnedFileFingerprint,
+    additionallySync?: OpenedDirectory,
+  ): void => {
+    const quarantine = openQuarantine();
+    try {
+      const { name, logicalPath: logicalQuarantine } = moveToQuarantine(
+        kind,
+        sourceParent,
+        source.path,
+        quarantine,
+        additionallySync,
+      );
       let quarantined: OwnedFileFingerprint;
       try {
         quarantined = captureFileAt(quarantine, name, logicalQuarantine);
@@ -442,10 +496,8 @@ export function createMutationExecutor(options: {
         || !directoryStillNamed(quarantine)
       ) failure('OWNERSHIP_LOST');
       try {
-        aroundAtomic(kind, 'remove', [logicalQuarantine], () =>
-          atomic.unlinkAt(quarantine.descriptor, name, false));
-      } catch (error) {
-        if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
+        atomic.unlinkAt(quarantine.descriptor, name, false);
+      } catch {
         failure('OWNERSHIP_LOST');
       }
       syncDirectory(quarantine.path);
@@ -460,35 +512,16 @@ export function createMutationExecutor(options: {
   ): void => {
     const quarantinePath = requireQuarantine();
     if (path.resolve(source.path) === path.resolve(quarantinePath)) {
-      if (!directoryStillNamed(sourceParent)) failure('OWNERSHIP_LOST');
-      try {
-        aroundAtomic('rmdir', 'remove', [source.path], () =>
-          atomic.unlinkAt(sourceParent.descriptor, entryName(source.path), true));
-      } catch (error) {
-        if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
-        failure('OWNERSHIP_LOST');
-      }
-      return;
+      failure('OWNERSHIP_LOST');
     }
-    const quarantine = openDirectory(quarantinePath);
-    const name = quarantineName(source.path);
-    const logicalQuarantine = path.join(quarantinePath, name);
+    const quarantine = openQuarantine();
     try {
-      try {
-        aroundAtomic('rmdir', 'quarantine', [source.path, logicalQuarantine], () =>
-          atomic.renameAt(
-            sourceParent.descriptor,
-            entryName(source.path),
-            quarantine.descriptor,
-            name,
-          ));
-      } catch (error) {
-        if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
-        if (['ENOENT', 'ENOTDIR', 'EISDIR'].includes(errno(error) ?? '')) {
-          failure('OWNERSHIP_LOST');
-        }
-        throw error;
-      }
+      const { name, logicalPath: logicalQuarantine } = moveToQuarantine(
+        'rmdir',
+        sourceParent,
+        source.path,
+        quarantine,
+      );
       let quarantined: OwnedDirectoryFingerprint;
       try {
         quarantined = captureDirectoryAt(quarantine, name, logicalQuarantine);
@@ -501,10 +534,8 @@ export function createMutationExecutor(options: {
         || !directoryStillNamed(quarantine)
       ) failure('OWNERSHIP_LOST');
       try {
-        aroundAtomic('rmdir', 'remove', [logicalQuarantine], () =>
-          atomic.unlinkAt(quarantine.descriptor, name, true));
-      } catch (error) {
-        if (unsupportedAtomicError(error)) failure('UNSUPPORTED_FILESYSTEM');
+        atomic.unlinkAt(quarantine.descriptor, name, true);
+      } catch {
         failure('OWNERSHIP_LOST');
       }
       syncDirectory(quarantine.path);
@@ -557,8 +588,9 @@ export function createMutationExecutor(options: {
     link(source, destination) {
       return boundary('link', [source.path, destination], () => {
         const sourceParent = openDirectory(path.dirname(source.path));
-        const destinationParent = openDirectory(path.dirname(destination));
+        let destinationParent: OpenedDirectory | undefined;
         try {
+          destinationParent = openDirectory(path.dirname(destination));
           const current = captureFileAt(
             sourceParent,
             entryName(source.path),
@@ -607,7 +639,7 @@ export function createMutationExecutor(options: {
           return linked;
         } finally {
           closeDescriptor(sourceParent.descriptor);
-          closeDescriptor(destinationParent.descriptor);
+          if (destinationParent) closeDescriptor(destinationParent.descriptor);
         }
       });
     },
@@ -615,8 +647,9 @@ export function createMutationExecutor(options: {
     rename(source, destination) {
       return boundary('rename', [source.path, destination], () => {
         const sourceParent = openDirectory(path.dirname(source.path));
-        const destinationParent = openDirectory(path.dirname(destination));
+        let destinationParent: OpenedDirectory | undefined;
         try {
+          destinationParent = openDirectory(path.dirname(destination));
           const current = captureFileAt(
             sourceParent,
             entryName(source.path),
@@ -662,7 +695,7 @@ export function createMutationExecutor(options: {
             || !directoryStillNamed(sourceParent)
             || !directoryStillNamed(destinationParent)
           ) failure('OWNERSHIP_LOST');
-          quarantineFile('rename', sourceParent, linkedSource);
+          quarantineFile('rename', sourceParent, linkedSource, destinationParent);
           const moved = captureFileAt(
             destinationParent,
             entryName(destination),
@@ -674,7 +707,7 @@ export function createMutationExecutor(options: {
           return moved;
         } finally {
           closeDescriptor(sourceParent.descriptor);
-          closeDescriptor(destinationParent.descriptor);
+          if (destinationParent) closeDescriptor(destinationParent.descriptor);
         }
       });
     },

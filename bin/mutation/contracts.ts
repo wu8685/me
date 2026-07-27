@@ -122,7 +122,7 @@ export interface MutationAtomicOperations {
     destinationParentDescriptor: number,
     destinationName: string,
   ): void;
-  renameAt(
+  renameNoReplaceAt(
     sourceParentDescriptor: number,
     sourceName: string,
     destinationParentDescriptor: number,

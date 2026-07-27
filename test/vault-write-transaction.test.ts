@@ -1087,8 +1087,13 @@ describe('fingerprint, no-clobber, and rollback windows', () => {
           );
         },
       });
-      expect(result.status).toBe('conflict');
-      expect(result.error?.code).toBe('INPUT_CHANGED');
+      if (internal === 'transactions') {
+        expect(result.status).toBe('manual_recovery');
+        expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+      } else {
+        expect(result.status).toBe('conflict');
+        expect(result.error?.code).toBe('INPUT_CHANGED');
+      }
     },
   );
 

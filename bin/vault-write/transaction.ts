@@ -898,10 +898,7 @@ class Transaction {
       },
       fileOps: this.operations,
       atomicHooks: options.atomicHooks,
-      quarantineDirectory: path.join(
-        this.plan.layout.transactionDir,
-        `vault-write-${this.operationId}`,
-      ),
+      quarantineDirectory: this.plan.layout.transactionDir,
       directoryFsync: options.directoryFsync,
     });
   }

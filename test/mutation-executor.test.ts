@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   MutationFailure,
+  type MutationAtomicOperations,
   type FilesystemMutationKind,
   type MutationExecutor,
   type MutationFileOperations,
@@ -11,6 +12,7 @@ import {
   type MutationPathPolicy,
 } from '../bin/mutation/contracts.ts';
 import { createMutationExecutor } from '../bin/mutation/executor.ts';
+import { createNativeMutationAtomicOperations } from '../bin/mutation/native-at.ts';
 
 const temporaryDirectories: string[] = [];
 
@@ -28,6 +30,7 @@ function fixture(options: {
   ): void;
   onWarning?(code: 'DIRECTORY_FSYNC_UNSUPPORTED'): void;
   fileOps?: Partial<MutationFileOperations>;
+  atomicOps?: MutationAtomicOperations;
   atomicHooks?: NonNullable<
     Parameters<typeof createMutationExecutor>[0]['atomicHooks']
   >;
@@ -95,6 +98,7 @@ function fixture(options: {
       },
       fileOps: { ...defaults, ...options.fileOps },
       atomicHooks: options.atomicHooks,
+      atomicOps: options.atomicOps,
       directoryFsync: options.directoryFsync,
       quarantineDirectory,
     } as Parameters<typeof createMutationExecutor>[0]),
@@ -446,6 +450,298 @@ describe('shared filesystem mutation executor', () => {
     expect(fs.readFileSync(source, 'utf8')).toBe('owned');
     expect(fs.readdirSync(quarantineDirectory!)).toEqual([]);
   });
+
+  test.each(['file', 'directory'] as const)(
+    'native quarantine no-replace preserves a colliding foreign %s',
+    entryType => {
+      const native = createNativeMutationAtomicOperations();
+      let collisionName = '';
+      let injected = false;
+      const renameNames: string[] = [];
+      const atomicOps: MutationAtomicOperations = {
+        ...native,
+        renameNoReplaceAt(sourceParent, sourceName, destinationParent, destinationName) {
+          renameNames.push(destinationName);
+          if (!injected) {
+            injected = true;
+            collisionName = destinationName;
+            if (entryType === 'file') {
+              const descriptor = native.openAt(
+                destinationParent,
+                destinationName,
+                fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+                0o600,
+              );
+              fs.writeSync(descriptor, 'foreign');
+              fs.fchmodSync(descriptor, 0o600);
+              fs.closeSync(descriptor);
+            } else {
+              native.mkdirAt(destinationParent, destinationName, 0o700);
+            }
+          }
+          native.renameNoReplaceAt(
+            sourceParent,
+            sourceName,
+            destinationParent,
+            destinationName,
+          );
+        },
+      };
+      const { root, executor, quarantineDirectory } = fixture({
+        atomicOps,
+        directoryFsync() {},
+      });
+      const source = path.join(root, entryType === 'file' ? 'owned.md' : 'owned-dir');
+      if (entryType === 'file') fs.writeFileSync(source, 'owned');
+      else fs.mkdirSync(source);
+
+      if (entryType === 'file') executor.unlink(executor.captureFile(source));
+      else executor.rmdir(executor.captureDirectory(source));
+
+      expect(renameNames).toHaveLength(2);
+      expect(renameNames[0]).not.toBe(renameNames[1]);
+      expect(renameNames.every(name => /^\.me-quarantine-[a-f0-9]{32}$/.test(name)))
+        .toBeTrue();
+      const collision = path.join(quarantineDirectory!, collisionName);
+      if (entryType === 'file') expect(fs.readFileSync(collision, 'utf8')).toBe('foreign');
+      else expect(fs.statSync(collision).isDirectory()).toBeTrue();
+    },
+  );
+
+  test('native rename-no-replace never overwrites an existing entry', () => {
+    const native = createNativeMutationAtomicOperations();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-native-rename-exclusive-'));
+    temporaryDirectories.push(root);
+    fs.writeFileSync(path.join(root, 'source'), 'owned');
+    fs.writeFileSync(path.join(root, 'destination'), 'foreign');
+    const descriptor = fs.openSync(
+      root,
+      fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+    );
+    let error: NodeJS.ErrnoException | undefined;
+    try {
+      try {
+        native.renameNoReplaceAt(descriptor, 'source', descriptor, 'destination');
+      } catch (caught) {
+        error = caught as NodeJS.ErrnoException;
+      }
+    } finally {
+      fs.closeSync(descriptor);
+    }
+
+    expect(error?.code).toBe('EEXIST');
+    expect(fs.readFileSync(path.join(root, 'source'), 'utf8')).toBe('owned');
+    expect(fs.readFileSync(path.join(root, 'destination'), 'utf8')).toBe('foreign');
+  });
+
+  test('native unlinkat removes an empty directory with the platform flag', () => {
+    const native = createNativeMutationAtomicOperations();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-native-rmdir-'));
+    temporaryDirectories.push(root);
+    fs.mkdirSync(path.join(root, 'empty'));
+    const descriptor = fs.openSync(
+      root,
+      fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+    );
+    try {
+      native.unlinkAt(descriptor, 'empty', true);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+
+    expect(fs.existsSync(path.join(root, 'empty'))).toBeFalse();
+  });
+
+  test.each([
+    ['link', 'publish'],
+    ['rename', 'publish'],
+    ['unlink', 'quarantine'],
+    ['mkdir', 'create'],
+    ['rmdir', 'quarantine'],
+  ] as const)(
+    'maps %s success followed by a post-success hook failure to ownership recovery',
+    (primitive, failurePhase) => {
+      const boundaries: string[] = [];
+      const { root, executor, quarantineDirectory } = fixture({
+        journal: {
+          beforeMutation: kind => boundaries.push(`before:${kind}`),
+          afterMutation: kind => boundaries.push(`after:${kind}`),
+        },
+        atomicHooks: {
+          afterAtomicMutation(kind, phase) {
+            if (kind === primitive && phase === failurePhase) throw errno('ENOTSUP');
+          },
+        },
+        directoryFsync() {},
+      });
+      const source = path.join(root, 'source');
+      const destination = path.join(root, 'destination');
+      if (primitive === 'rmdir') fs.mkdirSync(source);
+      else if (primitive !== 'mkdir') fs.writeFileSync(source, 'owned');
+
+      const action = (): void => {
+        if (primitive === 'mkdir') executor.mkdir(destination, 0o700);
+        else if (primitive === 'rmdir') executor.rmdir(executor.captureDirectory(source));
+        else if (primitive === 'unlink') executor.unlink(executor.captureFile(source));
+        else executor[primitive](executor.captureFile(source), destination);
+      };
+
+      expect(action).toThrow(new MutationFailure('OWNERSHIP_LOST'));
+      expect(boundaries).toEqual([`before:${primitive}`]);
+      if (primitive === 'link' || primitive === 'rename' || primitive === 'mkdir') {
+        expect(fs.existsSync(destination)).toBeTrue();
+      }
+      if (primitive === 'rename') expect(fs.existsSync(source)).toBeTrue();
+      if (primitive === 'unlink' || primitive === 'rmdir') {
+        expect(fs.existsSync(source)).toBeFalse();
+        expect(fs.readdirSync(quarantineDirectory!)).toHaveLength(1);
+      }
+    },
+  );
+
+  test('maps descriptor-relative ENOTSUP during capture to UNSUPPORTED_FILESYSTEM', () => {
+    const native = createNativeMutationAtomicOperations();
+    const { root, executor } = fixture({
+      atomicOps: {
+        ...native,
+        openAt() {
+          throw errno('ENOTSUP');
+        },
+      },
+    });
+    const source = path.join(root, 'source.md');
+    fs.writeFileSync(source, 'owned');
+
+    expect(() => executor.captureFile(source))
+      .toThrow(new MutationFailure('UNSUPPORTED_FILESYSTEM'));
+  });
+
+  test('closes the source parent when opening the destination parent fails', () => {
+    let failDirectory = '';
+    let opened = 0;
+    let closed = 0;
+    const { root, executor } = fixture({
+      fileOps: {
+        openSync(candidate, flags, mode) {
+          if (candidate === failDirectory) throw errno('EACCES');
+          opened += 1;
+          return fs.openSync(candidate, flags, mode);
+        },
+        closeSync(descriptor) {
+          closed += 1;
+          fs.closeSync(descriptor);
+        },
+      } as Partial<MutationFileOperations>,
+      directoryFsync() {},
+    });
+    const source = path.join(root, 'source.md');
+    failDirectory = path.join(root, 'destination-parent');
+    fs.writeFileSync(source, 'owned');
+    fs.mkdirSync(failDirectory);
+    const owned = executor.captureFile(source);
+    opened = 0;
+    closed = 0;
+
+    expect(() => executor.link(owned, path.join(failDirectory, 'destination.md')))
+      .toThrow(new MutationFailure('UNSAFE_PATH'));
+    expect(opened).toBe(1);
+    expect(closed).toBe(1);
+  });
+
+  test('fsyncs source and quarantine immediately after quarantine rename', () => {
+    const native = createNativeMutationAtomicOperations();
+    const events: string[] = [];
+    let source = '';
+    let replaced = false;
+    const { root, executor, quarantineDirectory } = fixture({
+      atomicOps: {
+        ...native,
+        renameNoReplaceAt(sourceParent, sourceName, destinationParent, destinationName) {
+          events.push('rename');
+          native.renameNoReplaceAt(
+            sourceParent,
+            sourceName,
+            destinationParent,
+            destinationName,
+          );
+        },
+      },
+      atomicHooks: {
+        beforeAtomicMutation(kind, phase) {
+          if (kind === 'unlink' && phase === 'quarantine' && !replaced) {
+            replaced = true;
+            fs.unlinkSync(source);
+            fs.writeFileSync(source, 'foreign');
+          }
+        },
+      },
+      directoryFsync(directory) {
+        events.push(`fsync:${directory}`);
+      },
+    });
+    source = path.join(root, 'owned.md');
+    fs.writeFileSync(source, 'owned');
+
+    expect(() => executor.unlink(executor.captureFile(source)))
+      .toThrow(new MutationFailure('OWNERSHIP_LOST'));
+    expect(events.slice(0, 3)).toEqual([
+      'rename',
+      `fsync:${root}`,
+      `fsync:${quarantineDirectory}`,
+    ]);
+  });
+
+  test('requires a 0700 owned quarantine directory', () => {
+    const { root, executor, quarantineDirectory } = fixture({
+      directoryFsync() {},
+    });
+    fs.chmodSync(quarantineDirectory!, 0o755);
+    const source = path.join(root, 'owned.md');
+    fs.writeFileSync(source, 'owned');
+
+    expect(() => executor.unlink(executor.captureFile(source)))
+      .toThrow(new MutationFailure('UNSAFE_PATH'));
+    expect(fs.readFileSync(source, 'utf8')).toBe('owned');
+  });
+
+  test('never directly removes the quarantine root', () => {
+    const { executor, quarantineDirectory } = fixture({
+      directoryFsync() {},
+    });
+    const owned = executor.captureDirectory(quarantineDirectory!);
+
+    expect(() => executor.rmdir(owned))
+      .toThrow(new MutationFailure('OWNERSHIP_LOST'));
+    expect(fs.statSync(quarantineDirectory!).isDirectory()).toBeTrue();
+  });
+
+  test.each(['file', 'directory'] as const)(
+    'preserves quarantined %s when its final atomic delete is uncertain',
+    entryType => {
+      const native = createNativeMutationAtomicOperations();
+      const { root, executor, quarantineDirectory } = fixture({
+        atomicOps: {
+          ...native,
+          unlinkAt(parentDescriptor, name, directory) {
+            if (name.startsWith('.me-quarantine-')) throw errno('EIO');
+            native.unlinkAt(parentDescriptor, name, directory);
+          },
+        },
+        directoryFsync() {},
+      });
+      const source = path.join(root, entryType === 'file' ? 'owned.md' : 'owned-dir');
+      if (entryType === 'file') fs.writeFileSync(source, 'owned');
+      else fs.mkdirSync(source);
+
+      const action = (): void => {
+        if (entryType === 'file') executor.unlink(executor.captureFile(source));
+        else executor.rmdir(executor.captureDirectory(source));
+      };
+      expect(action).toThrow(new MutationFailure('OWNERSHIP_LOST'));
+      expect(fs.existsSync(source)).toBeFalse();
+      expect(fs.readdirSync(quarantineDirectory!)).toHaveLength(1);
+    },
+  );
 
   test.each(['link', 'rename'] as const)(
     'checks source and destination devices before %s',
