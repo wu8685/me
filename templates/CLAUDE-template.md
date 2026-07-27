@@ -38,6 +38,7 @@ cat .me/config.yaml
 | Command | Action |
 |---------|--------|
 | `/me:setup` | Initialize this workspace (already done) |
+| `/me:update` | Preview and, after explicit confirmation, apply forward-only managed vault migrations |
 | `/me:ingest <url> [--mode translate-cn\|summarize\|raw\|transcribe]` | Ingest URL into structured note in the raw layer. Supports HTML articles (auto-detects language/mode) and Bilibili videos (metadata + CC; `--mode transcribe` forces whisper ASR when no CC) |
 | `/me:checklinks [layer]` | Check vault link health — broken wikilinks, orphans, dead-ends (optionally filter by layer) |
 | `/me:autolinks [file] [layer]` | Auto-add wikilinks via LLM concept extraction matched against vault index (bulk or single-note) |

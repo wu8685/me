@@ -145,12 +145,128 @@ test_plugin_structure() {
     return 1
   fi
   assert_file_exists "$PLUGIN_ROOT/skills/setup/SKILL.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/skills/update/SKILL.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/SCHEMA.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/CLAUDE-template.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/templates/AGENTS-template.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/raw-template.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/practices-template.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/templates/cognition-template.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/references/gitignore-snippet.txt" || return 1
+}
+
+test_update_release_contract() {
+  local update_skill="$PLUGIN_ROOT/skills/update/SKILL.md"
+  local setup_skill="$PLUGIN_ROOT/skills/setup/SKILL.md"
+
+  assert_file_contains "$update_skill" 'bin/update.ts.*preview\|bin/update.ts" preview' || return 1
+  assert_file_contains "$update_skill" 'expected-plan-digest' || return 1
+  assert_file_contains "$update_skill" 'single explicit confirmation\|one explicit confirmation' || return 1
+  assert_file_contains "$update_skill" 'Never edit migration targets directly' || return 1
+  assert_file_contains "$update_skill" "Preview does not authorize" || return 1
+  assert_file_contains "$update_skill" 'STALE_PREVIEW' || return 1
+  assert_file_contains "$setup_skill" 'vault_schema_version: 1' || return 1
+  assert_file_contains "$setup_skill" 'Run \$me:update (Codex) or /me:update (Claude Code)' || return 1
+  assert_file_contains "$setup_skill" 'AGENTS-template.md' || return 1
+  assert_file_contains "$setup_skill" 'no writes at all' || return 1
+  assert_file_contains "$PLUGIN_ROOT/templates/CLAUDE-template.md" '/me:update' || return 1
+  assert_file_contains "$PLUGIN_ROOT/templates/AGENTS-template.md" '\$me:update' || return 1
+  assert_file_contains "$PLUGIN_ROOT/.codex-plugin/plugin.json" '\$me:update' || return 1
+  node -e '
+    const manifest=require(process.argv[1]);
+    if (manifest.bin["me-update"] !== "bin/update.ts") process.exit(1);
+  ' "$PLUGIN_ROOT/package.json" || return 1
+}
+
+test_setup_current_contract_and_existing_zero_write() {
+  local v="$MOCK_VAULT"
+
+  # Execute the deterministic fresh setup writes described by the Skill.
+  mkdir -p "$v/.me" "$v/raw" "$v/practices" "$v/cognition"
+  touch "$v/raw/.gitkeep" "$v/practices/.gitkeep" "$v/cognition/.gitkeep"
+  {
+    echo '# me plugin configuration'
+    echo 'vault_schema_version: 1'
+    echo
+    echo 'layers:'
+    echo '  raw: "raw"'
+    echo '  practices: "practices"'
+    echo '  cognition: "cognition"'
+  } > "$v/.me/config.yaml"
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$v/SCHEMA.md"
+  cp "$PLUGIN_ROOT/templates/CLAUDE-template.md" "$v/CLAUDE.md"
+  cp "$PLUGIN_ROOT/templates/AGENTS-template.md" "$v/AGENTS.md"
+
+  assert_file_contains "$v/.me/config.yaml" '^vault_schema_version: 1$' || return 1
+  assert_file_contains "$v/CLAUDE.md" '<!-- me:managed:start knowledge-base -->' || return 1
+  assert_file_contains "$v/AGENTS.md" '<!-- me:managed:start knowledge-base -->' || return 1
+
+  # The existing-vault route must happen before any write/runtime bootstrap.
+  local before after runtime_before runtime_after
+  before=$(find "$v" -type f -exec cksum {} \; | sort)
+  runtime_before=$(find "$ME_RUNTIME_ROOT" -type f -exec cksum {} \; | sort)
+  if [ -f "$v/.me/config.yaml" ]; then
+    : # setup stops and reports update guidance
+  fi
+  after=$(find "$v" -type f -exec cksum {} \; | sort)
+  [ "$after" = "$before" ] || {
+    echo -e "    ${RED}FAIL${NC}: existing setup route changed vault bytes"
+    return 1
+  }
+  runtime_after=$(find "$ME_RUNTIME_ROOT" -type f -exec cksum {} \; | sort)
+  [ "$runtime_after" = "$runtime_before" ] || {
+    echo -e "    ${RED}FAIL${NC}: existing setup route created runtime state"
+    return 1
+  }
+}
+
+test_update_cli_legacy_round_trip_preserves_user_agents() {
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/.me"
+  {
+    echo '# user config comment'
+    echo 'layers:'
+    echo '  raw: "raw"'
+    echo '  practices: "practices"'
+    echo '  cognition: "cognition"'
+  } > "$v/.me/config.yaml"
+  cp "$PLUGIN_ROOT/templates/migration-history/0000/SCHEMA.md" "$v/SCHEMA.md"
+  printf '# Claude user rule\nKeep claude bytes.\n' > "$v/CLAUDE.md"
+  printf '# Codex user rule\nKeep codex bytes.\n' > "$v/AGENTS.md"
+
+  local before preview digest apply second
+  before=$(find "$v" -type f -exec cksum {} \; | sort)
+  preview=$(bun run "$PLUGIN_ROOT/bin/update.ts" preview --vault-dir "$v") || return 1
+  node -e '
+    const r=JSON.parse(process.argv[1]);
+    if (r.status !== "preview" || !r.planDigest) process.exit(1);
+    if (r.migrations.map(m => m.id).join(",") !== "0000-to-0001") process.exit(1);
+  ' "$preview" || return 1
+  [ "$(find "$v" -type f -exec cksum {} \; | sort)" = "$before" ] || {
+    echo -e "    ${RED}FAIL${NC}: preview changed legacy vault"
+    return 1
+  }
+
+  digest=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).planDigest)' "$preview")
+  apply=$(bun run "$PLUGIN_ROOT/bin/update.ts" apply --vault-dir "$v" \
+    --expected-plan-digest "$digest") || return 1
+  node -e '
+    const r=JSON.parse(process.argv[1]);
+    if (r.status !== "committed" || r.recoveryState !== "none") process.exit(1);
+  ' "$apply" || return 1
+  assert_file_contains "$v/.me/config.yaml" '^vault_schema_version: 1$' || return 1
+  assert_file_contains "$v/CLAUDE.md" '^# Claude user rule$' || return 1
+  assert_file_contains "$v/CLAUDE.md" '^Keep claude bytes\.$' || return 1
+  assert_file_contains "$v/CLAUDE.md" '<!-- me:managed:start knowledge-base -->' || return 1
+  assert_file_contains "$v/AGENTS.md" '^# Codex user rule$' || return 1
+  assert_file_contains "$v/AGENTS.md" '^Keep codex bytes\.$' || return 1
+  assert_file_contains "$v/AGENTS.md" '<!-- me:managed:start knowledge-base -->' || return 1
+
+  second=$(bun run "$PLUGIN_ROOT/bin/update.ts" preview --vault-dir "$v") || return 1
+  node -e '
+    const r=JSON.parse(process.argv[1]);
+    if (r.status !== "up_to_date" || r.currentVaultSchemaVersion !== 1) process.exit(1);
+  ' "$second" || return 1
 }
 
 test_plugin_manifest() {
@@ -179,10 +295,12 @@ test_plugin_manifest() {
 test_vault_writer_public_binary() {
   assert_file_exists "$PLUGIN_ROOT/bin/vault-write.ts" || return 1
   assert_file_exists "$PLUGIN_ROOT/bin/runtime.ts" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/update.ts" || return 1
   node -e '
     const p=require(process.argv[1]);
     if (p.bin["vault-write"] !== "bin/vault-write.ts") process.exit(1)
     if (p.bin["me-runtime"] !== "bin/runtime.ts") process.exit(1)
+    if (p.bin["me-update"] !== "bin/update.ts") process.exit(1)
   ' "$PLUGIN_ROOT/package.json" || return 1
   if [ ! -x "$PLUGIN_ROOT/bin/vault-write.ts" ]; then
     echo -e "    ${RED}FAIL${NC}: vault-write entrypoint is not executable"
@@ -192,8 +310,12 @@ test_vault_writer_public_binary() {
     echo -e "    ${RED}FAIL${NC}: runtime entrypoint is not executable"
     return 1
   fi
+  if [ ! -x "$PLUGIN_ROOT/bin/update.ts" ]; then
+    echo -e "    ${RED}FAIL${NC}: update entrypoint is not executable"
+    return 1
+  fi
 
-  local pack_dir install_dir tarball binary runtime_binary result
+  local pack_dir install_dir tarball binary runtime_binary update_binary result
   pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-pack.XXXXXX")
   install_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-install.XXXXXX")
   tarball=$(npm pack --silent --pack-destination "$pack_dir" "$PLUGIN_ROOT") || return 1
@@ -209,6 +331,31 @@ test_vault_writer_public_binary() {
     echo -e "    ${RED}FAIL${NC}: packed me-runtime binary is not executable"
     return 1
   fi
+  update_binary="$install_dir/node_modules/.bin/me-update"
+  if [ ! -x "$update_binary" ]; then
+    echo -e "    ${RED}FAIL${NC}: packed me-update binary is not executable"
+    return 1
+  fi
+  local installed_package="$install_dir/node_modules/me"
+  local required_release_path
+  for required_release_path in \
+    skills/update/SKILL.md \
+    bin/update.ts \
+    bin/update/transaction.ts \
+    bin/update/migrations/0000-to-0001.ts \
+    bin/mutation/executor.ts \
+    templates/CLAUDE-template.md \
+    templates/AGENTS-template.md \
+    templates/migration-history/0000/CLAUDE-template.md \
+    templates/migration-history/0000/SCHEMA.md; do
+    assert_file_exists "$installed_package/$required_release_path" || return 1
+  done
+  for required_release_path in test graphify-out runtime .planning .worktrees; do
+    if [ -e "$installed_package/$required_release_path" ]; then
+      echo -e "    ${RED}FAIL${NC}: packed release contains $required_release_path"
+      return 1
+    fi
+  done
 
   mkdir -p "$MOCK_VAULT/.me" "$MOCK_VAULT/raw" \
     "$MOCK_VAULT/practices" "$MOCK_VAULT/cognition"
@@ -698,6 +845,15 @@ test_setup_writes_claude_md() {
   assert_file_contains "$MOCK_VAULT/CLAUDE.md" "/me:ingest" || return 1
 }
 
+test_setup_writes_agents_md() {
+  cp "$PLUGIN_ROOT/templates/AGENTS-template.md" "$MOCK_VAULT/AGENTS.md"
+
+  assert_file_exists "$MOCK_VAULT/AGENTS.md" || return 1
+  assert_file_contains "$MOCK_VAULT/AGENTS.md" "Layer Map" || return 1
+  assert_file_contains "$MOCK_VAULT/AGENTS.md" '\$me:setup' || return 1
+  assert_file_contains "$MOCK_VAULT/AGENTS.md" '\$me:update' || return 1
+}
+
 test_setup_configures_gitignore_new() {
   # Simulate: no .gitignore exists, create from snippet
   cp "$PLUGIN_ROOT/references/gitignore-snippet.txt" "$MOCK_VAULT/.gitignore"
@@ -738,15 +894,25 @@ test_full_setup_simulation() {
   # Full end-to-end simulation of /me:setup
   local v="$MOCK_VAULT"
 
-  # Step 3: Create directories
-  mkdir -p "$v/raw" "$v/practices" "$v/cognition"
+  # Step 3: Create current config and layer directories.
+  mkdir -p "$v/.me" "$v/raw" "$v/practices" "$v/cognition"
+  cat > "$v/.me/config.yaml" << 'EOF'
+# me plugin configuration
+vault_schema_version: 1
+
+layers:
+  raw: "raw"
+  practices: "practices"
+  cognition: "cognition"
+EOF
   touch "$v/raw/.gitkeep" "$v/practices/.gitkeep" "$v/cognition/.gitkeep"
 
   # Step 4: Write SCHEMA.md
   cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$v/SCHEMA.md"
 
-  # Step 5: Write CLAUDE.md
+  # Step 5: Write both Agent navigation files
   cp "$PLUGIN_ROOT/templates/CLAUDE-template.md" "$v/CLAUDE.md"
+  cp "$PLUGIN_ROOT/templates/AGENTS-template.md" "$v/AGENTS.md"
 
   # Step 6: Configure .gitignore
   cp "$PLUGIN_ROOT/references/gitignore-snippet.txt" "$v/.gitignore"
@@ -757,7 +923,9 @@ test_full_setup_simulation() {
   assert_dir_exists "$v/cognition" || return 1
   assert_file_exists "$v/SCHEMA.md" || return 1
   assert_file_exists "$v/CLAUDE.md" || return 1
+  assert_file_exists "$v/AGENTS.md" || return 1
   assert_file_exists "$v/.gitignore" || return 1
+  assert_file_contains "$v/.me/config.yaml" '^vault_schema_version: 1$' || return 1
   assert_file_contains "$v/CLAUDE.md" "three-layer knowledge vault" || return 1
   assert_file_contains "$v/SCHEMA.md" "LOCKED" || return 1
   assert_file_contains "$v/.gitignore" ".obsidian/" || return 1
@@ -965,6 +1133,8 @@ test_setup_creates_config() {
   mkdir -p "$v/.me"
   cat > "$v/.me/config.yaml" << 'EOF'
 # me plugin configuration
+vault_schema_version: 1
+
 # Layer directory mapping — maps logical layers to actual directory paths
 layers:
   raw: "raw"
@@ -973,6 +1143,7 @@ layers:
 EOF
 
   assert_file_exists "$v/.me/config.yaml" || return 1
+  assert_file_contains "$v/.me/config.yaml" '^vault_schema_version: 1$' || return 1
   assert_file_contains "$v/.me/config.yaml" "raw" || return 1
   assert_file_contains "$v/.me/config.yaml" "practices" || return 1
   assert_file_contains "$v/.me/config.yaml" "cognition" || return 1
@@ -988,6 +1159,8 @@ test_setup_creates_config_custom_dirs() {
   # Setup creates config with custom mapping
   mkdir -p "$v/.me"
   cat > "$v/.me/config.yaml" << 'EOF'
+vault_schema_version: 1
+
 layers:
   raw: "调研"
   practices: "实践"
@@ -995,6 +1168,7 @@ layers:
 EOF
 
   assert_file_exists "$v/.me/config.yaml" || return 1
+  assert_file_contains "$v/.me/config.yaml" '^vault_schema_version: 1$' || return 1
   assert_file_contains "$v/.me/config.yaml" '调研' || return 1
   assert_file_contains "$v/.me/config.yaml" '实践' || return 1
   assert_file_contains "$v/.me/config.yaml" '认知' || return 1
@@ -1050,6 +1224,7 @@ test_full_setup_simulation_with_config() {
   # Step: Write config
   mkdir -p "$v/.me"
   cat > "$v/.me/config.yaml" << 'EOF'
+vault_schema_version: 1
 layers:
   raw: "raw"
   practices: "practices"
@@ -1068,6 +1243,7 @@ EOF
   # Step: Write SCHEMA.md and CLAUDE.md
   cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$v/SCHEMA.md"
   cp "$PLUGIN_ROOT/templates/CLAUDE-template.md" "$v/CLAUDE.md"
+  cp "$PLUGIN_ROOT/templates/AGENTS-template.md" "$v/AGENTS.md"
   cp "$PLUGIN_ROOT/references/gitignore-snippet.txt" "$v/.gitignore"
 
   # Verify
@@ -1077,6 +1253,7 @@ EOF
   assert_dir_exists "$v/$COGNITION_DIR" || return 1
   assert_file_exists "$v/SCHEMA.md" || return 1
   assert_file_exists "$v/CLAUDE.md" || return 1
+  assert_file_exists "$v/AGENTS.md" || return 1
   assert_file_contains "$v/CLAUDE.md" "config.yaml" || return 1
 }
 
@@ -1367,6 +1544,9 @@ test_e2e_me_setup() {
     return 0
   fi
 
+  printf '# Claude user rule\nKeep this byte-for-byte.\n' > "$MOCK_VAULT/CLAUDE.md"
+  printf '# Codex user rule\nKeep this byte-for-byte.\n' > "$MOCK_VAULT/AGENTS.md"
+
   local output
   output=$(cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
   if echo "$output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key"; then
@@ -1381,10 +1561,18 @@ test_e2e_me_setup() {
   assert_dir_exists "$MOCK_VAULT/cognition" || return 1
   assert_file_exists "$MOCK_VAULT/SCHEMA.md" || return 1
   assert_file_exists "$MOCK_VAULT/CLAUDE.md" || return 1
+  assert_file_exists "$MOCK_VAULT/AGENTS.md" || return 1
+  assert_file_exists "$MOCK_VAULT/.me/config.yaml" || return 1
   assert_file_exists "$MOCK_VAULT/.gitignore" || return 1
 
   assert_file_contains "$MOCK_VAULT/CLAUDE.md" "three-layer knowledge vault" || return 1
   assert_file_contains "$MOCK_VAULT/CLAUDE.md" "/me:setup" || return 1
+  assert_file_contains "$MOCK_VAULT/CLAUDE.md" '^# Claude user rule$' || return 1
+  assert_file_contains "$MOCK_VAULT/CLAUDE.md" '^Keep this byte-for-byte\.$' || return 1
+  assert_file_contains "$MOCK_VAULT/AGENTS.md" '\$me:setup' || return 1
+  assert_file_contains "$MOCK_VAULT/AGENTS.md" '^# Codex user rule$' || return 1
+  assert_file_contains "$MOCK_VAULT/AGENTS.md" '^Keep this byte-for-byte\.$' || return 1
+  assert_file_contains "$MOCK_VAULT/.me/config.yaml" '^vault_schema_version: 1$' || return 1
   assert_file_contains "$MOCK_VAULT/SCHEMA.md" "LOCKED" || return 1
   assert_file_contains "$MOCK_VAULT/.gitignore" ".obsidian/" || return 1
 
@@ -1406,13 +1594,25 @@ test_e2e_me_setup_idempotent() {
     return 0
   fi
 
-  local output
+  local vault_before runtime_before output vault_after runtime_after
+  vault_before=$(find "$MOCK_VAULT" -type f -exec cksum {} \; | sort)
+  runtime_before=$(find "$ME_RUNTIME_ROOT" -type f -exec cksum {} \; | sort)
   output=$(cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
 
   echo "    second run output: $(echo "$output" | head -3)"
 
   assert_dir_exists "$MOCK_VAULT/raw" || return 1
   assert_file_exists "$MOCK_VAULT/SCHEMA.md" || return 1
+  vault_after=$(find "$MOCK_VAULT" -type f -exec cksum {} \; | sort)
+  runtime_after=$(find "$ME_RUNTIME_ROOT" -type f -exec cksum {} \; | sort)
+  [ "$vault_after" = "$vault_before" ] || {
+    echo -e "    ${RED}FAIL${NC}: second setup changed existing vault bytes"
+    return 1
+  }
+  [ "$runtime_after" = "$runtime_before" ] || {
+    echo -e "    ${RED}FAIL${NC}: second setup changed runtime bytes"
+    return 1
+  }
 
   local count
   count=$(grep -c ".obsidian/" "$MOCK_VAULT/.gitignore" 2>/dev/null || echo "0")
@@ -3875,11 +4075,12 @@ test_skill_files_exist() {
   assert_file_exists "$PLUGIN_ROOT/skills/checklinks/SKILL.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/skills/move/SKILL.md" || return 1
   assert_file_exists "$PLUGIN_ROOT/skills/autolinks/SKILL.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/skills/update/SKILL.md" || return 1
 }
 
 test_skill_files_have_frontmatter() {
   # Test 2: Each SKILL.md has Codex-compatible frontmatter
-  for skill in setup backlinks checklinks move autolinks ingest search; do
+  for skill in setup update backlinks checklinks move autolinks ingest search; do
     local f="$PLUGIN_ROOT/skills/$skill/SKILL.md"
     assert_file_contains "$f" "^name:" || { echo "    missing name in $skill"; return 1; }
     assert_file_contains "$f" "^description:" || { echo "    missing description in $skill"; return 1; }
@@ -3897,6 +4098,7 @@ test_skills_reference_bin_executables() {
   assert_file_contains "$PLUGIN_ROOT/skills/checklinks/SKILL.md" "bin/checklinks.ts" || return 1
   assert_file_contains "$PLUGIN_ROOT/skills/move/SKILL.md" "bin/move.ts" || return 1
   assert_file_contains "$PLUGIN_ROOT/skills/autolinks/SKILL.md" "bin/autolinks.ts" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/update/SKILL.md" "bin/update.ts" || return 1
 }
 
 test_skills_follow_ingest_pattern() {
@@ -3925,11 +4127,10 @@ test_setup_agent_templates_and_merge_rules() {
   local f="$skill_dir/SKILL.md"
   local merge_ref="$skill_dir/references/merge-rules.md"
 
-  # SKILL.md should have upgrade path (Step 2b)
-  if ! grep -q "Version Upgrade Path\|upgrade" "$f" 2>/dev/null; then
-    echo -e "    ${RED}FAIL${NC}: setup SKILL.md missing version upgrade path"
-    return 1
-  fi
+  # Existing vaults are handed off without the historical direct upgrade.
+  assert_file_contains "$f" 'belong exclusively to `me:update`' || return 1
+  assert_file_not_contains "$f" 'smart-merged CLAUDE.md' || return 1
+  assert_file_not_contains "$f" 'Refresh SCHEMA.md' || return 1
 
   if ! grep -rqi "managed marker\\|ownership marker" "$f" "$merge_ref" 2>/dev/null; then
     echo -e "    ${RED}FAIL${NC}: setup skill missing managed marker instructions"
@@ -3972,7 +4173,7 @@ test_setup_agent_templates_and_merge_rules() {
 
 test_skill_files_under_500_lines() {
   # Each SKILL.md should be under 500 lines (per convention)
-  for skill in setup backlinks checklinks move autolinks; do
+  for skill in setup update backlinks checklinks move autolinks; do
     local f="$PLUGIN_ROOT/skills/$skill/SKILL.md"
     local line_count
     line_count=$(wc -l < "$f" 2>/dev/null || echo "0")
@@ -5164,6 +5365,9 @@ main() {
     # Run all tests
     run_test test_plugin_structure
     run_test test_plugin_manifest
+    run_test test_update_release_contract
+    run_test test_setup_current_contract_and_existing_zero_write
+    run_test test_update_cli_legacy_round_trip_preserves_user_agents
     run_test test_vault_writer_public_binary
     run_test test_codex_public_docs
     run_test test_external_runtime_documented
@@ -5176,6 +5380,7 @@ main() {
     run_test test_setup_creates_directories
     run_test test_setup_writes_schema
     run_test test_setup_writes_claude_md
+    run_test test_setup_writes_agents_md
     run_test test_setup_configures_gitignore_new
     run_test test_setup_configures_gitignore_append
     run_test test_setup_gitignore_idempotent

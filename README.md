@@ -86,6 +86,21 @@ $me:setup
 ME 会建立三层知识结构。之后可以继续使用 `/me:*` commands 或 `me:*`
 skills 摄入材料、检索笔记、维护连接，并让已有知识参与新的问题。
 
+## 升级
+
+插件升级与 vault migration 是两个独立步骤。先更新 marketplace 中的插件，
+再进入每个 vault 单独预览并确认迁移：
+
+```bash
+codex plugin marketplace upgrade me-marketplace
+# then, in the vault
+$me:update
+```
+
+Claude Code 在 vault 中使用 `/me:update`，其预览、单次明确确认、恢复与
+Codex `$me:update` 语义相同。ME 只修改展示并确认过的 managed files，
+不会替用户 stage 或 commit vault。
+
 ## 文档
 
 - [使用指南](./docs/user-guide.md)：安装、初始化、配置与典型工作流

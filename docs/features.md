@@ -41,6 +41,7 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 | 功能 | Claude Code | Codex skill | 输入 | 输出 |
 |------|-------------|-------------|------|------|
 | 初始化工作空间 | `/me:setup` | `me:setup` | - | 三层目录 + 配置文件 |
+| 升级 vault schema | `/me:update` | `me:update` | cwd 或一个 vault 路径 | 零写 preview；确认后的 forward-only migration |
 | 摄入外部材料 | `/me:ingest <source>` | `me:ingest` | URL 或 Source Bundle | 结构化 Markdown 笔记与本地素材 |
 | 生成决策简报 | `/me:decision-brief <问题>` | `me:decision-brief` | 待决问题、约束与相关证据 | 建议、选项比较、验证实验与复盘条件 |
 | 多维搜索笔记 | `/me:search` | `me:search` | 查询条件 | 匹配笔记列表 |
@@ -56,6 +57,7 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 | Events | `bin/events.ts` | JSONL 事件日志 — append/query，支持 UUID 关联 |
 | Wikilink Graph | `bin/wikilink-graph.ts` | 无依赖的链接图引擎 |
 | Vault Write | `bin/vault-write.ts` | 通用笔记写入的预览、校验、索引维护与恢复报告 |
+| Vault Update | `bin/update.ts` | versioned vault migration 的预览、digest-bound apply 与恢复报告 |
 | Runtime | `bin/runtime.ts` | 查询本机 runtime、准备受控 inbox |
 
 ## 可同步 vault 与本机运行时
@@ -83,6 +85,7 @@ practices/           # Practices 层
 cognition/           # Cognition 层
 SCHEMA.md            # Frontmatter schema
 CLAUDE.md            # Agent 导航契约
+AGENTS.md            # Codex Agent 导航契约
 .gitignore           # Obsidian 配置
 ```
 
@@ -96,6 +99,21 @@ Detected existing directories:
 
 Map these directories? (Press Enter for defaults)
 ```
+
+fresh setup 写入 `vault_schema_version: 1`。如果 `.me/config.yaml` 已存在，
+setup 完全零写并提示运行 `/me:update`（Claude Code）或 `$me:update`
+（Codex）；既有 vault 的 managed files 不由 setup 直接刷新。
+
+## /me:update - 升级 vault managed schema
+
+插件 marketplace upgrade 和 vault migration 是两个独立操作。更新插件后，
+`/me:update` 与 `$me:update` 都先执行零写 preview，展示 ordered migrations、
+paths、warnings 与 exact diffs，再询问一次明确确认。确认只绑定当前
+`planDigest`；状态变化会得到 `STALE_PREVIEW`，必须重新预览和确认。
+
+迁移只前进、不降级。newer vault、conflict 或 recovery state 会阻止 apply。
+事务失败时报告 rollback 或 recovery actions；ME 不直接编辑恢复材料，也
+不会 stage 或 commit 用户 vault。
 
 ## /me:ingest - 摄入文章、PDF 与公开视频
 

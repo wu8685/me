@@ -1,127 +1,115 @@
 ---
 name: setup
-description: "Use when a workspace needs initial ME vault setup or an existing ME vault needs its managed schema and navigation files upgraded."
+description: "Use when a workspace needs initial ME vault setup. Existing ME vaults are handed off to me:update without writes."
 ---
 
 # /me:setup
 
-Initializes or upgrades a workspace vault.
+Initializes a new workspace vault at the current schema version. Claude Code
+invokes this Skill as `/me:setup`; Codex invokes it as `$me:setup`.
 
-## Step 1: Detect Target Workspace
+## Step 1: Resolve the target
 
-Use cwd as target. If `$ARGUMENTS` contains a path, use that instead.
+Use cwd as the target. If `$ARGUMENTS` contains one explicit path, use that
+instead. Reject multiple target paths. Resolve every workspace path relative to
+that target; resolve plugin resources through `${CLAUDE_PLUGIN_ROOT}`.
 
-## Step 2: Route — Fresh Setup or Upgrade?
+## Step 2: Stop for an existing vault
 
-```bash
-[ -f ".me/config.yaml" ] && echo "upgrade" || echo "fresh"
+Check for `{target}/.me/config.yaml` before creating any directory, lock,
+runtime namespace, or temporary file.
+
+If it exists, perform **no writes at all** to the vault or runtime and report
+exactly:
+
+```text
+me vault already initialized.
+Run $me:update (Codex) or /me:update (Claude Code) to preview any required
+vault migrations. No files changed.
 ```
 
-**If "upgrade"** → go to Step 2b (upgrade path below), then STOP.
-**If "fresh"** → continue to Step 3.
+Then stop. Existing-vault changes to `.me/config.yaml`, `SCHEMA.md`,
+`CLAUDE.md`, and `AGENTS.md` belong exclusively to `me:update`; setup never
+performs a direct upgrade.
 
-### Step 2b: Version Upgrade Path
+## Step 3: Configure layer mapping (fresh only)
 
-The workspace is already initialized. Refresh plugin-managed files only — do NOT touch `.me/config.yaml` or layer directories.
+If `$ARGUMENTS` contains `--defaults`, use `raw`, `practices`, and `cognition`.
+Otherwise scan for existing directories using
+`references/layer-candidates.md`. If candidates are found, show the proposed
+mapping and ask the user to confirm it. If none are found, use the defaults.
 
-**2b-i. Refresh SCHEMA.md**
+## Step 4: Write current portable config (fresh only)
 
-Read `${CLAUDE_PLUGIN_ROOT}/templates/SCHEMA.md` → write to `{target}/SCHEMA.md`.
-
-**2b-ii. Smart-merge CLAUDE.md**
-
-Read both files:
-- Current `{target}/CLAUDE.md`
-- Latest `${CLAUDE_PLUGIN_ROOT}/templates/CLAUDE-template.md`
-
-Apply merge rules from `skills/setup/references/merge-rules.md`: replace template-owned sections with latest content, preserve user-added sections at their original positions.
-
-Write merged result to `{target}/CLAUDE.md`.
-
-**2b-iii. Report**
-
-```
-me vault already initialized — smart-merged CLAUDE.md and refreshed SCHEMA.md to latest plugin version.
-Config unchanged: .me/config.yaml
-```
-
-Done. Do not continue to Step 3.
-
----
-
-## Step 3: Configure Layer Mapping (fresh only)
-
-If `$ARGUMENTS` contains `--defaults`, use defaults: `raw`, `practices`, `cognition`. Skip to Step 4.
-
-Otherwise scan for existing directories that match known layer names. See `skills/setup/references/layer-candidates.md` for candidate lists and detection script.
-
-If candidates found → present and ask user to confirm mapping via conversation.
-If no candidates → use defaults.
-
-## Step 4: Write .me/config.yaml (fresh only)
-
-```bash
-mkdir -p .me
-```
-
-Write `.me/config.yaml`:
+Create `.me/` and write `.me/config.yaml`:
 
 ```yaml
 # me plugin configuration
-# Layer directory mapping — maps logical layers to actual directory paths
+vault_schema_version: 1
+
 layers:
   raw: "<raw_dir>"
   practices: "<practices_dir>"
   cognition: "<cognition_dir>"
 ```
 
-## Step 5: Create Vault Directories (fresh only)
+## Step 5: Create layer directories (fresh only)
 
-```bash
-mkdir -p <raw_dir>/ <practices_dir>/ <cognition_dir>/
-touch <raw_dir>/.gitkeep <practices_dir>/.gitkeep <cognition_dir>/.gitkeep
-```
+Create the configured Raw, Practices, and Cognition directories and a
+`.gitkeep` in each.
 
-## Step 6: Write SCHEMA.md (fresh only)
+## Step 6: Write current managed files (fresh only)
 
-Read `${CLAUDE_PLUGIN_ROOT}/templates/SCHEMA.md` → write to `{target}/SCHEMA.md`.
+1. Copy `${CLAUDE_PLUGIN_ROOT}/templates/SCHEMA.md` to `SCHEMA.md`.
+2. Apply `${CLAUDE_PLUGIN_ROOT}/templates/CLAUDE-template.md` to `CLAUDE.md`.
+3. Apply `${CLAUDE_PLUGIN_ROOT}/templates/AGENTS-template.md` to `AGENTS.md`.
 
-## Step 7: Write CLAUDE.md (fresh only)
+For both Agent files, follow
+`skills/setup/references/merge-rules.md`. If the file is absent, create it
+from the matching current template. If it already contains a valid ME managed
+block, refresh only that block. If it is user-authored and unmarked, preserve
+every existing byte and append the complete current ME block. Duplicate,
+nested, mismatched, unknown, or incomplete markers are conflicts: stop instead
+of guessing. Never overwrite user-authored Agent instructions.
 
-Read `${CLAUDE_PLUGIN_ROOT}/templates/CLAUDE-template.md` → write to `{target}/CLAUDE.md`.
+## Step 7: Configure `.gitignore` (fresh only)
 
-## Step 8: Configure .gitignore (fresh only)
+- If `.gitignore` is absent, create it from
+  `${CLAUDE_PLUGIN_ROOT}/references/gitignore-snippet.txt`.
+- If it exists without an `.obsidian/` entry, append the snippet while
+  preserving all existing bytes.
+- If it already has an `.obsidian/` entry, leave it unchanged.
 
-- No `.gitignore` → create from `${CLAUDE_PLUGIN_ROOT}/references/gitignore-snippet.txt`
-- `.gitignore` exists but no `.obsidian/` entry → append snippet
-- Already has `.obsidian/` → skip
+Do not ignore `.me/`; portable config belongs in version control.
 
-Do NOT add `.me/` to `.gitignore` — config should be tracked in git.
+## Step 8: Validate the fresh vault
 
-## Step 9: Report (fresh only)
+Before reporting success, read back the created files and verify:
 
-```
-me vault initialized.
+- `.me/config.yaml` parses with `vault_schema_version: 1` and the confirmed
+  three-layer mapping;
+- every configured layer directory and `.gitkeep` exists;
+- `SCHEMA.md` matches the current template;
+- both Agent files contain one complete set of current ME managed markers and
+  preserve all pre-existing bytes outside those markers;
+- `.gitignore` contains exactly one effective `.obsidian/` entry.
 
-Created:
-  .me/config.yaml     (layer mapping: raw -> <raw_dir>, practices -> <practices_dir>, cognition -> <cognition_dir>)
-  <raw_dir>/           (+ .gitkeep)
-  <practices_dir>/     (+ .gitkeep)
-  <cognition_dir>/     (+ .gitkeep)
-  SCHEMA.md
-  CLAUDE.md
-  .gitignore           (added .obsidian/ entry)
+If validation fails, report the failure and do not claim initialization
+succeeded.
 
-Next steps:
-  Run `/me:ingest <url>` to add your first research note.
-```
+## Step 9: Report
+
+Report the files and mapped layer directories actually created or safely
+merged. Suggest `/me:ingest <url>` for Claude Code and `$me:ingest <url>` for
+Codex. Do not run Git and do not commit the vault.
 
 ## Constraints
 
-- All workspace paths relative to cwd (or `$ARGUMENTS` path). Never absolute paths for target.
-- Plugin files via `${CLAUDE_PLUGIN_ROOT}`.
-- No git hooks (D-09). No `status:` or `lifecycle:` frontmatter (D-06).
-- Layer directories always from `.me/config.yaml` — never hardcode `raw/`, `practices/`, `cognition/`.
-- `.me/config.yaml` is committed to git — shared across machines.
-- Setup writes only portable vault configuration and does not create runtime directories.
-- Host-local locks, staging, inbox, and recovery data live outside the vault under `~/.me/runtime/vault-<path-hash>/`; never add an absolute runtime path to `.me/config.yaml`. If the vault is on another filesystem, require `ME_RUNTIME_ROOT` to point to an absolute same-filesystem directory; never choose a vault-adjacent fallback or cross-device copy.
+- Setup writes only portable vault content and does not create runtime directories.
+- Host-local locks, staging, inbox, and recovery state live under
+  `~/.me/runtime/vault-<path-hash>/`.
+- Never store an absolute runtime path in `.me/config.yaml`.
+- If a future mutation is needed, hand it to `$me:update` / `/me:update`;
+  setup is fresh-install only.
+- Layer paths always come from `.me/config.yaml` after initialization.
+- No git hooks. No `status:` or `lifecycle:` frontmatter.
