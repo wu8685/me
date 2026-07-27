@@ -106,9 +106,11 @@ path back; an ownership ambiguity returns `RECOVERY_REQUIRED` and preserves
 recovery material instead of guessing.
 
 An interrupted pre-config apply cannot claim schema v1 because config is last.
-On a later run, an unresolved `.me-setup-*` staging namespace is a conflict:
-inspect it and the already-published paths before removing anything, then
-rerun preview. Never delete an unfamiliar staging namespace automatically.
+Before the existing-config fast-path, both preview and apply inspect external
+`<ME_RUNTIME>/transactions/me-setup-*` journals. Any retained operation,
+including config-published-but-not-cleaned state, returns
+`RECOVERY_REQUIRED`; inspect its journal and preserved content before removing
+anything. Never delete an unfamiliar transaction namespace automatically.
 
 The runner implements the actions below. They are the result contract, not
 instructions to execute manually.

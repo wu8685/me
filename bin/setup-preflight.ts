@@ -294,7 +294,7 @@ export function preflightFreshSetup(
       ))
     ))
     || layerDirectories.some(layer => (
-      RESERVED_ROOTS.has(layer.split('/')[0])
+      layer.split('/').some(component => RESERVED_ROOTS.has(component))
       || MANAGED_FILES.has(layer)
       || [...MANAGED_FILES].some(file => file.startsWith(`${layer}/`))
       || [...MANAGED_FILES].some(file => layer.startsWith(`${file}/`))

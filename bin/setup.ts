@@ -12,6 +12,9 @@ import {
 import {
   MutationFailure,
   fingerprintMutationSource,
+  type AppliedMutationOutcome,
+  type AtomicMutationPhase,
+  type FilesystemMutationKind,
   type MutationPathPolicy,
   type OwnedDirectoryFingerprint,
   type OwnedFileFingerprint,
@@ -22,6 +25,7 @@ import { createMutationExecutor } from './mutation/executor.ts';
 import {
   bootstrapRuntimeDirectories,
   resolveRuntimeLayout,
+  runtimeDisplayPath,
   RuntimePathError,
   type RuntimeLayout,
 } from './runtime-paths.ts';
@@ -64,7 +68,21 @@ export interface SetupOptions {
   preview?: boolean;
   hooks?: {
     beforePublish?(vaultRelativePath: string): void;
+    afterPublish?(vaultRelativePath: string): void;
   };
+  atomicHooks?: {
+    beforeAtomicMutation?(
+      kind: FilesystemMutationKind,
+      phase: AtomicMutationPhase,
+      paths: readonly string[],
+    ): void;
+    afterAtomicMutation?(
+      kind: FilesystemMutationKind,
+      phase: AtomicMutationPhase,
+      paths: readonly string[],
+    ): void;
+  };
+  directoryFsync?(directory: string): void;
 }
 
 interface AppliedWrite {
@@ -77,6 +95,27 @@ interface AppliedWrite {
 interface AppliedDirectory {
   mutation: Extract<PlannedMutation, { kind: 'mkdir' }>;
   published: OwnedDirectoryFingerprint;
+}
+
+interface SetupJournalV1 {
+  version: 1;
+  operationId: string;
+  state: 'planned' | 'staged' | 'mutating' | 'validating'
+    | 'committed' | 'rolling-back' | 'rolled-back' | 'recovery-required';
+  layers: string[];
+  mutations: Array<{
+    kind: PlannedMutation['kind'];
+    path: string;
+    publishOrder: number;
+  }>;
+  appliedMutations: Array<{
+    kind: FilesystemMutationKind;
+    paths: string[];
+  }>;
+  pendingMutation?: {
+    kind: FilesystemMutationKind;
+    paths: string[];
+  };
 }
 
 const EXISTING_MESSAGE =
@@ -141,7 +180,10 @@ function setupPathPolicy(layout: RuntimeLayout): MutationPathPolicy {
         return path.relative(layout.canonicalVault, absolute)
           .split(path.sep).join('/') || '.';
       }
-      return '<ME_RUNTIME>';
+      if (isInside(layout.runtimeRoot, absolute)) {
+        return runtimeDisplayPath(layout, absolute);
+      }
+      return '<unsafe>';
     },
   };
 }
@@ -403,6 +445,165 @@ function existingConfig(vaultDir: string): boolean {
   }
 }
 
+function fsyncDirectory(candidate: string): void {
+  let descriptor: number | undefined;
+  try {
+    const named = fs.lstatSync(candidate, { bigint: true });
+    if (!named.isDirectory() || named.isSymbolicLink()) {
+      throw new MutationFailure('UNSAFE_PATH');
+    }
+    descriptor = fs.openSync(
+      candidate,
+      fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+    );
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      !opened.isDirectory()
+      || opened.dev !== named.dev
+      || opened.ino !== named.ino
+      || opened.mode !== named.mode
+    ) throw new MutationFailure('UNSAFE_PATH');
+    fs.fsyncSync(descriptor);
+  } catch (error) {
+    if (
+      (error as NodeJS.ErrnoException).code === 'EINVAL'
+      || (error as NodeJS.ErrnoException).code === 'ENOTSUP'
+      || (error as NodeJS.ErrnoException).code === 'EOPNOTSUPP'
+    ) return;
+    if (error instanceof MutationFailure) throw error;
+    throw new MutationFailure('UNSAFE_PATH');
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
+function setupRecoveryPresent(layout: RuntimeLayout): boolean {
+  let transactionEntry: fs.Stats;
+  try {
+    transactionEntry = fs.lstatSync(layout.transactionDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw new UpdateError('UNSAFE_PATH');
+  }
+  if (!transactionEntry.isDirectory() || transactionEntry.isSymbolicLink()) {
+    throw new UpdateError('UNSAFE_PATH');
+  }
+  let names: string[];
+  try {
+    names = fs.readdirSync(layout.transactionDir);
+  } catch {
+    throw new UpdateError('UNSAFE_PATH');
+  }
+  for (const name of names) {
+    if (!name.startsWith('me-setup-')) continue;
+    if (!/^me-setup-[0-9a-f-]{36}$/.test(name)) {
+      throw new UpdateError('RECOVERY_REQUIRED');
+    }
+    const candidate = path.join(layout.transactionDir, name);
+    let entry: fs.Stats;
+    try {
+      entry = fs.lstatSync(candidate);
+    } catch {
+      throw new UpdateError('RECOVERY_REQUIRED');
+    }
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new UpdateError('RECOVERY_REQUIRED');
+    }
+    // Any retained setup operation is authoritative recovery state, including
+    // committed-but-not-cleaned state after config publication.
+    return true;
+  }
+  return false;
+}
+
+class SetupJournal {
+  private descriptor: number;
+  private device: bigint;
+  private inode: bigint;
+
+  constructor(
+    readonly journalPath: string,
+    readonly data: SetupJournalV1,
+    readonly policy: MutationPathPolicy,
+  ) {
+    this.descriptor = fs.openSync(
+      journalPath,
+      fs.constants.O_RDWR | fs.constants.O_CREAT
+        | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    const opened = fs.fstatSync(this.descriptor, { bigint: true });
+    this.device = opened.dev;
+    this.inode = opened.ino;
+    this.persist();
+    fsyncDirectory(path.dirname(journalPath));
+  }
+
+  private assertOwned(): void {
+    const named = fs.lstatSync(this.journalPath, { bigint: true });
+    const opened = fs.fstatSync(this.descriptor, { bigint: true });
+    if (
+      !named.isFile()
+      || named.isSymbolicLink()
+      || !opened.isFile()
+      || named.dev !== this.device
+      || named.ino !== this.inode
+      || opened.dev !== this.device
+      || opened.ino !== this.inode
+    ) throw new MutationFailure('OWNERSHIP_LOST');
+  }
+
+  persist(): void {
+    this.assertOwned();
+    const bytes = Buffer.from(`${JSON.stringify(this.data, null, 2)}\n`);
+    fs.ftruncateSync(this.descriptor, 0);
+    fs.writeSync(
+      this.descriptor,
+      Uint8Array.from(bytes),
+      0,
+      bytes.length,
+      0,
+    );
+    fs.fchmodSync(this.descriptor, 0o600);
+    fs.fsyncSync(this.descriptor);
+    fsyncDirectory(path.dirname(this.journalPath));
+  }
+
+  state(state: SetupJournalV1['state']): void {
+    this.data.state = state;
+    this.persist();
+  }
+
+  beforeMutation(kind: FilesystemMutationKind, paths: readonly string[]): void {
+    this.data.pendingMutation = {
+      kind,
+      paths: paths.map(candidate => this.policy.display(candidate)),
+    };
+    this.persist();
+  }
+
+  afterMutation(kind: FilesystemMutationKind, paths: readonly string[]): void {
+    this.data.appliedMutations.push({
+      kind,
+      paths: paths.map(candidate => this.policy.display(candidate)),
+    });
+    delete this.data.pendingMutation;
+    this.persist();
+  }
+
+  recordAppliedOutcome(
+    kind: FilesystemMutationKind,
+    paths: readonly string[],
+  ): void {
+    if (!this.data.pendingMutation) return;
+    this.afterMutation(kind, paths);
+  }
+
+  close(): void {
+    fs.closeSync(this.descriptor);
+  }
+}
+
 export function executeFreshSetup(options: SetupOptions): SetupResult {
   if (
     !options
@@ -417,11 +618,20 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
       recoveryState: 'none',
     };
   }
+  let initialLayout: RuntimeLayout;
   try {
-    if (existingConfig(options.vaultDir)) {
+    initialLayout = resolveRuntimeLayout(options.vaultDir, options.environment);
+    if (setupRecoveryPresent(initialLayout)) {
+      throw new UpdateError('RECOVERY_REQUIRED');
+    }
+    // Recovery detection deliberately precedes this fast-path.
+    if (existingConfig(initialLayout.canonicalVault)) {
       return { version: 1, status: 'already_initialized', message: EXISTING_MESSAGE };
     }
-    const preflight = preflightFreshSetup(options);
+    const preflight = preflightFreshSetup({
+      ...options,
+      vaultDir: initialLayout.canonicalVault,
+    });
     if (options.preview) return preflight;
   } catch (error) {
     const code = errorCode(error);
@@ -429,37 +639,63 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
       version: 1,
       status: 'blocked',
       error: { code, message: code },
-      recoveryState: 'none',
+      recoveryState: code === 'RECOVERY_REQUIRED' ? 'manual' : 'none',
     };
   }
 
-  let layout: RuntimeLayout | undefined;
+  let layout: RuntimeLayout | undefined = initialLayout;
   let lock: OwnedCooperativeLock | undefined;
-  let staging: string | undefined;
+  let operationDirectory: string | undefined;
+  let operationOwned: OwnedDirectoryFingerprint | undefined;
+  let stagingDirectory: string | undefined;
   let stagingOwned: OwnedDirectoryFingerprint | undefined;
+  let originalsDirectory: string | undefined;
+  let originalsOwned: OwnedDirectoryFingerprint | undefined;
+  let discardedDirectory: string | undefined;
+  let discardedOwned: OwnedDirectoryFingerprint | undefined;
+  let journal: SetupJournal | undefined;
   let executor: ReturnType<typeof createMutationExecutor> | undefined;
   let rollbackComplete = true;
+  let vaultCommitted = false;
   const writes: AppliedWrite[] = [];
   const directories: AppliedDirectory[] = [];
   const transientFiles: OwnedFileFingerprint[] = [];
-  const cleanupStaging = (): void => {
-    if (!executor || !stagingOwned) return;
+  const cleanupTransient = (): void => {
+    if (!executor) return;
     for (const owned of [...transientFiles].reverse()) {
       executor.unlink(owned);
     }
-    executor.rmdir(stagingOwned);
-    staging = undefined;
+    if (stagingOwned) executor.rmdir(stagingOwned);
+    if (originalsOwned) executor.rmdir(originalsOwned);
+    if (discardedOwned) executor.rmdir(discardedOwned);
     stagingOwned = undefined;
+    originalsOwned = undefined;
+    discardedOwned = undefined;
     transientFiles.length = 0;
   };
+  const rememberApplied = (
+    error: unknown,
+    kind: FilesystemMutationKind,
+    paths: readonly string[],
+    apply: (outcome: AppliedMutationOutcome) => void,
+  ): boolean => {
+    if (!(error instanceof MutationFailure) || !error.applied) return false;
+    apply(error.applied);
+    journal?.recordAppliedOutcome(kind, paths);
+    return true;
+  };
   try {
-    layout = resolveRuntimeLayout(options.vaultDir, options.environment);
-    bootstrapRuntimeDirectories(layout, [layout.lockDir, layout.retirementDir]);
+    bootstrapRuntimeDirectories(layout, [
+      layout.lockDir,
+      layout.transactionDir,
+      layout.retirementDir,
+    ]);
     lock = acquireVaultLock(layout, {
       operationId: crypto.randomUUID(),
       owner: 'me-update',
     });
 
+    if (setupRecoveryPresent(layout)) throw new UpdateError('RECOVERY_REQUIRED');
     if (existingConfig(layout.canonicalVault)) {
       return { version: 1, status: 'already_initialized', message: EXISTING_MESSAGE };
     }
@@ -471,19 +707,60 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
       || mutations.at(-1)?.vaultRelativePath !== '.me/config.yaml'
     ) throw new UpdateError('VALIDATION_FAILED');
 
-    staging = fs.mkdtempSync(path.join(layout.canonicalVault, '.me-setup-'));
-    fs.chmodSync(staging, 0o700);
+    const operationId = crypto.randomUUID();
+    operationDirectory = path.join(
+      layout.transactionDir,
+      `me-setup-${operationId}`,
+    );
+    stagingDirectory = path.join(operationDirectory, 'staged');
+    originalsDirectory = path.join(operationDirectory, 'originals');
+    discardedDirectory = path.join(operationDirectory, 'discarded');
+    fs.mkdirSync(operationDirectory, { mode: 0o700 });
+    fs.mkdirSync(stagingDirectory, { mode: 0o700 });
+    fs.mkdirSync(originalsDirectory, { mode: 0o700 });
+    fs.mkdirSync(discardedDirectory, { mode: 0o700 });
+    fsyncDirectory(layout.transactionDir);
+    fsyncDirectory(operationDirectory);
+
+    journal = new SetupJournal(
+      path.join(operationDirectory, 'journal.json'),
+      {
+        version: 1,
+        operationId,
+        state: 'planned',
+        layers: [...options.layerDirectories],
+        mutations: mutations.map(mutation => ({
+          kind: mutation.kind,
+          path: mutation.vaultRelativePath,
+          publishOrder: mutation.publishOrder,
+        })),
+        appliedMutations: [],
+      },
+      policy,
+    );
     executor = createMutationExecutor({
       pathPolicy: policy,
-      journal: { beforeMutation() {}, afterMutation() {} },
+      journal: {
+        beforeMutation(kind, paths) {
+          journal!.beforeMutation(kind, paths);
+        },
+        afterMutation(kind, paths) {
+          journal!.afterMutation(kind, paths);
+        },
+      },
       retirementDirectory: layout.retirementDir,
+      atomicHooks: options.atomicHooks,
+      directoryFsync: options.directoryFsync,
     });
-    stagingOwned = executor.captureDirectory(staging);
+    operationOwned = executor.captureDirectory(operationDirectory);
+    stagingOwned = executor.captureDirectory(stagingDirectory);
+    originalsOwned = executor.captureDirectory(originalsDirectory);
+    discardedOwned = executor.captureDirectory(discardedDirectory);
     const staged = new Map<number, OwnedFileFingerprint>();
     for (const mutation of mutations) {
       if (mutation.kind !== 'write-file') continue;
       const candidate = path.join(
-        staging,
+        stagingDirectory,
         `${String(mutation.publishOrder).padStart(6, '0')}.stage`,
       );
       const descriptor = fs.openSync(
@@ -503,7 +780,9 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
       staged.set(mutation.publishOrder, owned);
       transientFiles.push(owned);
     }
+    journal.state('staged');
 
+    journal.state('mutating');
     for (const mutation of mutations) {
       options.hooks?.beforePublish?.(mutation.vaultRelativePath);
       const current = source(
@@ -519,8 +798,17 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
         ...mutation.vaultRelativePath.split('/'),
       );
       if (mutation.kind === 'mkdir') {
-        const published = executor.mkdir(destination, mutation.desiredMode);
-        directories.push({ mutation, published });
+        try {
+          const published = executor.mkdir(destination, mutation.desiredMode);
+          directories.push({ mutation, published });
+        } catch (error) {
+          rememberApplied(error, 'mkdir', [destination], outcome => {
+            if (outcome.kind !== 'mkdir') throw new MutationFailure('OWNERSHIP_LOST');
+            directories.push({ mutation, published: outcome.ownedDirectory });
+          });
+          throw error;
+        }
+        options.hooks?.afterPublish?.(mutation.vaultRelativePath);
         continue;
       }
       if (mutation.kind !== 'write-file') {
@@ -530,22 +818,41 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
       writes.push(applied);
       if (mutation.source.type === 'file') {
         const originalPath = path.join(
-          staging,
+          originalsDirectory,
           `${String(mutation.publishOrder).padStart(6, '0')}.original`,
         );
-        applied.original = executor.rename(
-          executor.captureFile(destination),
-          originalPath,
-        );
+        try {
+          applied.original = executor.rename(
+            executor.captureFile(destination),
+            originalPath,
+          );
+        } catch (error) {
+          rememberApplied(error, 'rename', [destination, originalPath], outcome => {
+            if (outcome.kind === 'mkdir') throw new MutationFailure('OWNERSHIP_LOST');
+            applied.original = outcome.ownedFile;
+          });
+          if (applied.original) transientFiles.push(applied.original);
+          throw error;
+        }
         transientFiles.push(applied.original);
       } else if (mutation.source.type !== 'missing') {
         throw new MutationFailure('SOURCE_CHANGED');
       }
       const stagedFile = staged.get(mutation.publishOrder);
       if (!stagedFile) throw new MutationFailure('SOURCE_CHANGED');
-      applied.published = executor.link(stagedFile, destination);
+      try {
+        applied.published = executor.link(stagedFile, destination);
+      } catch (error) {
+        rememberApplied(error, 'link', [stagedFile.path, destination], outcome => {
+          if (outcome.kind === 'mkdir') throw new MutationFailure('OWNERSHIP_LOST');
+          applied.published = outcome.ownedFile;
+        });
+        throw error;
+      }
+      options.hooks?.afterPublish?.(mutation.vaultRelativePath);
     }
 
+    journal.state('validating');
     for (const mutation of mutations) {
       const current = source(
         layout.canonicalVault,
@@ -565,7 +872,22 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
       }
     }
 
-    cleanupStaging();
+    journal.state('committed');
+    vaultCommitted = true;
+    cleanupTransient();
+    journal.close();
+    const cleanupExecutor = createMutationExecutor({
+      pathPolicy: policy,
+      journal: { beforeMutation() {}, afterMutation() {} },
+      retirementDirectory: layout.retirementDir,
+      atomicHooks: options.atomicHooks,
+      directoryFsync: options.directoryFsync,
+    });
+    const journalOwned = cleanupExecutor.captureFile(journal.journalPath);
+    cleanupExecutor.unlink(journalOwned);
+    if (!operationOwned) throw new MutationFailure('OWNERSHIP_LOST');
+    cleanupExecutor.rmdir(operationOwned);
+    operationDirectory = undefined;
     return {
       version: 1,
       status: 'initialized',
@@ -574,20 +896,48 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
     };
   } catch (error) {
     try {
-      if (layout) {
+      if (layout && !vaultCommitted) {
+        journal?.state('rolling-back');
         const policy = setupPathPolicy(layout);
         executor ??= createMutationExecutor({
           pathPolicy: policy,
-          journal: { beforeMutation() {}, afterMutation() {} },
+          journal: {
+            beforeMutation(kind, paths) {
+              journal?.beforeMutation(kind, paths);
+            },
+            afterMutation(kind, paths) {
+              journal?.afterMutation(kind, paths);
+            },
+          },
           retirementDirectory: layout.retirementDir,
+          atomicHooks: options.atomicHooks,
+          directoryFsync: options.directoryFsync,
         });
         for (const applied of [...writes].reverse()) {
           if (applied.published) {
             const discard = path.join(
-              staging!,
+              discardedDirectory!,
               `${String(applied.mutation.publishOrder).padStart(6, '0')}.discard`,
             );
-            const discarded = executor.rename(applied.published, discard);
+            let discarded: OwnedFileFingerprint;
+            try {
+              discarded = executor.rename(applied.published, discard);
+            } catch (rollbackError) {
+              if (
+                !rememberApplied(
+                  rollbackError,
+                  'rename',
+                  [applied.published.path, discard],
+                  outcome => {
+                    if (outcome.kind === 'mkdir') {
+                      throw new MutationFailure('OWNERSHIP_LOST');
+                    }
+                    discarded = outcome.ownedFile;
+                  },
+                )
+              ) throw rollbackError;
+              throw rollbackError;
+            }
             transientFiles.push(discarded);
           }
           if (applied.original) {
@@ -597,23 +947,51 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
         for (const applied of [...directories].reverse()) {
           executor.rmdir(applied.published);
         }
+        cleanupTransient();
+        journal?.state('rolled-back');
       }
     } catch {
       rollbackComplete = false;
     }
-    if (rollbackComplete && staging) {
+    if (rollbackComplete && !vaultCommitted && journal && operationOwned) {
       try {
-        cleanupStaging();
+        journal.close();
+        const policy = setupPathPolicy(layout!);
+        const cleanupExecutor = createMutationExecutor({
+          pathPolicy: policy,
+          journal: { beforeMutation() {}, afterMutation() {} },
+          retirementDirectory: layout!.retirementDir,
+        });
+        cleanupExecutor.unlink(cleanupExecutor.captureFile(journal.journalPath));
+        cleanupExecutor.rmdir(operationOwned);
+        operationDirectory = undefined;
       } catch {
         rollbackComplete = false;
       }
     }
-    const code = rollbackComplete ? errorCode(error) : 'RECOVERY_REQUIRED';
+    const recoveryRequired = !rollbackComplete
+      || vaultCommitted
+      || operationDirectory !== undefined;
+    if (recoveryRequired && journal) {
+      try {
+        journal.state('recovery-required');
+      } catch {
+        // The retained operation directory is itself authoritative recovery.
+      }
+      try {
+        journal.close();
+      } catch {
+        // Preserve runtime state for manual recovery.
+      }
+    }
+    const code = !recoveryRequired
+      ? errorCode(error)
+      : 'RECOVERY_REQUIRED';
     return {
       version: 1,
       status: 'blocked',
       error: { code, message: code },
-      recoveryState: rollbackComplete ? 'none' : 'manual',
+      recoveryState: recoveryRequired ? 'manual' : 'none',
     };
   } finally {
     if (lock && layout) releaseVaultLock(layout, lock);

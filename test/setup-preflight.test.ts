@@ -264,6 +264,8 @@ describe('fresh setup preflight', () => {
     ['agent control path', ['.agents/raw', 'practices', 'cognition']],
     ['github control path', ['.github/raw', 'practices', 'cognition']],
     ['editor control path', ['raw', '.vscode/practices', 'cognition']],
+    ['nested git control path', ['knowledge/.git/raw', 'practices', 'cognition']],
+    ['nested codex control path', ['raw', 'knowledge/.codex/practices', 'cognition']],
     ['managed file ancestor', ['SCHEMA.md/raw', 'practices', 'cognition']],
   ] as const)('rejects %s layer mapping', (_name, layers) => {
     const { vault } = makeVault();
