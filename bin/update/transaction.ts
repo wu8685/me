@@ -4,6 +4,7 @@ import * as path from 'path';
 import {
   acquireVaultLock,
   CooperativeLockError,
+  inspectOwnedVaultLock,
   inspectVaultLock,
   releaseVaultLock,
   type OwnedCooperativeLock,
@@ -989,6 +990,7 @@ function hasIncompleteRuntimeOperation(layout: RuntimeLayout): boolean {
 export function inspectVaultUpdateRecovery(
   vaultDir: string,
   environment?: NodeJS.ProcessEnv,
+  ownedLock?: OwnedCooperativeLock,
 ): {
   code: Extract<
     UpdateErrorCode,
@@ -1009,7 +1011,21 @@ export function inspectVaultUpdateRecovery(
       preservedPaths: ['.me/locks', '.me/tmp'],
     };
   }
-  const lockState = inspectVaultLock(layout);
+  if (
+    ownedLock
+    && inspectOwnedVaultLock(layout, ownedLock) !== 'owned'
+  ) {
+    return {
+      code: 'RECOVERY_REQUIRED',
+      actions: [{
+        kind: 'inspect',
+        path: '<ME_RUNTIME>/locks/vault.lock',
+        description: 'Inspect the unrecognized lock entry before retrying.',
+      }],
+      preservedPaths: ['<ME_RUNTIME>/locks/vault.lock'],
+    };
+  }
+  const lockState = ownedLock ? 'absent' : inspectVaultLock(layout);
   if (lockState === 'active') {
     return {
       code: 'UPDATE_IN_PROGRESS',

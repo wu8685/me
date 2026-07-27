@@ -74,6 +74,7 @@ export interface SetupOptions {
   environment?: NodeJS.ProcessEnv;
   preview?: boolean;
   hooks?: {
+    afterLockAcquired?(lockPath: string): void;
     beforePublish?(vaultRelativePath: string): void;
     afterPublish?(vaultRelativePath: string): void;
     beforeLockRelease?(lockPath: string): void;
@@ -453,21 +454,6 @@ function existingConfig(vaultDir: string): boolean {
   }
 }
 
-function hasSetupOperation(layout: RuntimeLayout): boolean {
-  try {
-    const entry = fs.lstatSync(layout.transactionDir);
-    if (!entry.isDirectory() || entry.isSymbolicLink()) {
-      throw new UpdateError('UNSAFE_PATH');
-    }
-    return fs.readdirSync(layout.transactionDir)
-      .some(name => name.startsWith('me-setup-'));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    if (error instanceof UpdateError) throw error;
-    throw new UpdateError('UNSAFE_PATH');
-  }
-}
-
 function fsyncDirectory(candidate: string): void {
   let descriptor: number | undefined;
   try {
@@ -605,24 +591,10 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
   let initialLayout: RuntimeLayout;
   try {
     initialLayout = resolveRuntimeLayout(options.vaultDir, options.environment);
-    let recovery = inspectVaultUpdateRecovery(
+    const recovery = inspectVaultUpdateRecovery(
       initialLayout.canonicalVault,
       options.environment,
     );
-    if (
-      recovery?.code === 'UPDATE_IN_PROGRESS'
-      && hasSetupOperation(initialLayout)
-    ) {
-      recovery = {
-        code: 'RECOVERY_REQUIRED',
-        actions: [{
-          kind: 'inspect',
-          path: '<ME_RUNTIME>/transactions',
-          description: 'Inspect the preserved setup journal and lock before retrying.',
-        }],
-        preservedPaths: ['<ME_RUNTIME>/transactions'],
-      };
-    }
     if (recovery) {
       return {
         version: 1,
@@ -744,8 +716,31 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
       operationId: crypto.randomUUID(),
       owner: 'me-update',
     });
+    options.hooks?.afterLockAcquired?.(lock.path);
+
+    const recovery = inspectVaultUpdateRecovery(
+      layout.canonicalVault,
+      options.environment,
+      lock,
+    );
+    if (recovery) {
+      releaseOwnedLock();
+      return {
+        version: 1,
+        status: 'blocked',
+        error: { code: recovery.code, message: recovery.code },
+        recoveryState: recovery.code === 'UPDATE_IN_PROGRESS' ? 'none' : 'manual',
+        recoveryActions: recovery.actions.map(action => ({
+          kind: 'inspect',
+          path: action.path,
+          description: action.description,
+        })),
+        preservedPaths: recovery.preservedPaths,
+      };
+    }
 
     if (existingConfig(layout.canonicalVault)) {
+      releaseOwnedLock();
       return { version: 1, status: 'already_initialized', message: EXISTING_MESSAGE };
     }
     preflightFreshSetup({ ...options, vaultDir: layout.canonicalVault });

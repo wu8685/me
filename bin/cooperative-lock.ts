@@ -27,6 +27,7 @@ export interface CooperativeLockHooks {
 
 export type CooperativeLockErrorCode = 'LOCK_HELD' | 'UNSAFE_PATH' | 'RECOVERY_REQUIRED';
 export type CooperativeLockInspection = 'absent' | 'active' | 'recovery-required';
+export type OwnedCooperativeLockInspection = 'owned' | 'recovery-required';
 
 export class CooperativeLockError extends Error {
   constructor(public readonly code: CooperativeLockErrorCode) {
@@ -558,6 +559,36 @@ export function acquireVaultLock(
     if (!removed) throw new CooperativeLockError('RECOVERY_REQUIRED');
     throw error;
   }
+}
+
+/**
+ * Verify that an acquired lock still owns the public cooperative namespace
+ * without releasing it. Callers can use this before a protected mutation
+ * phase when they must rescan other shared runtime state under the lock.
+ */
+export function inspectOwnedVaultLock(
+  layout: RuntimeLayout,
+  lock: OwnedCooperativeLock,
+): OwnedCooperativeLockInspection {
+  const expectedPath = path.join(layout.lockDir, 'vault.lock');
+  const state = lockStates.get(lock);
+  if (
+    !state
+    || path.resolve(lock.path) !== path.resolve(expectedPath)
+  ) return 'recovery-required';
+  const ownership = inspectPathOwnership(
+    lock.path,
+    lock.descriptor,
+    {
+      bytes: state.bytes,
+      device: state.descriptorDevice,
+      inode: state.descriptorInode,
+      operationId: lock.operationId,
+      owner: lock.owner,
+    },
+    state.operations,
+  );
+  return ownership === 'owned' ? 'owned' : 'recovery-required';
 }
 
 export function releaseVaultLock(

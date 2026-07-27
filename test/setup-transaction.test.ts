@@ -234,7 +234,7 @@ describe('fresh setup transaction', () => {
   test.each([
     'SIGINT',
     'SIGKILL',
-  ] as const)('%s after config publication leaves durable recovery before existing fast-path', async signal => {
+  ] as const)('%s after config publication leaves an active lock before existing fast-path', async signal => {
     const vault = temporaryDirectory('me-setup-kill-vault-');
     const runtime = path.join(temporaryDirectory('me-setup-kill-root-'), 'runtime');
     const moduleUrl = pathToFileURL(path.join(pluginRoot, 'bin/setup.ts')).href;
@@ -283,8 +283,8 @@ describe('fresh setup transaction', () => {
       });
       expect(result).toMatchObject({
         status: 'blocked',
-        error: { code: 'RECOVERY_REQUIRED' },
-        recoveryState: 'manual',
+        error: { code: 'UPDATE_IN_PROGRESS' },
+        recoveryState: 'none',
       });
       expect(manifest(vault)).toEqual(beforeVault);
       expect(manifest(runtime)).toEqual(beforeRuntime);
@@ -445,6 +445,94 @@ describe('fresh setup transaction', () => {
       releaseVaultLock(layout, lock);
     }
   });
+
+  test('active setup lock wins over its existing setup operation during preview', () => {
+    const vault = temporaryDirectory('me-setup-active-operation-vault-');
+    const runtime = path.join(
+      temporaryDirectory('me-setup-active-operation-root-'),
+      'runtime',
+    );
+    const environment = { ...process.env, ME_RUNTIME_ROOT: runtime };
+    const layout = resolveRuntimeLayout(vault, environment);
+    bootstrapRuntimeDirectories(layout, [layout.lockDir, layout.transactionDir]);
+    const operationId = crypto.randomUUID();
+    const operation = path.join(
+      layout.transactionDir,
+      `me-setup-${operationId}`,
+    );
+    fs.mkdirSync(operation, { mode: 0o700 });
+    fs.writeFileSync(path.join(operation, 'journal.json'), '{ incomplete', {
+      mode: 0o600,
+    });
+    const lock = acquireVaultLock(layout, {
+      operationId,
+      owner: 'me-update',
+    });
+    const beforeVault = manifest(vault);
+    const beforeRuntime = manifest(runtime);
+    try {
+      const result = executeFreshSetup({
+        ...setupOptions(vault, runtime),
+        preview: true,
+      });
+      expect(result).toMatchObject({
+        status: 'blocked',
+        error: { code: 'UPDATE_IN_PROGRESS' },
+        recoveryState: 'none',
+      });
+      expect(manifest(vault)).toEqual(beforeVault);
+      expect(manifest(runtime)).toEqual(beforeRuntime);
+    } finally {
+      releaseVaultLock(layout, lock);
+    }
+  });
+
+  for (const kind of ['vault-write', 'me-update', 'unknown'] as const) {
+    test(`rechecks malformed ${kind} residue after acquiring the lock`, () => {
+      const vault = temporaryDirectory(`me-setup-locked-${kind}-vault-`);
+      const runtime = path.join(
+        temporaryDirectory(`me-setup-locked-${kind}-root-`),
+        'runtime',
+      );
+      const beforeVault = manifest(vault);
+      let publishAttempts = 0;
+
+      const result = executeFreshSetup({
+        ...setupOptions(vault, runtime),
+        hooks: {
+          afterLockAcquired() {
+            const layout = resolveRuntimeLayout(vault, {
+              ...process.env,
+              ME_RUNTIME_ROOT: runtime,
+            });
+            const id = crypto.randomUUID();
+            const name = kind === 'unknown' ? `mystery-${id}` : `${kind}-${id}`;
+            const operation = path.join(layout.transactionDir, name);
+            fs.mkdirSync(operation, { mode: 0o700 });
+            fs.writeFileSync(path.join(operation, 'journal.json'), '{ malformed', {
+              mode: 0o600,
+            });
+          },
+          beforePublish() {
+            publishAttempts += 1;
+          },
+        },
+      });
+
+      expect(result).toMatchObject({
+        status: 'blocked',
+        error: { code: 'RECOVERY_REQUIRED' },
+        recoveryState: 'manual',
+        recoveryActions: [{
+          path: '<ME_RUNTIME>/transactions',
+        }],
+      });
+      expect(publishAttempts).toBe(0);
+      expect(manifest(vault)).toEqual(beforeVault);
+      expect(fs.existsSync(path.join(vault, '.me/config.yaml'))).toBeFalse();
+      expect(setupOperationDirectories(runtime)).toEqual([]);
+    });
+  }
 
   test('shared inspector ignores a valid committed vault-write journal', () => {
     const vault = temporaryDirectory('me-setup-committed-write-vault-');
