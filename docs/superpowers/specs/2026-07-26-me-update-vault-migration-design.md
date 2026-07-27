@@ -160,7 +160,8 @@ Rules:
   current version;
 - planning is deterministic for identical plugin and vault bytes;
 - migration modules do not write directly;
-- migrations declare operations and preconditions to the shared executor;
+- migrations declare operations and preconditions to the planner rather than
+  calling the shared executor directly;
 - each migration is independently idempotent;
 - the combined plan is validated before any write;
 - old migration modules remain available for every still-supported legacy
@@ -171,7 +172,8 @@ closed with `INVALID_MIGRATION_REGISTRY`.
 
 ## 6. Supported migration operations
 
-The shared executor supports a deliberately small operation vocabulary:
+The migration planner supports a deliberately small declarative operation
+vocabulary and lowers it into the shared filesystem mutation contract:
 
 - set, rename, or remove a known config key;
 - create a file only when absent;
@@ -189,6 +191,36 @@ scan and mutate an open-ended set during apply.
 The executor rejects absolute vault targets, lexical escapes, symlink escapes,
 special files, duplicate targets, overlapping parent/child replacements, and
 operations outside the canonical vault.
+
+### 6.1 Shared mutation contract and executor
+
+`me:update` and the existing generic `vault-write` path share one pure
+filesystem mutation contract and one ownership-aware executor. They must not
+define incompatible operation names, source fingerprints, ownership proofs,
+mutation-boundary hooks, or low-level filesystem failure meanings.
+
+The shared contract owns:
+
+- vault-relative source fingerprints and exact desired file metadata;
+- the closed mutation vocabulary used by deterministic plans;
+- explicit source and destination preconditions for renames;
+- typed filesystem boundary operations and fault-injection hooks;
+- ownership capture and revalidation for files and directories;
+- checked `link`, `rename`, `unlink`, `mkdir`, and `rmdir` primitives;
+- path-policy and journal callbacks supplied by the calling domain;
+- internal failure codes for changed sources, occupied destinations, lost
+  ownership, unsafe paths, and unsupported filesystems.
+
+The shared executor does not own ME domain semantics. `vault-write` keeps its
+note, schema, graph, and index planner; `me:update` keeps its migration
+registry, schema-version planner, and confirmation digest. Each domain also
+keeps its own journal state machine, public JSON result, and adapter from
+shared mutation failures to domain error codes.
+
+Planned desired file mode is material input and is covered by the plan
+fingerprint. A rename fingerprints both its source and destination state.
+Runtime-only inode and device ownership proofs remain internal and are never
+placed in public results or portable configuration.
 
 ## 7. Configuration preservation
 
@@ -237,9 +269,17 @@ instruction files without markers, a migration may recognize the exact known
 legacy section structure and adopt it once. Ambiguous headers or modified
 legacy sections are conflicts.
 
+When an Agent instruction file is absent, a migration may create the current
+fully marked template. When an existing `AGENTS.md` or `CLAUDE.md` has no ME
+markers and no legacy ME-owned heading collision, the migration may append the
+current marked ME block without changing existing bytes. Malformed or
+duplicate markers, partial legacy matches, and ambiguous ME-owned headings are
+conflicts. Repeating either creation, adoption, append, or marked replacement
+must produce identical bytes.
+
 This strategy preserves unrelated project instructions in `AGENTS.md` and
-`CLAUDE.md`. Future setup templates should emit ownership markers so later
-updates do not depend on header heuristics.
+`CLAUDE.md`. Current setup templates emit ownership markers so later updates
+do not depend on header heuristics.
 
 ### 8.4 User Profiles
 
@@ -287,6 +327,12 @@ The updater reuses the external runtime and path-safety model:
 
 It also shares the vault-wide ME write lock so update cannot race ingest,
 vault-write, or another update.
+
+All publication and rollback filesystem changes go through the shared
+ownership-aware mutation executor described in Section 6.1. The updater
+supplies its own safe-path policy and journal callbacks, and maps typed shared
+failures into updater results. It must not implement a parallel set of raw
+`link`, `rename`, `unlink`, `mkdir`, or `rmdir` mutation primitives.
 
 Before mutation, the transaction records:
 
@@ -400,6 +446,13 @@ sensitive file contents.
 ### 13.3 Transaction and safety tests
 
 - update serializes against ingest and vault-write;
+- updater and vault-write plans use the same mutation and fingerprint types;
+- updater and vault-write execute filesystem boundaries through the same
+  ownership-aware executor;
+- shared typed failures map deterministically into each domain's public error
+  contract;
+- write-file desired mode and both rename endpoint fingerprints affect the
+  plan digest;
 - injected failure at every mutation boundary rolls back owned changes;
 - external interference preserves recovery material;
 - symlink, traversal, special-file, and cross-filesystem targets fail closed;
@@ -409,8 +462,12 @@ sensitive file contents.
 ### 13.4 Setup and packaging tests
 
 - fresh setup writes the current vault schema directly;
+- fresh setup creates or safely merges both the Claude `CLAUDE.md` and Codex
+  `AGENTS.md` managed templates;
 - setup on an existing vault performs no migration and points to
   `$me:update`;
+- existing user-authored Agent instructions remain byte-for-byte unchanged
+  outside ME markers;
 - the plugin exposes `skills/update/SKILL.md` and packages all registry and
   template resources;
 - user documentation separates plugin upgrade from vault update;
@@ -424,6 +481,12 @@ Implementation is expected to add these focused units:
 ```text
 skills/update/SKILL.md
 bin/update.ts
+bin/mutation/
+├── contracts.ts
+└── executor.ts
+templates/
+├── CLAUDE-template.md
+└── AGENTS-template.md
 bin/update/
 ├── contracts.ts
 ├── config-document.ts
@@ -438,10 +501,13 @@ Exact filenames may change during implementation planning, but the boundaries
 must remain:
 
 - Skill: user interaction and confirmation;
+- shared mutation contract/executor: domain-neutral mutation vocabulary,
+  fingerprints, ownership checks, and filesystem primitives;
 - planner: pure deterministic migration planning;
 - registry: version-chain integrity;
 - config document: safe round-trip mutations;
-- transaction: locking, staging, journal, rollback, recovery;
+- transaction: domain locking, staging, journal state, rollback orchestration,
+  recovery reporting, and shared-executor adaptation;
 - migration modules: declarative version-specific intent.
 
 ## 15. Acceptance criteria

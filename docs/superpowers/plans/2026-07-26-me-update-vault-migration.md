@@ -17,6 +17,9 @@
 - Apply must recompute under the shared vault lock and reject a changed plan with `STALE_PREVIEW`.
 - Migrations are forward-only, deterministic, ordered, independently idempotent, and statically registered by the plugin.
 - Preserve unknown config keys, comments, user Profiles, and non-ME Agent instructions.
+- Reuse one domain-neutral mutation contract and ownership-aware executor for
+  updater and vault-write filesystem publication; keep domain planners,
+  journals, public results, and error adapters separate.
 - Use vault-relative paths publicly and `<ME_RUNTIME>/...` for host-local recovery paths.
 - Multi-file publication is journaled all-or-recovery, not described as database-atomic.
 - Do not commit, push, or otherwise mutate the user's vault Git repository.
@@ -29,7 +32,9 @@
 | File | Responsibility |
 | --- | --- |
 | `bin/cooperative-lock.ts` | One vault-wide lock shared by vault-write, ingest finalization, and update |
-| `bin/update/contracts.ts` | Versioned updater result, plan, mutation, fingerprint, and error contracts |
+| `bin/mutation/contracts.ts` | Shared planned-mutation, fingerprint, typed failure, and boundary contracts |
+| `bin/mutation/executor.ts` | Shared ownership-aware checked filesystem primitives |
+| `bin/update/contracts.ts` | Versioned updater plan metadata, result, and public error contracts |
 | `bin/update/config-document.ts` | Safe round-trip parsing and explicit config-key edits |
 | `bin/update/markdown-sections.ts` | Deterministic ME-owned Markdown section recognition and marker merge |
 | `bin/update/managed-assets.ts` | Ownership strategies and exact desired-byte planning |
@@ -240,7 +245,7 @@ export function renderConfigEdits(
 export function readVaultSchemaVersion(source: string): number;
 ```
 
-The shared contracts are:
+The updater result contracts are:
 
 ```ts
 export type UpdateStatus =
@@ -267,36 +272,6 @@ export type UpdateErrorCode =
   | 'VALIDATION_FAILED'
   | 'RECOVERY_REQUIRED'
   | 'INTERNAL_ERROR';
-
-export interface SourceFingerprint {
-  vaultRelativePath: string;
-  type: 'missing' | 'file' | 'directory';
-  sha256?: string;
-  mode?: number;
-}
-
-export type PlannedMutation =
-  | {
-      kind: 'write-file';
-      vaultRelativePath: string;
-      source: SourceFingerprint;
-      desiredBytes: Buffer;
-      desiredSha256: string;
-      publishOrder: number;
-    }
-  | {
-      kind: 'mkdir';
-      vaultRelativePath: string;
-      source: SourceFingerprint;
-      publishOrder: number;
-    }
-  | {
-      kind: 'rename';
-      vaultRelativePath: string;
-      destinationVaultRelativePath: string;
-      source: SourceFingerprint;
-      publishOrder: number;
-    };
 
 export interface UpdatePlan {
   status: 'up_to_date' | 'preview';
@@ -329,7 +304,8 @@ export interface UpdateResultV1 {
 ```
 
 `UpdateError` stores one `UpdateErrorCode` and always uses the stable public
-message from a frozen error catalog.
+message from a frozen error catalog. `UpdatePlan.mutations` consumes the
+shared `PlannedMutation` introduced in Task 2A.
 
 - [ ] **Step 1: Add the YAML dependency**
 
@@ -434,6 +410,289 @@ git commit -m "feat: define me update config contracts"
 
 ---
 
+### Task 2A: Extract the shared mutation contract and ownership executor
+
+**Files:**
+- Create: `bin/mutation/contracts.ts`
+- Create: `bin/mutation/executor.ts`
+- Create: `test/mutation-contracts.test.ts`
+- Create: `test/mutation-executor.test.ts`
+- Modify: `bin/update/contracts.ts`
+- Modify: `test/update-contracts.test.ts`
+- Modify: `bin/vault-write/transaction.ts`
+- Modify: `test/vault-write-transaction.test.ts`
+
+**Interfaces:**
+- Consumes: existing ownership-aware primitives from
+  `bin/vault-write/transaction.ts`, updater contracts from Task 2, and runtime
+  path policies supplied by each domain.
+- Produces:
+
+```ts
+import * as fs from 'fs';
+
+export interface SourceFingerprint {
+  vaultRelativePath: string;
+  type: 'missing' | 'file' | 'directory';
+  sha256?: string;
+  mode?: number;
+}
+
+export type PlannedMutation =
+  | {
+      kind: 'write-file';
+      vaultRelativePath: string;
+      source: SourceFingerprint;
+      desiredBytes: Buffer;
+      desiredSha256: string;
+      desiredMode: number;
+      publishOrder: number;
+    }
+  | {
+      kind: 'mkdir';
+      vaultRelativePath: string;
+      source: SourceFingerprint;
+      desiredMode: number;
+      publishOrder: number;
+    }
+  | {
+      kind: 'rename';
+      vaultRelativePath: string;
+      destinationVaultRelativePath: string;
+      source: SourceFingerprint;
+      destinationSource: SourceFingerprint;
+      publishOrder: number;
+    };
+
+export type FilesystemMutationKind =
+  | 'link'
+  | 'rename'
+  | 'unlink'
+  | 'mkdir'
+  | 'rmdir';
+
+export type MutationFailureCode =
+  | 'SOURCE_CHANGED'
+  | 'TARGET_EXISTS'
+  | 'OWNERSHIP_LOST'
+  | 'UNSAFE_PATH'
+  | 'UNSUPPORTED_FILESYSTEM';
+
+export class MutationFailure extends Error {
+  readonly code: MutationFailureCode;
+
+  constructor(code: MutationFailureCode) {
+    super(code);
+    this.name = 'MutationFailure';
+    this.code = code;
+  }
+}
+
+export interface OwnedFileFingerprint {
+  path: string;
+  device: bigint;
+  inode: bigint;
+  mode: number;
+  linkCount: bigint;
+  sha256: string;
+}
+
+export interface OwnedDirectoryFingerprint {
+  path: string;
+  device: bigint;
+  inode: bigint;
+  mode: number;
+}
+
+export interface MutationPathPolicy {
+  assertSafe(path: string): void;
+  display(path: string): string;
+}
+
+export interface MutationJournalAdapter {
+  beforeMutation(kind: FilesystemMutationKind, paths: readonly string[]): void;
+  afterMutation(kind: FilesystemMutationKind, paths: readonly string[]): void;
+}
+
+export interface MutationExecutorHooks {
+  beforeFilesystemMutation?(
+    kind: FilesystemMutationKind,
+    paths: readonly string[],
+  ): void;
+  onWarning?(code: 'DIRECTORY_FSYNC_UNSUPPORTED'): void;
+}
+
+export interface MutationFileOperations {
+  openSync: typeof fs.openSync;
+  closeSync: typeof fs.closeSync;
+  fstatSync: typeof fs.fstatSync;
+  fsyncSync: typeof fs.fsyncSync;
+  lstatSync: typeof fs.lstatSync;
+  statSync: typeof fs.statSync;
+  readFileSync: typeof fs.readFileSync;
+  readdirSync: typeof fs.readdirSync;
+  linkSync: typeof fs.linkSync;
+  renameSync: typeof fs.renameSync;
+  unlinkSync: typeof fs.unlinkSync;
+  mkdirSync: typeof fs.mkdirSync;
+  rmdirSync: typeof fs.rmdirSync;
+}
+
+export interface MutationExecutor {
+  captureFile(path: string): OwnedFileFingerprint;
+  captureDirectory(path: string): OwnedDirectoryFingerprint;
+  mkdir(path: string, mode: number): OwnedDirectoryFingerprint;
+  link(
+    source: OwnedFileFingerprint,
+    destination: string,
+  ): OwnedFileFingerprint;
+  rename(
+    source: OwnedFileFingerprint,
+    destination: string,
+  ): OwnedFileFingerprint;
+  unlink(source: OwnedFileFingerprint): void;
+  rmdir(source: OwnedDirectoryFingerprint): void;
+}
+
+export function fingerprintMutationSource(options: {
+  vaultRoot: string;
+  vaultRelativePath: string;
+  pathPolicy: MutationPathPolicy;
+}): SourceFingerprint;
+
+export function validatePlannedMutations(
+  mutations: readonly PlannedMutation[],
+): void;
+
+export function createMutationExecutor(options: {
+  pathPolicy: MutationPathPolicy;
+  journal: MutationJournalAdapter;
+  hooks?: MutationExecutorHooks;
+  fileOps?: MutationFileOperations;
+  directoryFsync?(directory: string): void;
+}): MutationExecutor;
+```
+
+`SourceFingerprint` and `PlannedMutation` are portable deterministic planning
+types. Inode/device-bearing ownership fingerprints are internal execution
+proofs and never enter plan digests, public JSON, or vault configuration.
+`bin/update/contracts.ts` re-exports the shared planning types during this
+release so Tasks 3–7 and external imports do not need a flag-day rename.
+
+- [ ] **Step 1: Write failing shared-contract and executor tests**
+
+Add contract tests that prove:
+
+1. `write-file` requires exact desired bytes, SHA-256, and `desiredMode`;
+2. `rename` requires fingerprints for both source and destination;
+3. mutation kinds and failures are closed typed unions rather than strings;
+4. invalid modes, mismatched hashes, duplicate targets, and overlapping
+   parent/child targets fail before filesystem mutation.
+5. updater and vault-write planning use the same source fingerprint helper,
+   which rejects symlinks and special files identically.
+
+Add executor tests that reuse fault-injection patterns already proven in
+`test/vault-write-transaction.test.ts`:
+
+```ts
+test('records one typed boundary around every checked primitive', () => {
+  const boundaries: string[] = [];
+  const executor = fixtureExecutor({
+    journal: {
+      beforeMutation: (kind, paths) =>
+        boundaries.push(`before:${kind}:${paths.join(',')}`),
+      afterMutation: (kind, paths) =>
+        boundaries.push(`after:${kind}:${paths.join(',')}`),
+    },
+  });
+
+  executor.mkdir(target, 0o700);
+  expect(boundaries).toEqual([
+    `before:mkdir:${target}`,
+    `after:mkdir:${target}`,
+  ]);
+});
+```
+
+Cover changed source identity/content, occupied rename destination, lost
+ownership before unlink/rmdir, symlink and special-file inputs,
+cross-filesystem link/rename, directory fsync warnings, and failure before and
+after each primitive. Assert the executor never silently overwrites a target.
+
+- [ ] **Step 2: Run the new tests and verify failure**
+
+Run:
+
+```bash
+bun test test/mutation-contracts.test.ts test/mutation-executor.test.ts
+```
+
+Expected: failure because the shared modules do not exist.
+
+- [ ] **Step 3: Extract contracts and the proven filesystem primitives**
+
+Move `SourceFingerprint` and `PlannedMutation` out of
+`bin/update/contracts.ts`. Extract the ownership capture/revalidation and
+checked `link`, `rename`, `unlink`, `mkdir`, `rmdir`, and directory-fsync
+behavior from the existing vault-write transaction into
+`bin/mutation/executor.ts`.
+
+The executor receives path-safety and journal adapters. It does not know about
+note schemas, indexes, migrations, vault schema versions, domain journal
+states, or public JSON results. It emits only typed `MutationFailure` values.
+
+- [ ] **Step 4: Adapt vault-write without changing its public contract**
+
+Replace vault-write's private `MutationKind`, ownership structs, and raw
+primitive methods with the shared executor. Keep its plan metadata, journal
+state machine, `VaultWriteResultV1`, and error catalog intact.
+
+Lower its note and optional README publication into shared
+`PlannedMutation` entries and obtain their portable preconditions through
+`fingerprintMutationSource`. Domain-specific graph/config/schema
+fingerprints remain in `PlanFingerprintV1`; they supplement rather than
+replace the shared mutation source fingerprints.
+
+Map shared failures explicitly:
+
+- `SOURCE_CHANGED` → `INPUT_CHANGED`;
+- `TARGET_EXISTS` → `TARGET_EXISTS`;
+- `UNSAFE_PATH` → `UNSAFE_PATH`;
+- `UNSUPPORTED_FILESYSTEM` → `UNSUPPORTED_FILESYSTEM`;
+- `OWNERSHIP_LOST` → `RECOVERY_REQUIRED`.
+
+Do not change the vault-write request format, output JSON, recovery paths, or
+commit model.
+
+- [ ] **Step 5: Run shared and vault-write regressions**
+
+Run:
+
+```bash
+bun test test/mutation-contracts.test.ts \
+  test/mutation-executor.test.ts \
+  test/update-contracts.test.ts \
+  test/vault-write-contracts.test.ts \
+  test/vault-write-path-safety.test.ts \
+  test/vault-write-transaction.test.ts \
+  test/vault-write-cli.test.ts
+```
+
+Expected: all pass. Existing vault-write fault-injection, journal, recovery,
+and public-result assertions remain unchanged.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add bin/mutation/contracts.ts bin/mutation/executor.ts \
+  bin/update/contracts.ts bin/vault-write/transaction.ts \
+  test/mutation-contracts.test.ts test/mutation-executor.test.ts \
+  test/update-contracts.test.ts test/vault-write-transaction.test.ts
+git commit -m "refactor: share me filesystem mutation executor"
+```
+
+---
+
 ### Task 3: Implement deterministic managed-asset ownership and merging
 
 **Files:**
@@ -443,10 +702,13 @@ git commit -m "feat: define me update config contracts"
 - Create: `templates/migration-history/0000/SCHEMA.md`
 - Create: `templates/migration-history/0000/CLAUDE-template.md`
 - Modify: `templates/CLAUDE-template.md`
+- Create: `templates/AGENTS-template.md`
 - Modify: `skills/setup/references/merge-rules.md`
+- Modify: `test/vault-test.sh`
 
 **Interfaces:**
-- Consumes: source fingerprints and `UpdateError` from
+- Consumes: `PlannedMutation` and source fingerprints from
+  `bin/mutation/contracts.ts`, plus domain `UpdateError` from
   `bin/update/contracts.ts`.
 - Produces:
 
@@ -461,7 +723,11 @@ export interface ManagedAssetIntent {
   desiredTemplatePath: string;
   strategy: ManagedAssetStrategy;
   knownTemplatePaths?: readonly string[];
-  optional?: boolean;
+  onAbsent: 'create' | 'skip';
+  onUnmarked:
+    | 'adopt-known-legacy'
+    | 'append-marked-block'
+    | 'conflict';
 }
 
 export function planManagedAsset(
@@ -473,6 +739,7 @@ export function planManagedAsset(
 export function mergeMeOwnedSections(
   current: string,
   desiredTemplate: string,
+  onUnmarked: ManagedAssetIntent['onUnmarked'],
 ): { content: string; adoptedLegacySections: string[] };
 ```
 
@@ -497,7 +764,9 @@ cp templates/CLAUDE-template.md \
 ```
 
 These snapshots are plugin resources used only for ownership proof; do not
-edit them after copying.
+edit them after copying. Do not create a historical `AGENTS-template.md`:
+earlier setup versions never emitted one, and the repository-root
+`AGENTS.md` is ME development configuration rather than a vault template.
 
 - [ ] **Step 2: Write failing ownership and Markdown-merge tests**
 
@@ -511,6 +780,8 @@ test('replaces only a byte-known historical template', () => {
     desiredTemplatePath: 'templates/SCHEMA.md',
     strategy: 'replace-known-template',
     knownTemplatePaths: ['templates/migration-history/0000/SCHEMA.md'],
+    onAbsent: 'create',
+    onUnmarked: 'conflict',
   };
   const mutation = planManagedAsset(vault, pluginRoot, intent);
   expect(mutation?.kind).toBe('write-file');
@@ -536,15 +807,33 @@ test('adopts exact legacy sections and preserves project instructions', () => {
     '',
   ].join('\\n');
 
-  const merged = mergeMeOwnedSections(current, desiredMarkedTemplate);
+  const merged = mergeMeOwnedSections(
+    current,
+    desiredMarkedTemplate,
+    'adopt-known-legacy',
+  );
   expect(merged.content).toContain('<!-- me:managed:start configuration -->');
   expect(merged.content).toContain('## Project Rules\\n\\nNever overwrite this.');
 });
 ```
 
-Also test nested headings, duplicate markers, mismatched markers, an
-unrecognized `# Knowledge Base`, symlink targets, special files, absent
-optional `AGENTS.md`, and a second merge producing identical bytes.
+Also test:
+
+- nested headings and fenced-code headings;
+- duplicate and mismatched markers;
+- an unrecognized or partially matching `# Knowledge Base`;
+- symlink targets and special files;
+- absent `CLAUDE.md` and `AGENTS.md` with `onAbsent: 'create'`;
+- absent files with `onAbsent: 'skip'`;
+- exact legacy Claude template adoption;
+- an existing user-authored `AGENTS.md` whose bytes remain unchanged before
+  the appended ME managed block;
+- unmarked files using each explicit `onUnmarked` policy;
+- a second create, adoption, append, or marked merge producing identical
+  bytes;
+- matching marker IDs and equivalent knowledge-vault semantics in
+  `CLAUDE-template.md` and `AGENTS-template.md`, while command examples use
+  `/me:*` and `$me:*` respectively.
 
 - [ ] **Step 3: Run tests and verify failure**
 
@@ -564,6 +853,12 @@ replace only complete matching marker pairs. For legacy content, recognize
 only the exact plugin-owned heading set from `merge-rules.md`; ambiguous or
 duplicated owned headings return `MIGRATION_CONFLICT`.
 
+For an unmarked Agent file with no legacy ME-owned heading collision,
+`append-marked-block` preserves all current bytes and appends the current
+complete ME block. A partial legacy match is a conflict rather than an append.
+For an absent file, obey `onAbsent` exactly. The marker parser and merge rules
+are Agent-neutral and apply identically to `CLAUDE.md` and `AGENTS.md`.
+
 `planManagedAsset` must:
 
 1. resolve lexical and canonical vault/plugin roots;
@@ -572,11 +867,15 @@ duplicated owned headings return `MIGRATION_CONFLICT`.
 4. return `undefined` when desired bytes already match;
 5. return an exact `write-file` mutation only when the selected strategy
    proves ownership;
-6. report a conflict instead of overwriting uncertain content.
+6. preserve the current regular-file mode when replacing or merging, and use
+   mode `0644` when creating an absent managed Markdown file;
+7. report a conflict instead of overwriting uncertain content.
 
-Add ownership markers around every template-owned section in
-`templates/CLAUDE-template.md`, and update merge rules to describe markers as
-the primary mechanism and legacy headings as one-time adoption only.
+Add ownership markers around every template-owned section in both
+`templates/CLAUDE-template.md` and `templates/AGENTS-template.md`. Update merge
+rules to describe markers as the primary Agent-neutral mechanism, exact
+legacy Claude headings as one-time adoption only, and safe marked-block
+append for an otherwise unrelated Agent instruction file.
 
 - [ ] **Step 5: Run tests**
 
@@ -584,21 +883,22 @@ Run:
 
 ```bash
 bun test test/update-managed-assets.test.ts
-bash test/vault-test.sh test_setup_upgrade_smart_merge
+bash test/vault-test.sh test_setup_agent_templates_and_merge_rules
 ```
 
-Expected: all pass. If the shell test name differs, locate the exact setup
-merge test with `rg -n "smart.merge|merge.*CLAUDE" test/vault-test.sh` and run
-that function using the script's documented single-test argument.
+Expected: all pass. Replace the old Claude-only
+`test_setup_smart_merge_instructions` with the named Agent-neutral contract
+test rather than retaining contradictory upgrade instructions.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add bin/update/markdown-sections.ts bin/update/managed-assets.ts \
   test/update-managed-assets.test.ts templates/CLAUDE-template.md \
+  templates/AGENTS-template.md \
   templates/migration-history/0000/SCHEMA.md \
   templates/migration-history/0000/CLAUDE-template.md \
-  skills/setup/references/merge-rules.md
+  skills/setup/references/merge-rules.md test/vault-test.sh
 git commit -m "feat: plan owned me vault assets safely"
 ```
 
@@ -616,7 +916,8 @@ git commit -m "feat: plan owned me vault assets safely"
 - Modify: `package-lock.json`
 
 **Interfaces:**
-- Consumes: `renderConfigEdits`, `planManagedAsset`, and updater contracts.
+- Consumes: `renderConfigEdits`, `planManagedAsset`, shared mutation
+  contracts from Task 2A, and updater contracts.
 - Produces:
 
 ```ts
@@ -722,8 +1023,18 @@ test('digest changes for every material input and is stable otherwise', () => {
 ```
 
 Add cases for current vault (`up_to_date`), malformed config, future schema,
-optional absent Agent files, modified managed files, unsafe paths, and exact
-unified diffs without absolute paths.
+absent Agent files, modified managed files, unsafe paths, and exact unified
+diffs without absolute paths. Prove that:
+
+- an absent `CLAUDE.md` plans creation from `CLAUDE-template.md`;
+- an absent `AGENTS.md` plans creation from `AGENTS-template.md`;
+- existing marked Agent files plan only their ME-owned sections;
+- an unrelated unmarked Agent file preserves all existing bytes and appends
+  one marked ME block;
+- exact legacy Claude content is adopted once;
+- both `CLAUDE.md` and `AGENTS.md` source or desired-byte changes alter
+  `planDigest`;
+- a second plan after applying the desired bytes is `up_to_date`.
 
 The future-schema case must assert the exact compatibility error:
 
@@ -765,8 +1076,11 @@ Migration `0000-to-0001` must:
 
 - set `vault_schema_version` to `1`;
 - plan `SCHEMA.md` with `replace-known-template`;
-- plan existing `CLAUDE.md` and `AGENTS.md` with
-  `merge-owned-sections`, treating absence as an optional no-op;
+- plan both `CLAUDE.md` and `AGENTS.md` with `merge-owned-sections`,
+  `onAbsent: 'create'`, `onUnmarked: 'append-marked-block'`, and exact
+  historical adoption before the unmarked fallback;
+- use the historical Claude snapshot only for exact legacy adoption and never
+  treat the repository-root `AGENTS.md` as a historical vault template;
 - leave Profiles and knowledge-layer notes untouched.
 
 The planner reads all inputs before returning, resolves every migration from
@@ -774,6 +1088,10 @@ current to target, rejects conflicts, sorts mutations so the config version
 write is last, and uses `createTwoFilesPatch` for text diffs. Canonicalize the
 digest input by lexicographically sorting object keys and path lists; do not
 include random operation IDs, timestamps, absolute paths, or raw file content.
+The canonical digest includes `desiredMode` for file/directory publication and
+both endpoint fingerprints for every rename.
+Config edits preserve the existing `.me/config.yaml` mode; newly created
+managed Markdown files use the mode selected in Task 3.
 
 - [ ] **Step 5: Run tests**
 
@@ -912,7 +1230,8 @@ git commit -m "feat: preview me vault updates"
 - Modify: `test/update-cli.test.ts`
 
 **Interfaces:**
-- Consumes: `planVaultUpdate`, `acquireVaultLock`, runtime path helpers, and
+- Consumes: `planVaultUpdate`, `acquireVaultLock`, runtime path helpers,
+  shared `createMutationExecutor`, typed mutation failures/hooks, and
   `UpdatePlan`.
 - Produces:
 
@@ -921,7 +1240,10 @@ export interface UpdateTransactionOptions {
   pluginRoot: string;
   environment?: NodeJS.ProcessEnv;
   hooks?: {
-    beforeMutation?(kind: string, paths: readonly string[]): void;
+    beforeMutation?(
+      kind: FilesystemMutationKind,
+      paths: readonly string[],
+    ): void;
     beforeLockRelease?(path: string): void;
   };
 }
@@ -971,6 +1293,10 @@ test('rejects stale preview before staging or vault mutation', () => {
 
 Inject failure before each hard-link/rename/unlink/mkdir boundary. Assert:
 
+- every boundary is emitted through the shared typed executor hook;
+- shared `SOURCE_CHANGED` before the first vault mutation maps to
+  `STALE_PREVIEW`;
+- shared `OWNERSHIP_LOST` after mutation maps to `RECOVERY_REQUIRED`;
 - failure before first vault mutation removes owned staging and originals;
 - failure after mutation restores owned originals;
 - externally changed output is preserved and yields `recovery_required`;
@@ -1021,6 +1347,28 @@ their SHA-256 digests. Use same-filesystem hard links/renames and record
 `pendingMutation` before every filesystem change. Move or link originals into
 `originals/` before replacement. Publish `.me/config.yaml` last.
 
+After staged bytes validate, set each staged descriptor to the planned
+`desiredMode` and fsync it before publication; the private operation directory
+remains mode `0700`. Directory creation passes the planned mode into the
+shared executor. Do not publish first and then apply an unjournaled chmod.
+
+Construct the shared mutation executor with updater-specific path-policy and
+journal adapters. All `link`, `rename`, `unlink`, `mkdir`, and `rmdir`
+publication and rollback boundaries must pass through it. This module may use
+raw filesystem APIs for read-only inspection, opening/fsyncing staged bytes,
+and journal descriptor writes, but must not call raw mutation primitives for
+vault publication, preservation, rollback, or cleanup.
+
+Map shared failures explicitly:
+
+- before the first vault mutation, `SOURCE_CHANGED` → `STALE_PREVIEW`;
+- `TARGET_EXISTS` before mutation → `STALE_PREVIEW`, unless the planner
+  already reported a managed-asset conflict;
+- `UNSAFE_PATH` → `UNSAFE_PATH`;
+- `UNSUPPORTED_FILESYSTEM` → `UNSUPPORTED_FILESYSTEM`;
+- ownership loss or any ambiguous failure after mutation →
+  `RECOVERY_REQUIRED`.
+
 On error, restore only files whose inode/digest ownership still matches the
 transaction. When ownership is ambiguous, stop cleanup, retain journal and
 originals, and return `RECOVERY_REQUIRED`. Do not return committed until all
@@ -1052,6 +1400,7 @@ Run:
 
 ```bash
 bun test test/cooperative-lock.test.ts \
+  test/mutation-executor.test.ts \
   test/vault-write-transaction.test.ts \
   test/ingest-finalize.test.ts \
   test/update-transaction.test.ts
@@ -1083,7 +1432,8 @@ git commit -m "feat: apply me vault migrations safely"
 - Modify: `test/vault-test.sh`
 
 **Interfaces:**
-- Consumes: the `me-update` CLI from Tasks 5–6.
+- Consumes: Agent-neutral managed templates and merge rules from Task 3, plus
+  the `me-update` CLI from Tasks 5–6.
 - Produces: `$me:update` / `/me:update` behavior and current-version fresh
   setup.
 
@@ -1103,17 +1453,26 @@ assert_file_contains "$PLUGIN_ROOT/skills/setup/SKILL.md" \
   'vault_schema_version: 1'
 assert_file_contains "$PLUGIN_ROOT/skills/setup/SKILL.md" \
   'Run.*me:update'
+assert_file_contains "$PLUGIN_ROOT/skills/setup/SKILL.md" \
+  'AGENTS-template.md'
+assert_file_exists "$PLUGIN_ROOT/templates/AGENTS-template.md"
+assert_file_contains "$PLUGIN_ROOT/templates/AGENTS-template.md" \
+  '\$me:update'
 assert_file_contains "$PLUGIN_ROOT/package.json" '"me-update"'
 ```
 
 Add an end-to-end temporary-vault test:
 
-1. fresh setup instructions generate `vault_schema_version: 1`;
-2. existing config causes setup to report update guidance without changing
-   file hashes;
-3. preview of a legacy fixture leaves it unchanged;
-4. apply with the returned digest migrates it;
-5. the second preview is `up_to_date`.
+1. fresh setup instructions generate `vault_schema_version: 1` and current
+   marked `CLAUDE.md` plus `AGENTS.md`;
+2. fresh setup against pre-existing user-authored Agent files preserves their
+   bytes outside the newly appended ME blocks;
+3. existing `.me/config.yaml` causes setup to report update guidance without
+   changing any config, schema, Agent, layer, or runtime file hash;
+4. preview of a legacy fixture leaves it unchanged;
+5. apply with the returned digest creates or merges both Agent files while
+   preserving user instructions;
+6. the second preview is `up_to_date`.
 
 - [ ] **Step 2: Run contract tests and verify failure**
 
@@ -1162,8 +1521,17 @@ layers:
   cognition: "<cognition_dir>"
 ```
 
-Add ME ownership markers through the current template. When
-`.me/config.yaml` already exists, setup performs no writes and reports:
+For fresh setup, create or safely merge both current marked templates:
+
+- `${CLAUDE_PLUGIN_ROOT}/templates/CLAUDE-template.md` → `CLAUDE.md`;
+- `${CLAUDE_PLUGIN_ROOT}/templates/AGENTS-template.md` → `AGENTS.md`.
+
+If either Agent file already exists, preserve its bytes and append or refresh
+only the ME managed block according to the Agent-neutral merge rules from
+Task 3. Never overwrite an existing user-authored Agent file.
+
+When `.me/config.yaml` already exists, setup performs no writes to any vault or
+runtime path and reports:
 
 ```text
 me vault already initialized.
@@ -1172,8 +1540,8 @@ vault migrations. No files changed.
 ```
 
 Remove the old setup behavior that directly refreshes `SCHEMA.md` and
-smart-merges `CLAUDE.md`; that behavior now belongs to migration
-`0000-to-0001`.
+smart-merges `CLAUDE.md`; all existing-vault changes to `SCHEMA.md`,
+`CLAUDE.md`, or `AGENTS.md` now belong to migration `0000-to-0001`.
 
 - [ ] **Step 5: Update packaging and documentation**
 
@@ -1197,7 +1565,9 @@ $me:update
 
 Explain preview/confirmation, schema version, forward-only policy,
 `STALE_PREVIEW`, recovery inspection, and that ME never commits the user's
-vault.
+vault. Document Claude Code `/me:update` and Codex `$me:update` with identical
+confirmation and recovery semantics. Add `$me:update` to the Codex manifest's
+update-oriented default prompt text.
 
 - [ ] **Step 6: Run complete verification**
 
@@ -1223,7 +1593,8 @@ npm pack --dry-run
 ```
 
 Expected: output includes `skills/update/SKILL.md`, `bin/update.ts`,
-`bin/update/**`, current templates, and `templates/migration-history/0000/**`;
+`bin/update/**`, `bin/mutation/**`, both current Agent templates, and
+`templates/migration-history/0000/**`;
 it excludes `.planning/`, `.worktrees/`, runtime state, and test fixtures.
 
 - [ ] **Step 8: Commit**
@@ -1241,9 +1612,15 @@ git commit -m "feat: expose versioned me vault updates"
 
 Before integration:
 
-- [ ] Compare every section of the design spec with Tasks 1–7.
+- [ ] Compare every section of the design spec with Tasks 1, 2, 2A, and 3–7.
 - [ ] Run `rg -n 'TB[D]|TO[D]O|implement [l]ater|appropriate [e]rror|similar to [T]ask' docs/superpowers/plans/2026-07-26-me-update-vault-migration.md` and resolve every hit.
-- [ ] Confirm all Task 2 contract names are used unchanged by Tasks 3–7.
+- [ ] Confirm Task 2 updater result names and Task 2A shared mutation names
+  are used unchanged by Tasks 3–7.
+- [ ] Confirm updater and vault-write use `bin/mutation/executor.ts` for every
+  publication and rollback filesystem mutation; neither defines a private
+  competing mutation kind or ownership proof.
+- [ ] Confirm both current Agent templates are packaged, use matching ME
+  marker IDs, and preserve all user instructions outside managed blocks.
 - [ ] Confirm preview performs no `mkdir`, lock acquisition, staging, or runtime bootstrap.
 - [ ] Confirm apply publishes `.me/config.yaml` last and never advances the version after rollback/recovery.
 - [ ] Confirm `git status --short` contains only intended implementation and plan artifacts.
