@@ -486,18 +486,11 @@ function hasUtf8Bom(bytes: Buffer): boolean {
     && bytes[2] === 0xbf;
 }
 
-export function renderConfigEdits(
-  configPath: string,
+export function renderConfigBytes(
+  sourceBytes: Buffer,
   edits: readonly ConfigEdit[],
 ): ConfigRenderResult {
   const validatedEdits = parseConfigEdits(edits);
-  let sourceBytes: Buffer;
-  try {
-    sourceBytes = fs.readFileSync(configPath);
-  } catch {
-    throw new UpdateError('INVALID_CONFIG');
-  }
-
   try {
     const document = parseConfig(decodeUtf8(sourceBytes));
     const currentVersion = readVersion(document);
@@ -523,4 +516,17 @@ export function renderConfigEdits(
     if (error instanceof UpdateError) throw error;
     return invalidConfig();
   }
+}
+
+export function renderConfigEdits(
+  configPath: string,
+  edits: readonly ConfigEdit[],
+): ConfigRenderResult {
+  let sourceBytes: Buffer;
+  try {
+    sourceBytes = fs.readFileSync(configPath);
+  } catch {
+    throw new UpdateError('INVALID_CONFIG');
+  }
+  return renderConfigBytes(sourceBytes, edits);
 }

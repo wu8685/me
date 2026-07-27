@@ -28,6 +28,15 @@ export interface ManagedAssetIntent {
   onUnmarked: UnmarkedManagedAssetPolicy;
 }
 
+export type ManagedAssetCurrent =
+  | { type: 'missing' }
+  | { type: 'file'; bytes: Buffer; mode: number };
+
+export interface ManagedAssetRenderResult {
+  desiredBytes: Buffer;
+  desiredMode: number;
+}
+
 function fail(code: 'MIGRATION_CONFLICT' | 'UNSAFE_PATH' | 'UNSUPPORTED_FILESYSTEM'): never {
   throw new UpdateError(code);
 }
@@ -225,6 +234,81 @@ function validateIntent(intent: ManagedAssetIntent): void {
   ) fail('UNSAFE_PATH');
 }
 
+export function renderManagedAssetBytes(options: {
+  intent: ManagedAssetIntent;
+  current: ManagedAssetCurrent;
+  readPluginResource(relativePath: string): Buffer;
+}): ManagedAssetRenderResult | undefined {
+  const { intent, current, readPluginResource } = options;
+  validateIntent(intent);
+  if (
+    !current
+    || typeof current !== 'object'
+    || (
+      current.type === 'file'
+      && (
+        !Buffer.isBuffer(current.bytes)
+        || !Number.isSafeInteger(current.mode)
+        || current.mode < 0
+        || current.mode > 0o777
+      )
+    )
+    || !['missing', 'file'].includes(current.type)
+  ) {
+    fail('UNSAFE_PATH');
+  }
+
+  const desiredBytes = readPluginResource(intent.desiredTemplatePath);
+  if (!Buffer.isBuffer(desiredBytes)) fail('UNSAFE_PATH');
+  const desiredText = intent.strategy === 'merge-owned-sections'
+    ? utf8(desiredBytes, true)
+    : undefined;
+  if (desiredText !== undefined) {
+    const validated = mergeMeOwnedSections(
+      desiredText,
+      desiredText,
+      'conflict',
+    );
+    if (validated.content !== desiredText) fail('UNSAFE_PATH');
+  }
+
+  if (current.type === 'missing') {
+    return intent.onAbsent === 'skip'
+      ? undefined
+      : {
+          desiredBytes: Buffer.from(Uint8Array.from(desiredBytes)),
+          desiredMode: 0o644,
+        };
+  }
+  if (bytesEqual(current.bytes, desiredBytes)) return undefined;
+  if (intent.strategy === 'create-if-absent') return undefined;
+
+  const knownBytes = (intent.knownTemplatePaths ?? []).map(relativePath => {
+    const bytes = readPluginResource(relativePath);
+    if (!Buffer.isBuffer(bytes)) fail('UNSAFE_PATH');
+    return bytes;
+  });
+  if (intent.strategy === 'replace-known-template') {
+    if (!knownBytes.some(known => bytesEqual(known, current.bytes))) {
+      fail('MIGRATION_CONFLICT');
+    }
+    return {
+      desiredBytes: Buffer.from(Uint8Array.from(desiredBytes)),
+      desiredMode: current.mode,
+    };
+  }
+
+  const merged = mergeMeOwnedSections(
+    utf8(current.bytes, false),
+    desiredText as string,
+    intent.onUnmarked,
+    knownBytes.map(known => utf8(known, true)),
+  ).content;
+  const mergedBytes = Buffer.from(merged);
+  if (bytesEqual(current.bytes, mergedBytes)) return undefined;
+  return { desiredBytes: mergedBytes, desiredMode: current.mode };
+}
+
 export function planManagedAsset(
   vaultRoot: string,
   pluginRoot: string,
@@ -233,56 +317,34 @@ export function planManagedAsset(
   validateIntent(intent);
   const vault = canonicalDirectory(vaultRoot);
   const plugin = canonicalDirectory(pluginRoot);
-  const desiredBytes = readRegularFile(plugin, intent.desiredTemplatePath);
-  const desiredText = intent.strategy === 'merge-owned-sections'
-    ? utf8(desiredBytes, true)
-    : undefined;
-  if (desiredText !== undefined) {
-    const validated = mergeMeOwnedSections(desiredText, desiredText, 'conflict');
-    if (validated.content !== desiredText) fail('UNSAFE_PATH');
-  }
   const source = sourceFingerprint(vault, intent.vaultRelativePath);
-
+  let current: ManagedAssetCurrent;
   if (source.type === 'missing') {
-    return intent.onAbsent === 'skip'
-      ? undefined
-      : writeMutation(intent.vaultRelativePath, source, desiredBytes, 0o644);
+    current = { type: 'missing' };
+  } else if (source.type === 'file') {
+    const currentBytes = readRegularFile(vault, intent.vaultRelativePath);
+    if (sha256(currentBytes) !== source.sha256) fail('UNSAFE_PATH');
+    current = {
+      type: 'file',
+      bytes: currentBytes,
+      mode: source.mode ?? 0o644,
+    };
+  } else {
+    return fail('UNSAFE_PATH');
   }
-  if (source.type !== 'file') fail('UNSAFE_PATH');
-  const currentBytes = readRegularFile(vault, intent.vaultRelativePath);
-  if (sha256(currentBytes) !== source.sha256) fail('UNSAFE_PATH');
-  if (bytesEqual(currentBytes, desiredBytes)) return undefined;
-
-  if (intent.strategy === 'create-if-absent') return undefined;
-  const knownBytes = (intent.knownTemplatePaths ?? [])
-    .map(knownPath => readRegularFile(plugin, knownPath));
-
-  if (intent.strategy === 'replace-known-template') {
-    if (!knownBytes.some(known => bytesEqual(known, currentBytes))) {
-      fail('MIGRATION_CONFLICT');
-    }
-    return writeMutation(
-      intent.vaultRelativePath,
-      source,
-      desiredBytes,
-      source.mode ?? 0o644,
-    );
-  }
-
-  const knownLegacyContents = knownBytes.map(known => utf8(known, true));
-  const merged = mergeMeOwnedSections(
-    utf8(currentBytes, false),
-    desiredText as string,
-    intent.onUnmarked,
-    knownLegacyContents,
-  ).content;
-  const mergedBytes = Buffer.from(merged);
-  if (bytesEqual(currentBytes, mergedBytes)) return undefined;
+  const rendered = renderManagedAssetBytes({
+    intent,
+    current,
+    readPluginResource(relativePath) {
+      return readRegularFile(plugin, relativePath);
+    },
+  });
+  if (!rendered) return undefined;
   return writeMutation(
     intent.vaultRelativePath,
     source,
-    mergedBytes,
-    source.mode ?? 0o644,
+    rendered.desiredBytes,
+    rendered.desiredMode,
   );
 }
 

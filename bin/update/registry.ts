@@ -36,12 +36,45 @@ function safeVersion(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
+function hasExactKeys(
+  value: object,
+  expected: readonly string[],
+): boolean {
+  const keys = Reflect.ownKeys(value);
+  return keys.length === expected.length
+    && keys.every(key => (
+      typeof key === 'string' && expected.includes(key)
+    ));
+}
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function denseRegistry(value: readonly VaultMigration[]): boolean {
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== value.length + 1) return false;
+  return keys.every(key => (
+    key === 'length'
+    || (
+      typeof key === 'string'
+      && Number.isSafeInteger(Number(key))
+      && String(Number(key)) === key
+      && Number(key) >= 0
+      && Number(key) < value.length
+    )
+  ));
+}
+
 export function validateMigrationRegistry(
   migrations: readonly VaultMigration[],
   currentVersion: number,
 ): void {
   if (
     !Array.isArray(migrations)
+    || !denseRegistry(migrations)
     || !safeVersion(currentVersion)
     || migrations.length !== currentVersion
   ) {
@@ -53,10 +86,16 @@ export function validateMigrationRegistry(
     const migration = migrations[index] as VaultMigration | undefined;
     if (
       !migration
-      || typeof migration !== 'object'
+      || !plainRecord(migration)
+      || !hasExactKeys(migration, [
+        'id',
+        'fromVersion',
+        'toVersion',
+        'describe',
+        'plan',
+      ])
       || typeof migration.id !== 'string'
-      || migration.id.length === 0
-      || /[\u0000-\u001f\u007f]/.test(migration.id)
+      || !/^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?$/.test(migration.id)
       || ids.has(migration.id)
       || !safeVersion(migration.fromVersion)
       || !safeVersion(migration.toVersion)

@@ -86,6 +86,8 @@ describe('migration registry validation', () => {
       { ...migration(0, 1, 'a'), describe: undefined },
       { ...migration(0, 1, 'a'), plan: undefined },
       { ...migration(0, 1, 'a'), fromVersion: -1 },
+      { ...migration(0, 1, 'a'), id: '/unsafe/id' },
+      { ...migration(0, 1, 'a'), extra: true },
     ]) {
       expectInvalidRegistry(() => validateMigrationRegistry(
         [invalid as VaultMigration],

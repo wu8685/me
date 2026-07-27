@@ -7,7 +7,10 @@ import { parseDocument } from 'yaml';
 import {
   planVaultUpdate,
 } from '../bin/update/planner.ts';
-import type { VaultMigration } from '../bin/update/registry.ts';
+import type {
+  ContentTransformIntent,
+  VaultMigration,
+} from '../bin/update/registry.ts';
 import { UpdateError } from '../bin/update/contracts.ts';
 
 const repositoryPluginRoot = path.resolve(import.meta.dir, '..');
@@ -84,7 +87,7 @@ function manifest(root: string): Array<{
     sha256?: string;
   }> = [];
   const visit = (directory: string): void => {
-    for (const name of fs.readdirSync(directory).sort()) {
+    for (const name of fs.readdirSync(directory).sort(codeUnitCompare)) {
       const absolute = path.join(directory, name);
       const relative = path.relative(root, absolute).split(path.sep).join('/');
       const stat = fs.lstatSync(absolute);
@@ -148,6 +151,21 @@ function configOnlyMigration(
   };
 }
 
+function codeUnitCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function managedTemplate(label: string): string {
+  return [
+    '<!-- me:managed:start configuration -->',
+    '## Configuration',
+    '',
+    label,
+    '<!-- me:managed:end configuration -->',
+    '',
+  ].join('\n');
+}
+
 describe('pure vault update planning', () => {
   test('plans legacy zero to current one without writing and config is last', () => {
     const vault = makeVault();
@@ -160,12 +178,15 @@ describe('pure vault update planning', () => {
     });
 
     expect(plan.status).toBe('preview');
+    expect(plan.conflicts).toEqual([]);
     expect(plan.currentVaultSchemaVersion).toBe(0);
     expect(plan.targetVaultSchemaVersion).toBe(1);
     expect(plan.migrations.map(item => item.id)).toEqual(['0000-to-0001']);
     expect(plan.mutations.at(-1)?.vaultRelativePath).toBe('.me/config.yaml');
     expect(plan.plannedPaths).toEqual(
-      plan.mutations.map(mutation => mutation.vaultRelativePath).sort(),
+      plan.mutations
+        .map(mutation => mutation.vaultRelativePath)
+        .sort(codeUnitCompare),
     );
     expect(plan.diffs.some(item => item.path === '.me/config.yaml')).toBeTrue();
     expect(plan.plannedPaths).not.toContain('Profiles/private.yaml');
@@ -318,10 +339,15 @@ describe('pure vault update planning', () => {
       path.join(vault, 'CLAUDE.md'),
       '\n## Project Rules\n\nkeep\n',
     );
-    expect(errorCode(() => planVaultUpdate({
+    const blocked = planVaultUpdate({
       vaultDir: vault,
       pluginRoot: repositoryPluginRoot,
-    }))).toBe('MIGRATION_CONFLICT');
+    });
+    expect(blocked.status).toBe('blocked');
+    expect(blocked.conflicts).toEqual([{
+      path: 'CLAUDE.md',
+      reason: 'MIGRATION_CONFLICT',
+    }]);
   });
 
   test('replaces SCHEMA only from known historical bytes and preserves its mode', () => {
@@ -340,10 +366,15 @@ describe('pure vault update planning', () => {
     });
 
     fs.appendFileSync(path.join(vault, 'SCHEMA.md'), '\nuser bytes\n');
-    expect(errorCode(() => planVaultUpdate({
+    const blocked = planVaultUpdate({
       vaultDir: vault,
       pluginRoot: plugin,
-    }))).toBe('MIGRATION_CONFLICT');
+    });
+    expect(blocked.status).toBe('blocked');
+    expect(blocked.conflicts).toEqual([{
+      path: 'SCHEMA.md',
+      reason: 'MIGRATION_CONFLICT',
+    }]);
   });
 
   test('is idempotent after applying the exact desired file bytes', () => {
@@ -462,7 +493,7 @@ describe('pure vault update planning', () => {
       vaultDir: vault,
       pluginRoot: repositoryPluginRoot,
       registry: [duplicate],
-    }))).toBe('MIGRATION_CONFLICT');
+    }))).toBe('INVALID_MIGRATION_REGISTRY');
   });
 
   test('rejects unsafe paths, symlinks, and special content targets', () => {
@@ -487,7 +518,7 @@ describe('pure vault update planning', () => {
       vaultDir: transformVault,
       pluginRoot: repositoryPluginRoot,
       registry: [unsafe],
-    }))).toBe('UNSAFE_PATH');
+    }))).toBe('INVALID_MIGRATION_REGISTRY');
 
     if (process.platform !== 'win32') {
       const fifo = path.join(transformVault, 'special');
@@ -529,5 +560,294 @@ describe('pure vault update planning', () => {
     }]);
     expect(JSON.stringify(plan)).not.toContain(vault);
     expect(JSON.stringify(plan)).not.toContain(repositoryPluginRoot);
+  });
+
+  test('composes a 0-to-1-to-2 chain on one virtual desired view', () => {
+    const plugin = copyPlugin();
+    writeFile(
+      plugin,
+      'templates/fixture-agent-v1.md',
+      managedTemplate('stage one'),
+    );
+    writeFile(
+      plugin,
+      'templates/fixture-agent-v2.md',
+      managedTemplate('stage two'),
+    );
+    const vault = makeVault([
+      'vault_schema_version: 0',
+      'shared: original',
+      '',
+    ].join('\n'));
+    writeFile(vault, 'notes/shared.md', 'base\n', 0o600);
+    writeFile(vault, 'notes/z-stage-zero.md', 'z\n');
+    writeFile(vault, 'notes/a-stage-one.md', 'a\n');
+
+    const append = (label: string) => ({
+      vaultRelativePaths: ['notes/shared.md'],
+      transform(_relativePath: string, currentBytes: Buffer) {
+        return Buffer.concat([currentBytes, Buffer.from(`${label}\n`)]);
+      },
+    });
+    const migrations: VaultMigration[] = [
+      {
+        id: 'fixture-0000-to-0001',
+        fromVersion: 0,
+        toVersion: 1,
+        describe: () => 'stage one',
+        plan: () => ({
+          configEdits: [
+            { kind: 'set', path: ['shared'], value: 'stage-one' },
+            { kind: 'set', path: ['vault_schema_version'], value: 1 },
+          ],
+          managedAssets: [{
+            vaultRelativePath: 'AGENTS.md',
+            desiredTemplatePath: 'templates/fixture-agent-v1.md',
+            strategy: 'merge-owned-sections',
+            onAbsent: 'create',
+            onUnmarked: 'append-marked-block',
+          }],
+          contentTransforms: [
+            append('stage-one'),
+            {
+              vaultRelativePaths: ['notes/z-stage-zero.md'],
+              transform(_relativePath, currentBytes) {
+                return Buffer.concat([currentBytes, Buffer.from('zero\n')]);
+              },
+            },
+          ],
+        }),
+      },
+      {
+        id: 'fixture-0001-to-0002',
+        fromVersion: 1,
+        toVersion: 2,
+        describe: () => 'stage two',
+        plan: () => ({
+          configEdits: [
+            { kind: 'set', path: ['shared'], value: 'stage-two' },
+            { kind: 'set', path: ['vault_schema_version'], value: 2 },
+          ],
+          managedAssets: [{
+            vaultRelativePath: 'AGENTS.md',
+            desiredTemplatePath: 'templates/fixture-agent-v2.md',
+            strategy: 'merge-owned-sections',
+            onAbsent: 'create',
+            onUnmarked: 'append-marked-block',
+          }],
+          contentTransforms: [
+            append('stage-two'),
+            {
+              vaultRelativePaths: ['notes/a-stage-one.md'],
+              transform(_relativePath, currentBytes) {
+                return Buffer.concat([currentBytes, Buffer.from('one\n')]);
+              },
+            },
+          ],
+        }),
+      },
+    ];
+
+    const plan = planVaultUpdate({
+      vaultDir: vault,
+      pluginRoot: plugin,
+      registry: migrations,
+    });
+    expect(plan).toMatchObject({
+      status: 'preview',
+      currentVaultSchemaVersion: 0,
+      targetVaultSchemaVersion: 2,
+      migrations: [
+        { id: 'fixture-0000-to-0001', description: 'stage one' },
+        { id: 'fixture-0001-to-0002', description: 'stage two' },
+      ],
+      conflicts: [],
+    });
+    expect(plan.mutations.filter(mutation => (
+      mutation.vaultRelativePath === 'notes/shared.md'
+    ))).toHaveLength(1);
+
+    const config = mutationFor(plan, '.me/config.yaml');
+    if (!config || config.kind !== 'write-file') throw new Error('expected config');
+    const configDocument = parseDocument(config.desiredBytes.toString('utf8'));
+    expect(configDocument.get('shared')).toBe('stage-two');
+    expect(configDocument.get('vault_schema_version')).toBe(2);
+
+    const shared = mutationFor(plan, 'notes/shared.md');
+    expect(shared?.kind === 'write-file'
+      && shared.desiredBytes.toString('utf8')).toBe(
+        'base\nstage-one\nstage-two\n',
+      );
+    expect(shared).toMatchObject({ desiredMode: 0o600 });
+
+    const agent = mutationFor(plan, 'AGENTS.md');
+    expect(agent?.kind === 'write-file'
+      && agent.desiredBytes.toString('utf8')).toContain('stage two');
+    expect(agent?.kind === 'write-file'
+      && agent.desiredBytes.toString('utf8')).not.toContain('stage one');
+
+    const orderedPaths = plan.mutations.map(item => item.vaultRelativePath);
+    expect(orderedPaths.indexOf('notes/z-stage-zero.md')).toBeLessThan(
+      orderedPaths.indexOf('notes/a-stage-one.md'),
+    );
+    expect(orderedPaths.at(-1)).toBe('.me/config.yaml');
+    expect(plan.mutations.map(item => item.publishOrder)).toEqual(
+      plan.mutations.map((_item, index) => index),
+    );
+
+    const renamedIds = migrations.map((migration, index) => ({
+      ...migration,
+      id: `${migration.id}-revision-${index}`,
+    }));
+    expect(planVaultUpdate({
+      vaultDir: vault,
+      pluginRoot: plugin,
+      registry: renamedIds,
+    }).planDigest).not.toBe(plan.planDigest);
+  });
+
+  test('collects all ownership conflicts and retains safe preview diffs', () => {
+    const vault = makeVault();
+    writeFile(vault, 'SCHEMA.md', '# user schema\n');
+    writeFile(vault, 'CLAUDE.md', '# Knowledge Base\n\nuser-owned collision\n');
+    writeFile(vault, 'AGENTS.md', '## Configuration\n\nuser-owned collision\n');
+
+    const plan = planVaultUpdate({
+      vaultDir: vault,
+      pluginRoot: repositoryPluginRoot,
+    });
+    expect(plan.status).toBe('blocked');
+    expect(plan.conflicts).toEqual([
+      { path: 'AGENTS.md', reason: 'MIGRATION_CONFLICT' },
+      { path: 'CLAUDE.md', reason: 'MIGRATION_CONFLICT' },
+      { path: 'SCHEMA.md', reason: 'MIGRATION_CONFLICT' },
+    ]);
+    expect(plan.plannedPaths).toEqual(['.me/config.yaml']);
+    expect(plan.diffs.map(item => item.path)).toEqual(['.me/config.yaml']);
+    expect(mutationFor(plan, '.me/config.yaml')).toBeDefined();
+  });
+
+  test('orders same-stage paths by explicit UTF-16 code units', () => {
+    const vault = makeVault('vault_schema_version: 0\n');
+    writeFile(vault, 'Z.md', 'Z\n');
+    writeFile(vault, 'a.md', 'a\n');
+    const migration = configOnlyMigration([{
+      vaultRelativePaths: ['a.md', 'Z.md'],
+      transform(_relativePath, bytes) {
+        return Buffer.concat([bytes, Buffer.from('changed\n')]);
+      },
+    }]);
+    const plan = planVaultUpdate({
+      vaultDir: vault,
+      pluginRoot: repositoryPluginRoot,
+      registry: [migration],
+    });
+    expect(plan.mutations.map(item => item.vaultRelativePath)).toEqual([
+      'Z.md',
+      'a.md',
+      '.me/config.yaml',
+    ]);
+    expect([...plan.plannedPaths].sort(codeUnitCompare)).toEqual(
+      plan.plannedPaths,
+    );
+  });
+
+  test('maps every malformed nested migration declaration to INVALID_MIGRATION_REGISTRY', () => {
+    const fixtures: Array<() => VaultMigration> = [
+      () => ({
+        ...configOnlyMigration(),
+        plan: () => ({
+          configEdits: [],
+          managedAssets: [],
+          contentTransforms: [],
+          extra: true,
+        } as never),
+      }),
+      () => ({
+        ...configOnlyMigration(),
+        plan: () => ({
+          configEdits: [{
+            kind: 'set',
+            path: ['vault_schema_version'],
+            value: 1,
+            extra: true,
+          } as never],
+          managedAssets: [],
+          contentTransforms: [],
+        }),
+      }),
+      () => ({
+        ...configOnlyMigration(),
+        plan: () => ({
+          configEdits: [],
+          managedAssets: [{
+            vaultRelativePath: 'AGENTS.md',
+            desiredTemplatePath: 'templates/AGENTS-template.md',
+            strategy: 'invented',
+            onAbsent: 'create',
+            onUnmarked: 'append-marked-block',
+          } as never],
+          contentTransforms: [],
+        }),
+      }),
+      () => ({
+        ...configOnlyMigration(),
+        plan: () => ({
+          configEdits: [],
+          managedAssets: [],
+          contentTransforms: [{
+            vaultRelativePaths: ['../outside.md'],
+            transform: (_path, bytes) => bytes,
+          }],
+        }),
+      }),
+      () => ({
+        ...configOnlyMigration(),
+        plan: () => ({
+          configEdits: [{
+            kind: 'set',
+            path: ['vault_schema_version'],
+            value: 1,
+          }],
+          managedAssets: [],
+          contentTransforms: [{
+            vaultRelativePaths: ['SCHEMA.md'],
+            transform: () => 'not bytes' as never,
+          }],
+        }),
+      }),
+      () => ({
+        ...configOnlyMigration(),
+        plan: () => {
+          throw new UpdateError('UNSAFE_PATH');
+        },
+      }),
+      () => ({
+        ...configOnlyMigration(),
+        plan: () => {
+          const contentTransforms: ContentTransformIntent[] = [];
+          (contentTransforms as ContentTransformIntent[] & { extra: boolean })
+            .extra = true;
+          return {
+            configEdits: [{
+              kind: 'set',
+              path: ['vault_schema_version'],
+              value: 1,
+            }],
+            managedAssets: [],
+            contentTransforms,
+          };
+        },
+      }),
+    ];
+
+    for (const fixture of fixtures) {
+      const vault = makeVault('vault_schema_version: 0\n');
+      expect(errorCode(() => planVaultUpdate({
+        vaultDir: vault,
+        pluginRoot: repositoryPluginRoot,
+        registry: [fixture()],
+      }))).toBe('INVALID_MIGRATION_REGISTRY');
+    }
   });
 });

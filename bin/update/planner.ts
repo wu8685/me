@@ -13,7 +13,7 @@ import {
 } from '../mutation/contracts.ts';
 import {
   readVaultSchemaVersion,
-  renderConfigEdits,
+  renderConfigBytes,
   type ConfigEdit,
 } from './config-document.ts';
 import {
@@ -22,7 +22,8 @@ import {
   type UpdatePlan,
 } from './contracts.ts';
 import {
-  planManagedAsset,
+  renderManagedAssetBytes,
+  type ManagedAssetCurrent,
   type ManagedAssetIntent,
 } from './managed-assets.ts';
 import {
@@ -35,38 +36,40 @@ import {
 
 const CONFIG_PATH = '.me/config.yaml';
 
-type DigestMaterial =
-  | {
-      kind: 'config';
-      path: string;
-      source: SourceFingerprint;
-      desiredSha256: string;
-      desiredMode: number;
-    }
-  | {
-      kind: 'managed-asset';
-      path: string;
-      source: SourceFingerprint;
-      desiredTemplateSha256: string;
-      knownTemplateSha256: readonly string[];
-    }
-  | {
-      kind: 'content-transform';
-      path: string;
-      source: SourceFingerprint;
-      desiredSha256: string;
-      desiredMode: number;
-    };
+interface VirtualFile {
+  path: string;
+  source: SourceFingerprint;
+  sourceBytes?: Buffer;
+  exists: boolean;
+  bytes?: Buffer;
+  mode: number;
+  lastStage: number;
+}
+
+interface PluginResource {
+  path: string;
+  bytes: Buffer;
+  sha256: string;
+}
+
+type DigestMaterial = Record<string, unknown>;
 
 function fail(
   code:
-    | 'INVALID_MIGRATION_REGISTRY'
     | 'MIGRATION_CONFLICT'
     | 'NOT_A_ME_VAULT'
     | 'UNSAFE_PATH'
     | 'UNSUPPORTED_FILESYSTEM',
 ): never {
   throw new UpdateError(code);
+}
+
+function invalidRegistry(): never {
+  throw new UpdateError('INVALID_MIGRATION_REGISTRY');
+}
+
+function codeUnitCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function sha256(bytes: Buffer | string): string {
@@ -240,172 +243,13 @@ function readRegularFile(
   }
 }
 
-function readPluginResource(
-  pluginRoot: string,
-  relativePath: string,
-): Buffer {
-  if (!safeRelativePath(relativePath)) fail('UNSAFE_PATH');
-  return readRegularFile(pluginRoot, relativePath).bytes;
-}
-
-function validateIntent(value: unknown): asserts value is MigrationIntent {
-  if (
-    !value
-    || typeof value !== 'object'
-    || !Array.isArray((value as MigrationIntent).configEdits)
-    || !Array.isArray((value as MigrationIntent).managedAssets)
-    || !Array.isArray((value as MigrationIntent).contentTransforms)
-  ) {
-    fail('INVALID_MIGRATION_REGISTRY');
-  }
-}
-
-function planMigration(
-  migration: VaultMigration,
-  vaultDir: string,
-  pluginRoot: string,
-): MigrationIntent {
-  let intent: MigrationIntent;
+function utf8(bytes: Buffer): string {
   try {
-    intent = migration.plan(Object.freeze({
-      vaultDir,
-      pluginRoot,
-      currentVaultSchemaVersion: migration.fromVersion,
-    }));
-  } catch (error) {
-    if (error instanceof UpdateError) throw error;
-    return fail('INVALID_MIGRATION_REGISTRY');
+    return new TextDecoder('utf-8', { fatal: true })
+      .decode(Uint8Array.from(bytes));
+  } catch {
+    return fail('MIGRATION_CONFLICT');
   }
-  validateIntent(intent);
-  return intent;
-}
-
-function planManagedAssets(
-  vaultDir: string,
-  pluginRoot: string,
-  intents: readonly ManagedAssetIntent[],
-): {
-  mutations: PlannedMutation[];
-  materials: DigestMaterial[];
-} {
-  const mutations: PlannedMutation[] = [];
-  const materials: DigestMaterial[] = [];
-  for (const intent of intents) {
-    if (
-      !intent
-      || typeof intent !== 'object'
-      || !safeRelativePath(intent.vaultRelativePath)
-      || !safeRelativePath(intent.desiredTemplatePath)
-    ) {
-      fail('UNSAFE_PATH');
-    }
-    const knownTemplatePaths = [...(intent.knownTemplatePaths ?? [])];
-    if (knownTemplatePaths.some(item => !safeRelativePath(item))) {
-      fail('UNSAFE_PATH');
-    }
-    const source = fingerprint(vaultDir, intent.vaultRelativePath);
-    const desiredBytes = readPluginResource(
-      pluginRoot,
-      intent.desiredTemplatePath,
-    );
-    const desiredTemplateSha256 = sha256(desiredBytes);
-    const knownTemplateSha256 = knownTemplatePaths
-      .map(item => sha256(readPluginResource(pluginRoot, item)))
-      .sort();
-    const mutation = planManagedAsset(vaultDir, pluginRoot, intent);
-    const sourceAfter = fingerprint(vaultDir, intent.vaultRelativePath);
-    const desiredTemplateSha256After = sha256(readPluginResource(
-      pluginRoot,
-      intent.desiredTemplatePath,
-    ));
-    const knownTemplateSha256After = knownTemplatePaths
-      .map(item => sha256(readPluginResource(pluginRoot, item)))
-      .sort();
-    if (
-      canonicalStringify(sourceAfter) !== canonicalStringify(source)
-      || desiredTemplateSha256After !== desiredTemplateSha256
-      || canonicalStringify(knownTemplateSha256After)
-        !== canonicalStringify(knownTemplateSha256)
-    ) {
-      fail('UNSAFE_PATH');
-    }
-    if (mutation) mutations.push(mutation);
-    materials.push({
-      kind: 'managed-asset',
-      path: intent.vaultRelativePath,
-      source,
-      desiredTemplateSha256,
-      knownTemplateSha256,
-    });
-  }
-  return { mutations, materials };
-}
-
-function planContentTransforms(
-  vaultDir: string,
-  intents: readonly ContentTransformIntent[],
-): {
-  mutations: PlannedMutation[];
-  materials: DigestMaterial[];
-  sourceBytes: Map<string, Buffer>;
-} {
-  const mutations: PlannedMutation[] = [];
-  const materials: DigestMaterial[] = [];
-  const sourceBytes = new Map<string, Buffer>();
-  const seen = new Set<string>();
-  for (const intent of intents) {
-    if (
-      !intent
-      || typeof intent !== 'object'
-      || !Array.isArray(intent.vaultRelativePaths)
-      || typeof intent.transform !== 'function'
-    ) {
-      fail('INVALID_MIGRATION_REGISTRY');
-    }
-    const paths = [...intent.vaultRelativePaths];
-    if (paths.some(item => !safeRelativePath(item))) fail('UNSAFE_PATH');
-    paths.sort();
-    for (const relativePath of paths) {
-      if (seen.has(relativePath)) fail('MIGRATION_CONFLICT');
-      seen.add(relativePath);
-      const source = fingerprint(vaultDir, relativePath);
-      const current = readRegularFile(vaultDir, relativePath, source).bytes;
-      let desired: Buffer;
-      try {
-        const transformed = intent.transform(
-          relativePath,
-          Buffer.from(Uint8Array.from(current)),
-        );
-        if (!Buffer.isBuffer(transformed)) {
-          fail('INVALID_MIGRATION_REGISTRY');
-        }
-        desired = Buffer.from(Uint8Array.from(transformed));
-      } catch (error) {
-        if (error instanceof UpdateError) throw error;
-        return fail('MIGRATION_CONFLICT');
-      }
-      sourceBytes.set(relativePath, current);
-      materials.push({
-        kind: 'content-transform',
-        path: relativePath,
-        source,
-        desiredSha256: sha256(desired),
-        desiredMode: source.mode ?? 0o644,
-      });
-      if (!bytesEqual(current, desired)) {
-        mutations.push({
-          kind: 'write-file',
-          vaultRelativePath: relativePath,
-          source,
-          desiredBytes: desired,
-          desiredSha256: sha256(desired),
-          desiredMode: source.mode ?? 0o644,
-          publishOrder: 0,
-        });
-      }
-    }
-  }
-  return { mutations, materials, sourceBytes };
 }
 
 function canonicalize(value: unknown): unknown {
@@ -413,7 +257,7 @@ function canonicalize(value: unknown): unknown {
   if (value && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => codeUnitCompare(left, right))
         .map(([key, child]) => [key, canonicalize(child)]),
     );
   }
@@ -422,6 +266,521 @@ function canonicalize(value: unknown): unknown {
 
 function canonicalStringify(value: unknown): string {
   return JSON.stringify(canonicalize(value));
+}
+
+function hasExactKeys(
+  value: object,
+  expected: readonly string[],
+): boolean {
+  const keys = Reflect.ownKeys(value);
+  return keys.length === expected.length
+    && keys.every(key => (
+      typeof key === 'string' && expected.includes(key)
+    ));
+}
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function denseArray(value: unknown): value is unknown[] {
+  if (!Array.isArray(value)) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index)) return false;
+  }
+  const keys = Reflect.ownKeys(value);
+  return keys.length === value.length + 1
+    && keys.every(key => (
+      key === 'length'
+      || (
+        typeof key === 'string'
+        && Number.isSafeInteger(Number(key))
+        && String(Number(key)) === key
+        && Number(key) >= 0
+        && Number(key) < value.length
+      )
+    ));
+}
+
+function validConfigPath(value: unknown): value is readonly string[] {
+  return denseArray(value)
+    && value.length > 0
+    && value.every(component => (
+      typeof component === 'string'
+      && component.length > 0
+      && !component.includes('\u0000')
+    ));
+}
+
+function validSetValue(value: unknown): boolean {
+  return typeof value === 'string'
+    || typeof value === 'number'
+    || typeof value === 'boolean'
+    || (
+      denseArray(value)
+      && value.every(item => typeof item === 'string')
+    );
+}
+
+function validateConfigEdit(value: unknown): asserts value is ConfigEdit {
+  if (!plainRecord(value)) invalidRegistry();
+  const record = value;
+  if (record.kind === 'set') {
+    if (
+      !hasExactKeys(record, ['kind', 'path', 'value'])
+      || !validConfigPath(record.path)
+      || !validSetValue(record.value)
+    ) {
+      invalidRegistry();
+    }
+    if (
+      record.path.length === 1
+      && record.path[0] === 'vault_schema_version'
+      && (
+        typeof record.value !== 'number'
+        || !Number.isSafeInteger(record.value)
+        || record.value < 0
+      )
+    ) {
+      invalidRegistry();
+    }
+    return;
+  }
+  if (record.kind === 'remove') {
+    if (
+      !hasExactKeys(record, ['kind', 'path'])
+      || !validConfigPath(record.path)
+    ) {
+      invalidRegistry();
+    }
+    return;
+  }
+  if (record.kind === 'rename') {
+    if (
+      !hasExactKeys(record, ['kind', 'from', 'to'])
+      || !validConfigPath(record.from)
+      || !validConfigPath(record.to)
+    ) {
+      invalidRegistry();
+    }
+    return;
+  }
+  invalidRegistry();
+}
+
+function validateManagedAsset(
+  value: unknown,
+): asserts value is ManagedAssetIntent {
+  if (!plainRecord(value)) invalidRegistry();
+  const record = value as unknown as ManagedAssetIntent;
+  const expected = [
+    'vaultRelativePath',
+    'desiredTemplatePath',
+    'strategy',
+    'onAbsent',
+    'onUnmarked',
+    ...(Object.hasOwn(record, 'knownTemplatePaths')
+      ? ['knownTemplatePaths']
+      : []),
+  ];
+  if (
+    !hasExactKeys(record, expected)
+    || !safeRelativePath(record.vaultRelativePath)
+    || !safeRelativePath(record.desiredTemplatePath)
+    || ![
+      'create-if-absent',
+      'replace-known-template',
+      'merge-owned-sections',
+    ].includes(record.strategy)
+    || !['create', 'skip'].includes(record.onAbsent)
+    || ![
+      'adopt-known-legacy',
+      'append-marked-block',
+      'conflict',
+    ].includes(record.onUnmarked)
+    || (
+      record.knownTemplatePaths !== undefined
+      && (
+        !denseArray(record.knownTemplatePaths)
+        || record.knownTemplatePaths.some(item => !safeRelativePath(item))
+      )
+    )
+  ) {
+    invalidRegistry();
+  }
+}
+
+function validateContentTransform(
+  value: unknown,
+): asserts value is ContentTransformIntent {
+  if (
+    !plainRecord(value)
+    || !hasExactKeys(value, ['vaultRelativePaths', 'transform'])
+  ) {
+    invalidRegistry();
+  }
+  const record = value as unknown as ContentTransformIntent;
+  if (
+    !denseArray(record.vaultRelativePaths)
+    || record.vaultRelativePaths.some(item => !safeRelativePath(item))
+    || typeof record.transform !== 'function'
+  ) {
+    invalidRegistry();
+  }
+}
+
+function validateIntent(value: unknown): asserts value is MigrationIntent {
+  if (
+    !plainRecord(value)
+    || !hasExactKeys(value, [
+      'configEdits',
+      'managedAssets',
+      'contentTransforms',
+    ])
+  ) {
+    invalidRegistry();
+  }
+  const intent = value as unknown as MigrationIntent;
+  if (
+    !denseArray(intent.configEdits)
+    || !denseArray(intent.managedAssets)
+    || !denseArray(intent.contentTransforms)
+  ) {
+    invalidRegistry();
+  }
+  intent.configEdits.forEach(validateConfigEdit);
+  intent.managedAssets.forEach(validateManagedAsset);
+  intent.contentTransforms.forEach(validateContentTransform);
+}
+
+function resolveMigrations(options: {
+  registry: readonly VaultMigration[];
+  currentVersion: number;
+  vaultDir: string;
+  pluginRoot: string;
+}): Array<{
+  migration: VaultMigration;
+  description: string;
+  intent: MigrationIntent;
+}> {
+  return options.registry.slice(options.currentVersion).map(migration => {
+    let description: unknown;
+    let intent: unknown;
+    try {
+      description = migration.describe();
+      intent = migration.plan(Object.freeze({
+        vaultDir: options.vaultDir,
+        pluginRoot: options.pluginRoot,
+        currentVaultSchemaVersion: migration.fromVersion,
+      }));
+    } catch {
+      return invalidRegistry();
+    }
+    if (
+      typeof description !== 'string'
+      || /[\u0000-\u001f\u007f]/.test(description)
+    ) {
+      invalidRegistry();
+    }
+    validateIntent(intent);
+    return { migration, description, intent };
+  });
+}
+
+function loadVirtualFile(
+  files: Map<string, VirtualFile>,
+  vaultDir: string,
+  relativePath: string,
+  allowMissing: boolean,
+): VirtualFile {
+  const existing = files.get(relativePath);
+  if (existing) {
+    if (!existing.exists && !allowMissing) fail('UNSAFE_PATH');
+    return existing;
+  }
+  const source = fingerprint(vaultDir, relativePath);
+  if (source.type === 'directory') fail('UNSAFE_PATH');
+  if (source.type === 'missing') {
+    if (!allowMissing) fail('UNSAFE_PATH');
+    const file: VirtualFile = {
+      path: relativePath,
+      source,
+      exists: false,
+      mode: 0o644,
+      lastStage: -1,
+    };
+    files.set(relativePath, file);
+    return file;
+  }
+  const sourceBytes = readRegularFile(
+    vaultDir,
+    relativePath,
+    source,
+  ).bytes;
+  const file: VirtualFile = {
+    path: relativePath,
+    source,
+    sourceBytes,
+    exists: true,
+    bytes: Buffer.from(Uint8Array.from(sourceBytes)),
+    mode: source.mode ?? 0o644,
+    lastStage: -1,
+  };
+  files.set(relativePath, file);
+  return file;
+}
+
+function virtualFingerprint(file: VirtualFile): SourceFingerprint {
+  if (!file.exists || !file.bytes) {
+    return { vaultRelativePath: file.path, type: 'missing' };
+  }
+  return {
+    vaultRelativePath: file.path,
+    type: 'file',
+    sha256: sha256(file.bytes),
+    mode: file.mode,
+  };
+}
+
+function managedCurrent(file: VirtualFile): ManagedAssetCurrent {
+  if (!file.exists || !file.bytes) return { type: 'missing' };
+  return {
+    type: 'file',
+    bytes: Buffer.from(Uint8Array.from(file.bytes)),
+    mode: file.mode,
+  };
+}
+
+function readPluginResource(
+  pluginRoot: string,
+  resources: Map<string, PluginResource>,
+  relativePath: string,
+): Buffer {
+  const cached = resources.get(relativePath);
+  if (cached) return Buffer.from(Uint8Array.from(cached.bytes));
+  const bytes = readRegularFile(pluginRoot, relativePath).bytes;
+  resources.set(relativePath, {
+    path: relativePath,
+    bytes: Buffer.from(Uint8Array.from(bytes)),
+    sha256: sha256(bytes),
+  });
+  return Buffer.from(Uint8Array.from(bytes));
+}
+
+function assertStableInputs(
+  vaultDir: string,
+  pluginRoot: string,
+  files: ReadonlyMap<string, VirtualFile>,
+  resources: ReadonlyMap<string, PluginResource>,
+): void {
+  for (const file of files.values()) {
+    if (
+      canonicalStringify(fingerprint(vaultDir, file.path))
+      !== canonicalStringify(file.source)
+    ) {
+      fail('UNSAFE_PATH');
+    }
+  }
+  for (const resource of resources.values()) {
+    const reread = readRegularFile(pluginRoot, resource.path).bytes;
+    if (sha256(reread) !== resource.sha256) fail('UNSAFE_PATH');
+  }
+}
+
+function renderMigrationStages(options: {
+  vaultDir: string;
+  pluginRoot: string;
+  files: Map<string, VirtualFile>;
+  resources: Map<string, PluginResource>;
+  resolved: ReturnType<typeof resolveMigrations>;
+  conflicts: Map<string, string>;
+  blockedPaths: Set<string>;
+  materials: DigestMaterial[];
+}): void {
+  for (let stage = 0; stage < options.resolved.length; stage += 1) {
+    const { migration, intent } = options.resolved[stage];
+    const stageTargets = new Set<string>();
+
+    if (intent.configEdits.length > 0) {
+      stageTargets.add(CONFIG_PATH);
+      const config = loadVirtualFile(
+        options.files,
+        options.vaultDir,
+        CONFIG_PATH,
+        false,
+      );
+      if (!config.bytes) fail('UNSAFE_PATH');
+      const source = virtualFingerprint(config);
+      let rendered;
+      try {
+        rendered = renderConfigBytes(config.bytes, intent.configEdits);
+      } catch (error) {
+        if (
+          error instanceof UpdateError
+          && (
+            error.code === 'INVALID_REQUEST'
+            || error.code === 'INVALID_VAULT_SCHEMA_VERSION'
+          )
+        ) {
+          return invalidRegistry();
+        }
+        throw error;
+      }
+      if (
+        rendered.currentVersion !== migration.fromVersion
+        || readVaultSchemaVersion(utf8(rendered.desiredBytes))
+          !== migration.toVersion
+      ) {
+        invalidRegistry();
+      }
+      options.materials.push({
+        kind: 'config',
+        stage,
+        path: CONFIG_PATH,
+        source,
+        desiredSha256: rendered.desiredSha256,
+        desiredMode: config.mode,
+      });
+      config.exists = true;
+      config.bytes = Buffer.from(Uint8Array.from(rendered.desiredBytes));
+      config.lastStage = stage;
+    } else {
+      invalidRegistry();
+    }
+
+    for (
+      let ordinal = 0;
+      ordinal < intent.managedAssets.length;
+      ordinal += 1
+    ) {
+      const managed = intent.managedAssets[ordinal];
+      if (stageTargets.has(managed.vaultRelativePath)) invalidRegistry();
+      stageTargets.add(managed.vaultRelativePath);
+      const file = loadVirtualFile(
+        options.files,
+        options.vaultDir,
+        managed.vaultRelativePath,
+        true,
+      );
+      const source = virtualFingerprint(file);
+      const desiredTemplateBytes = readPluginResource(
+        options.pluginRoot,
+        options.resources,
+        managed.desiredTemplatePath,
+      );
+      const knownTemplateSha256 = [...(managed.knownTemplatePaths ?? [])]
+        .map(relativePath => sha256(readPluginResource(
+          options.pluginRoot,
+          options.resources,
+          relativePath,
+        )))
+        .sort(codeUnitCompare);
+      let rendered;
+      try {
+        rendered = renderManagedAssetBytes({
+          intent: managed,
+          current: managedCurrent(file),
+          readPluginResource(relativePath) {
+            return readPluginResource(
+              options.pluginRoot,
+              options.resources,
+              relativePath,
+            );
+          },
+        });
+      } catch (error) {
+        if (
+          error instanceof UpdateError
+          && error.code === 'MIGRATION_CONFLICT'
+        ) {
+          options.conflicts.set(
+            managed.vaultRelativePath,
+            'MIGRATION_CONFLICT',
+          );
+          options.blockedPaths.add(managed.vaultRelativePath);
+          options.materials.push({
+            kind: 'managed-asset',
+            stage,
+            ordinal,
+            path: managed.vaultRelativePath,
+            source,
+            desiredTemplateSha256: sha256(desiredTemplateBytes),
+            knownTemplateSha256,
+            outcome: 'conflict',
+          });
+          continue;
+        }
+        throw error;
+      }
+      const desiredSha256 = rendered
+        ? sha256(rendered.desiredBytes)
+        : source.type === 'file'
+          ? source.sha256
+          : undefined;
+      options.materials.push({
+        kind: 'managed-asset',
+        stage,
+        ordinal,
+        path: managed.vaultRelativePath,
+        source,
+        desiredTemplateSha256: sha256(desiredTemplateBytes),
+        knownTemplateSha256,
+        desiredSha256,
+        desiredMode: rendered?.desiredMode ?? file.mode,
+        outcome: rendered ? 'changed' : 'unchanged',
+      });
+      if (rendered) {
+        file.exists = true;
+        file.bytes = Buffer.from(Uint8Array.from(rendered.desiredBytes));
+        file.mode = rendered.desiredMode;
+        file.lastStage = stage;
+      }
+    }
+
+    let transformOrdinal = 0;
+    for (const transform of intent.contentTransforms) {
+      const paths = [...transform.vaultRelativePaths].sort(codeUnitCompare);
+      for (const relativePath of paths) {
+        if (stageTargets.has(relativePath)) invalidRegistry();
+        stageTargets.add(relativePath);
+        const file = loadVirtualFile(
+          options.files,
+          options.vaultDir,
+          relativePath,
+          false,
+        );
+        if (!file.bytes) fail('UNSAFE_PATH');
+        const source = virtualFingerprint(file);
+        let desired: unknown;
+        try {
+          desired = transform.transform(
+            relativePath,
+            Buffer.from(Uint8Array.from(file.bytes)),
+          );
+        } catch {
+          return invalidRegistry();
+        }
+        if (!Buffer.isBuffer(desired)) invalidRegistry();
+        const desiredBytes = Buffer.from(Uint8Array.from(desired));
+        options.materials.push({
+          kind: 'content-transform',
+          stage,
+          ordinal: transformOrdinal,
+          path: relativePath,
+          source,
+          desiredSha256: sha256(desiredBytes),
+          desiredMode: file.mode,
+        });
+        if (!bytesEqual(file.bytes, desiredBytes)) {
+          file.bytes = desiredBytes;
+          file.lastStage = stage;
+        }
+        transformOrdinal += 1;
+      }
+    }
+  }
 }
 
 function mutationDigestRecord(mutation: PlannedMutation): unknown {
@@ -454,28 +813,43 @@ function mutationDigestRecord(mutation: PlannedMutation): unknown {
   };
 }
 
-function utf8(bytes: Buffer): string {
-  try {
-    return new TextDecoder('utf-8', { fatal: true })
-      .decode(Uint8Array.from(bytes));
-  } catch {
-    return fail('MIGRATION_CONFLICT');
-  }
-}
-
-function sourceBytesForMutation(
-  vaultDir: string,
-  mutation: PlannedMutation,
-  cached: ReadonlyMap<string, Buffer>,
-): Buffer {
-  const cachedBytes = cached.get(mutation.vaultRelativePath);
-  if (cachedBytes) return cachedBytes;
-  if (mutation.source.type === 'missing') return Buffer.alloc(0);
-  return readRegularFile(
-    vaultDir,
-    mutation.vaultRelativePath,
-    mutation.source,
-  ).bytes;
+function finalMutations(
+  files: ReadonlyMap<string, VirtualFile>,
+  blockedPaths: ReadonlySet<string>,
+): PlannedMutation[] {
+  const candidates = [...files.values()]
+    .filter(file => {
+      if (
+        blockedPaths.has(file.path)
+        || !file.exists
+        || !file.bytes
+        || file.lastStage < 0
+      ) {
+        return false;
+      }
+      return file.source.type === 'missing'
+        || (
+          file.source.type === 'file'
+          && file.sourceBytes !== undefined
+          && !bytesEqual(file.sourceBytes, file.bytes)
+        );
+    })
+    .sort((left, right) => {
+      const leftConfig = left.path === CONFIG_PATH ? 1 : 0;
+      const rightConfig = right.path === CONFIG_PATH ? 1 : 0;
+      if (leftConfig !== rightConfig) return leftConfig - rightConfig;
+      return left.lastStage - right.lastStage
+        || codeUnitCompare(left.path, right.path);
+    });
+  return candidates.map((file, publishOrder) => ({
+    kind: 'write-file',
+    vaultRelativePath: file.path,
+    source: file.source,
+    desiredBytes: Buffer.from(Uint8Array.from(file.bytes as Buffer)),
+    desiredSha256: sha256(file.bytes as Buffer),
+    desiredMode: file.mode,
+    publishOrder,
+  }));
 }
 
 function makeDiff(
@@ -494,17 +868,6 @@ function makeDiff(
   );
 }
 
-function sortMutations(mutations: readonly PlannedMutation[]): PlannedMutation[] {
-  return [...mutations]
-    .sort((left, right) => {
-      const leftConfig = left.vaultRelativePath === CONFIG_PATH ? 1 : 0;
-      const rightConfig = right.vaultRelativePath === CONFIG_PATH ? 1 : 0;
-      if (leftConfig !== rightConfig) return leftConfig - rightConfig;
-      return left.vaultRelativePath.localeCompare(right.vaultRelativePath);
-    })
-    .map((mutation, publishOrder) => ({ ...mutation, publishOrder }));
-}
-
 export function planVaultUpdate(options: {
   vaultDir: string;
   pluginRoot: string;
@@ -513,7 +876,10 @@ export function planVaultUpdate(options: {
   const vaultDir = canonicalDirectory(options.vaultDir);
   const pluginRoot = canonicalDirectory(options.pluginRoot);
   const registry = options.registry ?? MIGRATION_REGISTRY;
-  validateMigrationRegistry(registry, CURRENT_VAULT_SCHEMA_VERSION);
+  const targetVersion = options.registry
+    ? registry.length
+    : CURRENT_VAULT_SCHEMA_VERSION;
+  validateMigrationRegistry(registry, targetVersion);
 
   const configSource = fingerprint(vaultDir, CONFIG_PATH);
   if (configSource.type === 'missing') fail('NOT_A_ME_VAULT');
@@ -524,113 +890,61 @@ export function planVaultUpdate(options: {
     configSource,
   ).bytes;
   const currentVersion = readVaultSchemaVersion(utf8(configBytes));
-  if (currentVersion > CURRENT_VAULT_SCHEMA_VERSION) {
+  if (currentVersion > targetVersion) {
     throw new UpdateError('VAULT_NEWER_THAN_PLUGIN');
   }
 
-  const selected = registry.slice(currentVersion);
-  const descriptions: Array<{ id: string; description: string }> = [];
-  const configEdits: ConfigEdit[] = [];
-  const managedAssets: ManagedAssetIntent[] = [];
-  const contentTransforms: ContentTransformIntent[] = [];
-  for (const migration of selected) {
-    let description: string;
-    try {
-      description = migration.describe();
-    } catch {
-      return fail('INVALID_MIGRATION_REGISTRY');
-    }
-    if (typeof description !== 'string') fail('INVALID_MIGRATION_REGISTRY');
-    descriptions.push({ id: migration.id, description });
-    const intent = planMigration(migration, vaultDir, pluginRoot);
-    configEdits.push(...intent.configEdits);
-    managedAssets.push(...intent.managedAssets);
-    contentTransforms.push(...intent.contentTransforms);
-  }
-
-  if (selected.length === 0) {
-    const registryRevision = sha256(canonicalStringify(
-      registry.map(migration => ({
-        id: migration.id,
-        fromVersion: migration.fromVersion,
-        toVersion: migration.toVersion,
-      })),
-    ));
-    const planDigest = sha256(canonicalStringify({
-      registryRevision,
-      sourceVersion: currentVersion,
-      targetVersion: CURRENT_VAULT_SCHEMA_VERSION,
-      migrationIds: [],
-      plannedPaths: [],
-      materials: [{
-        kind: 'config',
-        path: CONFIG_PATH,
-        source: configSource,
-        desiredSha256: sha256(configBytes),
-        desiredMode: configSource.mode ?? 0o644,
-      }],
-      mutations: [],
-    }));
-    return {
-      status: 'up_to_date',
-      currentVaultSchemaVersion: currentVersion,
-      targetVaultSchemaVersion: CURRENT_VAULT_SCHEMA_VERSION,
-      migrations: [],
-      mutations: [],
-      plannedPaths: [],
-      diffs: [],
-      warnings: [],
-      planDigest,
-    };
-  }
-
-  const configRender = renderConfigEdits(
-    path.join(vaultDir, '.me', 'config.yaml'),
-    configEdits,
-  );
-  if (
-    configRender.currentVersion !== currentVersion
-    || configRender.sourceSha256 !== configSource.sha256
-    || canonicalStringify(fingerprint(vaultDir, CONFIG_PATH))
-      !== canonicalStringify(configSource)
-    || readVaultSchemaVersion(utf8(configRender.desiredBytes))
-      !== CURRENT_VAULT_SCHEMA_VERSION
-  ) {
-    fail('INVALID_MIGRATION_REGISTRY');
-  }
-  const configMutation: PlannedMutation = {
-    kind: 'write-file',
-    vaultRelativePath: CONFIG_PATH,
-    source: configSource,
-    desiredBytes: Buffer.from(Uint8Array.from(configRender.desiredBytes)),
-    desiredSha256: configRender.desiredSha256,
-    desiredMode: configSource.mode ?? 0o644,
-    publishOrder: 0,
-  };
-  const configMaterial: DigestMaterial = {
-    kind: 'config',
+  const resolved = resolveMigrations({
+    registry,
+    currentVersion,
+    vaultDir,
+    pluginRoot,
+  });
+  const files = new Map<string, VirtualFile>();
+  files.set(CONFIG_PATH, {
     path: CONFIG_PATH,
     source: configSource,
-    desiredSha256: configRender.desiredSha256,
-    desiredMode: configSource.mode ?? 0o644,
-  };
+    sourceBytes: configBytes,
+    exists: true,
+    bytes: Buffer.from(Uint8Array.from(configBytes)),
+    mode: configSource.mode ?? 0o644,
+    lastStage: -1,
+  });
+  const resources = new Map<string, PluginResource>();
+  const conflictMap = new Map<string, string>();
+  const blockedPaths = new Set<string>();
+  const materials: DigestMaterial[] = [];
 
-  const assets = planManagedAssets(vaultDir, pluginRoot, managedAssets);
-  const transforms = planContentTransforms(vaultDir, contentTransforms);
-  const mutations = sortMutations([
-    ...assets.mutations,
-    ...transforms.mutations,
-    configMutation,
-  ]);
+  if (resolved.length === 0) {
+    materials.push({
+      kind: 'config',
+      stage: -1,
+      path: CONFIG_PATH,
+      source: configSource,
+      desiredSha256: sha256(configBytes),
+      desiredMode: configSource.mode ?? 0o644,
+    });
+  } else {
+    renderMigrationStages({
+      vaultDir,
+      pluginRoot,
+      files,
+      resources,
+      resolved,
+      conflicts: conflictMap,
+      blockedPaths,
+      materials,
+    });
+  }
+  assertStableInputs(vaultDir, pluginRoot, files, resources);
+
+  const mutations = finalMutations(files, blockedPaths);
   try {
     validatePlannedMutations(mutations);
   } catch (error) {
-    if (error instanceof MutationFailure) {
-      translateMutationFailure(error);
-    }
+    if (error instanceof MutationFailure) translateMutationFailure(error);
     throw error;
   }
-
   const plannedPaths = mutations
     .flatMap(mutation => (
       mutation.kind === 'rename'
@@ -640,23 +954,28 @@ export function planVaultUpdate(options: {
           ]
         : [mutation.vaultRelativePath]
     ))
-    .sort();
-  const cachedSourceBytes = new Map(transforms.sourceBytes);
-  cachedSourceBytes.set(CONFIG_PATH, configBytes);
+    .sort(codeUnitCompare);
   const diffs = mutations
     .filter((mutation): mutation is Extract<
       PlannedMutation,
       { kind: 'write-file' }
     > => mutation.kind === 'write-file')
-    .map(mutation => ({
-      path: mutation.vaultRelativePath,
-      diff: makeDiff(
-        mutation.vaultRelativePath,
-        sourceBytesForMutation(vaultDir, mutation, cachedSourceBytes),
-        mutation.desiredBytes,
-      ),
-    }))
-    .sort((left, right) => left.path.localeCompare(right.path));
+    .map(mutation => {
+      const file = files.get(mutation.vaultRelativePath);
+      if (!file) fail('UNSAFE_PATH');
+      return {
+        path: mutation.vaultRelativePath,
+        diff: makeDiff(
+          mutation.vaultRelativePath,
+          file.sourceBytes ?? Buffer.alloc(0),
+          mutation.desiredBytes,
+        ),
+      };
+    })
+    .sort((left, right) => codeUnitCompare(left.path, right.path));
+  const conflicts = [...conflictMap]
+    .map(([path, reason]) => ({ path, reason }))
+    .sort((left, right) => codeUnitCompare(left.path, right.path));
   const registryRevision = sha256(canonicalStringify(
     registry.map(migration => ({
       id: migration.id,
@@ -664,33 +983,34 @@ export function planVaultUpdate(options: {
       toVersion: migration.toVersion,
     })),
   ));
-  const materials = [
-    configMaterial,
-    ...assets.materials,
-    ...transforms.materials,
-  ].sort((left, right) => (
-    left.path.localeCompare(right.path)
-      || left.kind.localeCompare(right.kind)
-  ));
   const planDigest = sha256(canonicalStringify({
     registryRevision,
     sourceVersion: currentVersion,
-    targetVersion: CURRENT_VAULT_SCHEMA_VERSION,
-    migrationIds: selected.map(migration => migration.id),
+    targetVersion,
+    migrationIds: resolved.map(item => item.migration.id),
     plannedPaths,
     materials,
     mutations: mutations.map(mutationDigestRecord),
+    conflicts,
   }));
 
   return {
-    status: mutations.length === 0 ? 'up_to_date' : 'preview',
+    status: conflicts.length > 0
+      ? 'blocked'
+      : mutations.length > 0
+        ? 'preview'
+        : 'up_to_date',
     currentVaultSchemaVersion: currentVersion,
-    targetVaultSchemaVersion: CURRENT_VAULT_SCHEMA_VERSION,
-    migrations: descriptions,
+    targetVaultSchemaVersion: targetVersion,
+    migrations: resolved.map(item => ({
+      id: item.migration.id,
+      description: item.description,
+    })),
     mutations,
     plannedPaths,
     diffs,
     warnings: [],
+    conflicts,
     planDigest,
   };
 }

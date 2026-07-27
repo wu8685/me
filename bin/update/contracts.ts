@@ -37,7 +37,7 @@ export type UpdateErrorCode =
   | 'INTERNAL_ERROR';
 
 export interface UpdatePlan {
-  status: 'up_to_date' | 'preview';
+  status: 'up_to_date' | 'preview' | 'blocked';
   currentVaultSchemaVersion: number;
   targetVaultSchemaVersion: number;
   migrations: Array<{ id: string; description: string }>;
@@ -45,6 +45,7 @@ export interface UpdatePlan {
   plannedPaths: string[];
   diffs: Array<{ path: string; diff: string }>;
   warnings: string[];
+  conflicts: Array<{ path: string; reason: string }>;
   planDigest: string;
 }
 
