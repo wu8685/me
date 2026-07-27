@@ -3,6 +3,7 @@ import * as path from 'path';
 import {
   UPDATE_ERROR_CATALOG,
   UpdateError,
+  sanitizePublicUpdateResult,
   serializeUpdateResult,
   type UpdateErrorCode,
   type UpdateResultV1,
@@ -274,5 +275,95 @@ describe('update contracts', () => {
     ]);
     expect(serialized).not.toContain(doubleSlash);
     expect(serialized).not.toContain(tripleSlash);
+  });
+
+  test('redacts a nested file URL before preserving its ordinary outer URI', () => {
+    const privatePath = [
+      '',
+      'Users',
+      'alice',
+      'ME-Runtime',
+      'journal.json',
+    ].join('/');
+    const nested = `https://example.test/redirect?next=file://${privatePath}&keep=public`;
+    const serialized = serializeUpdateResult(result({
+      warnings: [nested],
+    }));
+
+    expect(JSON.parse(serialized).warnings).toEqual([
+      'https://example.test/redirect?next=<ABSOLUTE_PATH>&keep=public',
+    ]);
+    expect(serialized).not.toContain(privatePath);
+    expect(serialized).toContain('https://example.test/redirect?next=');
+  });
+
+  test('preserves only explicit ME slash-command grammar while redacting paths', () => {
+    const privatePath = [
+      '',
+      'Users',
+      'alice',
+      'vault',
+      'secret.md',
+    ].join('/');
+    const serialized = serializeUpdateResult(result({
+      diffs: [{
+        path: 'CLAUDE.md',
+        diff: [
+          '`/me:setup`',
+          '`/me:ingest <url>`',
+          '`/me:checklinks raw`',
+          '`/me:update`',
+          `/ordinary/path ${privatePath}`,
+        ].join('\n'),
+      }],
+    }));
+    const diff = JSON.parse(serialized).diffs[0].diff;
+
+    expect(diff).toContain('`/me:setup`');
+    expect(diff).toContain('`/me:ingest <url>`');
+    expect(diff).toContain('`/me:checklinks raw`');
+    expect(diff).toContain('`/me:update`');
+    expect(diff).not.toContain('/ordinary/path');
+    expect(diff).not.toContain(privatePath);
+    expect(diff.match(/<ABSOLUTE_PATH>/g)?.length).toBe(2);
+  });
+
+  test('sanitizes the in-memory public result recursively and removes binary values', () => {
+    const privatePath = [
+      '',
+      'private',
+      'me-runtime',
+      'transactions',
+      'secret.json',
+    ].join('/');
+    const unsafe = result({
+      warnings: [
+        `warning ${privatePath}`,
+        Buffer.from(privatePath) as unknown as string,
+      ],
+      conflicts: [{
+        path: 'SCHEMA.md',
+        reason: `conflict ${privatePath}`,
+      }],
+      diffs: [{
+        path: 'CLAUDE.md',
+        diff: `/me:setup\n${privatePath}`,
+      }],
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: `failure ${privatePath}`,
+      },
+    });
+    const sanitized = sanitizePublicUpdateResult(unsafe);
+
+    expect(JSON.stringify(sanitized)).not.toContain(privatePath);
+    expect(sanitized.warnings).toEqual([
+      'warning <ABSOLUTE_PATH>',
+      '<BINARY_DATA>',
+    ]);
+    expect(sanitized.diffs[0].diff).toBe('/me:setup\n<ABSOLUTE_PATH>');
+    expect(sanitized.conflicts[0].reason).toBe('conflict <ABSOLUTE_PATH>');
+    expect(sanitized.error?.message).toBe('failure <ABSOLUTE_PATH>');
+    expect(Buffer.isBuffer(sanitized.warnings[1])).toBeFalse();
   });
 });

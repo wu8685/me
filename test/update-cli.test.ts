@@ -17,6 +17,7 @@ import {
   type UpdatePlan,
 } from '../bin/update/contracts.ts';
 import { resolveRuntimeLayout } from '../bin/runtime-paths.ts';
+import { planVaultUpdate } from '../bin/update/planner.ts';
 
 const pluginRoot = path.resolve(import.meta.dir, '..');
 const cli = path.join(pluginRoot, 'bin/update.ts');
@@ -435,5 +436,112 @@ describe('me-update preview CLI', () => {
     expect(aborted.error?.code).toBe('INVALID_REQUEST');
     expect(manifest(vault)).toEqual(before);
     expect(fs.existsSync(runtimeBase)).toBeFalse();
+  });
+
+  test('returns a recursively sanitized result before serialization', () => {
+    const vault = makeVault();
+    const privatePath = path.join(
+      path.parse(process.cwd()).root,
+      'private',
+      'me-update',
+      'secret.json',
+    );
+    const basePlan = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    const result = runUpdateCli(
+      ['preview', '--vault-dir', vault],
+      options({
+        planUpdate: () => ({
+          ...basePlan,
+          warnings: [
+            `warning ${privatePath}`,
+            Buffer.from(privatePath),
+          ] as unknown as string[],
+          diffs: [{
+            path: 'CLAUDE.md',
+            diff: `/me:setup\n${privatePath}`,
+          }],
+          conflicts: [{
+            path: 'SCHEMA.md',
+            reason: `conflict ${privatePath}`,
+          }],
+        }),
+      }),
+    );
+
+    expect(JSON.stringify(result)).not.toContain(privatePath);
+    expect(result.warnings).toEqual([
+      'warning <ABSOLUTE_PATH>',
+      '<BINARY_DATA>',
+    ]);
+    expect(result.diffs).toEqual([{
+      path: 'CLAUDE.md',
+      diff: '/me:setup\n<ABSOLUTE_PATH>',
+    }]);
+    expect(result.conflicts[0].reason).toBe('conflict <ABSOLUTE_PATH>');
+    expect(Buffer.isBuffer(result.warnings[1])).toBeFalse();
+  });
+
+  test('preserves the real Claude migration diff including every ME slash command', () => {
+    const vault = makeVault();
+    const rawPlan = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    const rawClaudeDiff = rawPlan.diffs.find(item => item.path === 'CLAUDE.md')?.diff;
+    const result = runUpdateCli(
+      ['preview', '--vault-dir', vault],
+      options(),
+    );
+    const publicClaudeDiff = result.diffs.find(item => item.path === 'CLAUDE.md')?.diff;
+
+    expect(publicClaudeDiff).toBe(rawClaudeDiff);
+    for (const command of [
+      '/me:setup',
+      '/me:ingest',
+      '/me:checklinks',
+      '/me:autolinks',
+      '/me:backlinks',
+      '/me:move',
+      '/me:search',
+    ]) {
+      expect(publicClaudeDiff).toContain(command);
+    }
+    expect(publicClaudeDiff).not.toContain('<ABSOLUTE_PATH>');
+  });
+
+  test('rejects unsafe operation IDs without reflecting them into the result', () => {
+    const vault = makeVault('vault_schema_version: 1\n');
+    const invalidIds = [
+      '',
+      '.',
+      '..',
+      'with/slash',
+      'with\\backslash',
+      'with space',
+      'with\ncontrol',
+      'x'.repeat(129),
+    ];
+
+    for (const unsafeId of invalidIds) {
+      const result = runUpdateCli(
+        ['preview', '--vault-dir', vault],
+        {
+          pluginRoot,
+          operationIdFactory: () => unsafeId,
+        },
+      );
+      expect(result.error?.code).toBe('INTERNAL_ERROR');
+      expect(result.operationId).toBe('unavailable');
+      if (unsafeId.length > 3) {
+        expect(JSON.stringify(result)).not.toContain(unsafeId);
+      }
+    }
+
+    const safe = runUpdateCli(
+      ['preview', '--vault-dir', vault],
+      {
+        pluginRoot,
+        operationIdFactory: () => 'preview.test_1-2',
+      },
+    );
+    expect(safe.status).toBe('up_to_date');
+    expect(safe.operationId).toBe('preview.test_1-2');
   });
 });

@@ -6,6 +6,7 @@ import {
   CURRENT_VAULT_SCHEMA_VERSION,
   UPDATE_ERROR_CATALOG,
   UpdateError,
+  sanitizePublicUpdateResult,
   serializeUpdateResult,
   type UpdateErrorCode,
   type UpdatePlan,
@@ -25,6 +26,15 @@ export interface UpdateCliOptions {
   operationIdFactory?: () => string;
   planUpdate?: typeof planVaultUpdate;
   signal?: AbortSignal;
+}
+
+const PUBLIC_OPERATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function safeOperationId(value: unknown): value is string {
+  return typeof value === 'string'
+    && value !== '.'
+    && value !== '..'
+    && PUBLIC_OPERATION_ID.test(value);
 }
 
 function parseArguments(argv: readonly string[]): PreviewArguments {
@@ -118,7 +128,14 @@ export function runUpdateCli(
   try {
     operationId = operationIdFactory();
   } catch {
-    return emptyResult('unavailable', 'INTERNAL_ERROR');
+    return sanitizePublicUpdateResult(
+      emptyResult('unavailable', 'INTERNAL_ERROR'),
+    );
+  }
+  if (!safeOperationId(operationId)) {
+    return sanitizePublicUpdateResult(
+      emptyResult('unavailable', 'INTERNAL_ERROR'),
+    );
   }
 
   try {
@@ -133,9 +150,11 @@ export function runUpdateCli(
     });
 
     if (options.signal?.aborted) throw new UpdateError('INVALID_REQUEST');
-    return previewResult(operationId, plan);
+    return sanitizePublicUpdateResult(previewResult(operationId, plan));
   } catch (error) {
-    return emptyResult(operationId, publicErrorCode(error));
+    return sanitizePublicUpdateResult(
+      emptyResult(operationId, publicErrorCode(error)),
+    );
   }
 }
 

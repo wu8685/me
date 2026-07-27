@@ -171,6 +171,7 @@ export class UpdateError extends Error {
 }
 
 const PATH_TOKEN_END = String.raw`\s,;)}\]"'<>\uE000\uE001`;
+const FILE_URI_TOKEN_END = `${PATH_TOKEN_END}&?#`;
 const ABSOLUTE_PATH_PATTERNS = [
   new RegExp(
     String.raw`(?<![A-Za-z0-9_:/\\])file:[\\/]{1,3}[^${PATH_TOKEN_END}]+`,
@@ -226,9 +227,22 @@ function redactAbsolutePaths(value: string): string {
       return sentinel;
     })
   );
-  let protectedValue = protect(
-    value,
+  // File URLs are local paths, even when nested inside an otherwise safe URI.
+  // Redact them before protecting ordinary URI tokens.
+  let protectedValue = value.replace(
+    new RegExp(
+      String.raw`(?<![A-Za-z0-9_:/\\])file:[\\/]{1,3}[^${FILE_URI_TOKEN_END}]+`,
+      'gi',
+    ),
+    '<ABSOLUTE_PATH>',
+  );
+  protectedValue = protect(
+    protectedValue,
     /<ME_RUNTIME>(?:[\\/][^\s,;)}\]"'<>]+)?/g,
+  );
+  protectedValue = protect(
+    protectedValue,
+    /(?<![A-Za-z0-9_])\/me:[a-z][a-z0-9-]*/g,
   );
   protectedValue = protect(
     protectedValue,
@@ -253,6 +267,13 @@ function redactAbsolutePaths(value: string): string {
 }
 
 function redactPublicValue(value: unknown): unknown {
+  if (
+    Buffer.isBuffer(value)
+    || value instanceof Uint8Array
+    || value instanceof ArrayBuffer
+  ) {
+    return '<BINARY_DATA>';
+  }
   if (typeof value === 'string') {
     return redactAbsolutePaths(value);
   }
@@ -265,6 +286,12 @@ function redactPublicValue(value: unknown): unknown {
   return value;
 }
 
+export function sanitizePublicUpdateResult(
+  result: UpdateResultV1,
+): UpdateResultV1 {
+  return redactPublicValue(result) as UpdateResultV1;
+}
+
 export function serializeUpdateResult(result: UpdateResultV1): string {
-  return `${JSON.stringify(redactPublicValue(result))}\n`;
+  return `${JSON.stringify(sanitizePublicUpdateResult(result))}\n`;
 }
