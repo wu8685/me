@@ -185,6 +185,18 @@ describe('fresh setup preflight', () => {
       'UNSAFE_PATH',
     ],
     [
+      'duplicate effective gitignore entries',
+      (vault: string) => fs.writeFileSync(
+        path.join(vault, '.gitignore'),
+        [
+          '# .obsidian/ is only a comment',
+          ' .obsidian/ ',
+          '.obsidian/\r',
+        ].join('\n'),
+      ),
+      'MIGRATION_CONFLICT',
+    ],
+    [
       'layer symlink',
       (vault: string, outside: string) => fs.symlinkSync(
         outside,
@@ -198,5 +210,22 @@ describe('fresh setup preflight', () => {
     expectedCode,
   ) => {
     expectZeroWriteFailure(arrange, expectedCode);
+  });
+
+  test('defines comment and whitespace semantics for effective gitignore entries', () => {
+    const { vault } = makeVault();
+    fs.writeFileSync(
+      path.join(vault, '.gitignore'),
+      '# .obsidian/ is not effective\n   .obsidian/   \n',
+    );
+
+    const result = preflightFreshSetup({
+      vaultDir: vault,
+      pluginRoot,
+      layerDirectories: ['raw', 'practices', 'cognition'],
+    });
+
+    expect(result.status).toBe('ready');
+    expect(result.plannedPaths).not.toContain('.gitignore');
   });
 });

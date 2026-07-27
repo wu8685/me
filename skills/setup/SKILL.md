@@ -116,6 +116,11 @@ of guessing. Never overwrite user-authored Agent instructions.
   preserving all existing bytes.
 - If it already has an `.obsidian/` entry, leave it unchanged.
 
+For this contract, an effective entry is a non-blank, non-comment line whose
+content after trimming surrounding whitespace is exactly `.obsidian/`.
+Preflight rejects more than one effective entry; comment-only mentions do not
+count. Use the same rule during final validation.
+
 Do not ignore `.me/`; portable config belongs in version control.
 
 ### Config — publish last

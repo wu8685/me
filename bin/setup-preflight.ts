@@ -121,6 +121,76 @@ function assetIntent(
   };
 }
 
+function readRegularFile(
+  root: string,
+  relativePath: string,
+): Buffer {
+  if (inspectPath(root, relativePath, 'file') !== 'file') fail('UNSAFE_PATH');
+  const absolute = path.join(root, ...relativePath.split('/'));
+  let descriptor: number | undefined;
+  try {
+    const named = fs.lstatSync(absolute, { bigint: true });
+    descriptor = fs.openSync(
+      absolute,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    );
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      !named.isFile()
+      || named.isSymbolicLink()
+      || !before.isFile()
+      || named.dev !== before.dev
+      || named.ino !== before.ino
+      || named.mode !== before.mode
+      || named.size !== before.size
+      || named.nlink !== before.nlink
+    ) fail('UNSAFE_PATH');
+    const bytes = fs.readFileSync(descriptor);
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      !after.isFile()
+      || after.dev !== before.dev
+      || after.ino !== before.ino
+      || after.mode !== before.mode
+      || after.size !== before.size
+      || after.nlink !== before.nlink
+      || after.mtimeNs !== before.mtimeNs
+      || after.ctimeNs !== before.ctimeNs
+    ) fail('UNSAFE_PATH');
+    return bytes;
+  } catch (error) {
+    if (error instanceof UpdateError) throw error;
+    return fail('UNSAFE_PATH');
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {
+        // A close failure cannot make an untrusted path safe.
+      }
+    }
+  }
+}
+
+function countEffectiveObsidianEntries(
+  bytes: Buffer,
+  invalidUtf8Code: 'MIGRATION_CONFLICT' | 'UNSAFE_PATH',
+): number {
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true })
+      .decode(Uint8Array.from(bytes));
+  } catch {
+    return fail(invalidUtf8Code);
+  }
+  return text.split('\n').filter(line => {
+    const normalized = line.replace(/\r$/, '').trim();
+    return normalized !== ''
+      && !normalized.startsWith('#')
+      && normalized === '.obsidian/';
+  }).length;
+}
+
 /**
  * Read-only validation for every path a fresh setup may mutate.
  */
@@ -165,22 +235,23 @@ export function preflightFreshSetup(
     if (mutation) plannedPaths.add(asset);
   }
 
+  const snippetEntries = countEffectiveObsidianEntries(
+    readRegularFile(plugin, 'references/gitignore-snippet.txt'),
+    'UNSAFE_PATH',
+  );
+  if (snippetEntries !== 1) fail('UNSAFE_PATH');
+
   const gitignore = inspectPath(vault, '.gitignore', 'file');
-  if (gitignore === 'file') {
-    let descriptor: number | undefined;
-    try {
-      descriptor = fs.openSync(
-        path.join(vault, '.gitignore'),
-        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
-      );
-      fs.readFileSync(descriptor);
-    } catch {
-      fail('UNSAFE_PATH');
-    } finally {
-      if (descriptor !== undefined) fs.closeSync(descriptor);
-    }
+  if (gitignore === 'missing') {
+    plannedPaths.add('.gitignore');
+  } else {
+    const effectiveEntries = countEffectiveObsidianEntries(
+      readRegularFile(vault, '.gitignore'),
+      'MIGRATION_CONFLICT',
+    );
+    if (effectiveEntries > 1) fail('MIGRATION_CONFLICT');
+    if (effectiveEntries === 0) plannedPaths.add('.gitignore');
   }
-  plannedPaths.add('.gitignore');
 
   return {
     version: 1,
