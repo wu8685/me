@@ -238,6 +238,74 @@ describe('shared filesystem mutation executor', () => {
     },
   );
 
+  test.each(['link', 'rename'] as const)(
+    '%s preserves a foreign temp-name replacement and sanitizes the displaced owned inode',
+    primitive => {
+      let destinationParent = '';
+      let displaced = '';
+      let replaced = false;
+      let originalTemporary = '';
+      const { root, executor } = fixture({
+        atomicHooks: {
+          beforeAtomicMutation(kind, phase) {
+            if (kind !== primitive || phase !== 'publish' || replaced) return;
+            replaced = true;
+            const [temporaryName] = fs.readdirSync(destinationParent)
+              .filter(name => name.startsWith('.me-publish-'));
+            originalTemporary = path.join(destinationParent, temporaryName);
+            displaced = path.join(destinationParent, `.displaced-${temporaryName}`);
+            fs.renameSync(originalTemporary, displaced);
+            fs.writeFileSync(originalTemporary, 'foreign temp bytes');
+          },
+        },
+        directoryFsync() {},
+      });
+      const source = path.join(root, 'source.md');
+      destinationParent = path.join(root, 'destination');
+      const destination = path.join(destinationParent, 'published.md');
+      fs.mkdirSync(destinationParent);
+      fs.writeFileSync(source, 'secret source bytes');
+
+      expect(() => executor[primitive](executor.captureFile(source), destination))
+        .toThrow(new MutationFailure('OWNERSHIP_LOST'));
+      expect(fs.readFileSync(originalTemporary, 'utf8')).toBe('foreign temp bytes');
+      expect(fs.statSync(displaced).size).toBe(0);
+      expect(fs.existsSync(destination)).toBeFalse();
+    },
+  );
+
+  test.each(['link', 'rename'] as const)(
+    '%s leaves only a zero-length owned temp when destination exists and retirement fails',
+    primitive => {
+      let destination = '';
+      let destinationCreated = false;
+      const { root, executor } = fixture({
+        atomicHooks: {
+          beforeAtomicMutation(kind, phase) {
+            if (kind === primitive && phase === 'publish' && !destinationCreated) {
+              destinationCreated = true;
+              fs.writeFileSync(destination, 'foreign destination');
+            }
+            if (kind === primitive && phase === 'retirement') throw errno('EIO');
+          },
+        },
+        directoryFsync() {},
+      });
+      const source = path.join(root, 'source.md');
+      destination = path.join(root, 'destination.md');
+      fs.writeFileSync(source, 'secret source bytes');
+
+      expect(() => executor[primitive](executor.captureFile(source), destination))
+        .toThrow(new MutationFailure('OWNERSHIP_LOST'));
+      expect(fs.readFileSync(destination, 'utf8')).toBe('foreign destination');
+      const residues = fs.readdirSync(root)
+        .filter(name => name.startsWith('.me-publish-'));
+      expect(residues.length).toBeGreaterThan(0);
+      expect(residues.every(name => fs.statSync(path.join(root, name)).size === 0))
+        .toBeTrue();
+    },
+  );
+
   test('rename remains no-clobber when the destination appears inside the primitive', () => {
     let logicalDestination = '';
     const injectDestination = (): void => {

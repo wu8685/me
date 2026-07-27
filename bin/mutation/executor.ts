@@ -663,7 +663,71 @@ export function createMutationExecutor(options: {
     let temporaryDescriptor: number | undefined;
     let temporaryName: string | undefined;
     let temporaryPath: string | undefined;
+    let temporaryDevice: bigint | undefined;
+    let temporaryInode: bigint | undefined;
     let published = false;
+    const inspectOwnedTemporary = (): fs.BigIntStats => {
+      if (
+        temporaryDescriptor === undefined
+        || temporaryDevice === undefined
+        || temporaryInode === undefined
+      ) failure('OWNERSHIP_LOST');
+      let stat: fs.BigIntStats;
+      try {
+        stat = operations.fstatSync(
+          temporaryDescriptor,
+          { bigint: true },
+        ) as fs.BigIntStats;
+      } catch {
+        failure('OWNERSHIP_LOST');
+      }
+      if (
+        !stat.isFile()
+        || stat.dev !== temporaryDevice
+        || stat.ino !== temporaryInode
+      ) failure('OWNERSHIP_LOST');
+      return stat;
+    };
+    const temporaryNameStillOwned = (): boolean => {
+      if (
+        temporaryPath === undefined
+        || temporaryDevice === undefined
+        || temporaryInode === undefined
+      ) return false;
+      try {
+        const named = operations.lstatSync(
+          temporaryPath,
+          { bigint: true },
+        ) as fs.BigIntStats;
+        return named.isFile()
+          && !named.isSymbolicLink()
+          && named.dev === temporaryDevice
+          && named.ino === temporaryInode;
+      } catch {
+        return false;
+      }
+    };
+    const sanitizeOwnedTemporary = (): OwnedFileFingerprint => {
+      if (temporaryDescriptor === undefined || temporaryPath === undefined) {
+        failure('OWNERSHIP_LOST');
+      }
+      try {
+        operations.ftruncateSync(temporaryDescriptor, 0);
+        operations.fsyncSync(temporaryDescriptor);
+      } catch {
+        failure('OWNERSHIP_LOST');
+      }
+      const sanitized = inspectOwnedTemporary();
+      if (sanitized.size !== 0n) failure('OWNERSHIP_LOST');
+      return {
+        path: temporaryPath,
+        device: sanitized.dev,
+        inode: sanitized.ino,
+        mode: Number(sanitized.mode & 0o777n),
+        linkCount: sanitized.nlink,
+        sha256: sha256(Buffer.alloc(0)),
+      };
+    };
     try {
       if (!sameOwnedFile(openedSource.fingerprint, source)) {
         failure('SOURCE_CHANGED');
@@ -679,12 +743,23 @@ export function createMutationExecutor(options: {
           temporaryDescriptor = atomic.openAt(
             destinationParent.descriptor,
             temporaryName,
-            fs.constants.O_WRONLY
+            fs.constants.O_RDWR
               | fs.constants.O_CREAT
               | fs.constants.O_EXCL
               | fs.constants.O_NOFOLLOW,
             0o600,
           );
+          const created = operations.fstatSync(
+            temporaryDescriptor,
+            { bigint: true },
+          ) as fs.BigIntStats;
+          if (
+            !created.isFile()
+            || created.dev !== destinationParent.device
+            || created.nlink !== 1n
+          ) failure('OWNERSHIP_LOST');
+          temporaryDevice = created.dev;
+          temporaryInode = created.ino;
           break;
         } catch (error) {
           if (errno(error) === 'EEXIST') continue;
@@ -707,21 +782,15 @@ export function createMutationExecutor(options: {
         operations.fsyncSync(temporaryDescriptor);
       } catch {
         failure('OWNERSHIP_LOST');
-      } finally {
-        closeDescriptor(temporaryDescriptor);
-        temporaryDescriptor = undefined;
       }
 
-      const temporary = captureFileAt(
-        destinationParent,
-        temporaryName,
-        temporaryPath,
-      );
+      const temporary = inspectOwnedTemporary();
       if (
-        temporary.device !== source.device
-        || temporary.mode !== source.mode
-        || temporary.linkCount !== 1n
-        || temporary.sha256 !== source.sha256
+        temporary.dev !== source.device
+        || Number(temporary.mode & 0o777n) !== source.mode
+        || temporary.nlink !== 1n
+        || temporary.size !== BigInt(openedSource.bytes.length)
+        || !temporaryNameStillOwned()
       ) failure('OWNERSHIP_LOST');
 
       try {
@@ -730,6 +799,7 @@ export function createMutationExecutor(options: {
           'publish',
           [source.path, destination],
           () => {
+            if (!temporaryNameStillOwned()) failure('OWNERSHIP_LOST');
             atomic.renameNoReplaceAt(
               destinationParent.descriptor,
               temporaryName!,
@@ -766,6 +836,7 @@ export function createMutationExecutor(options: {
       if (
         !sameOwnedFile(currentSource, source)
         || copied.device !== source.device
+        || copied.inode !== temporaryInode
         || copied.inode === source.inode
         || copied.mode !== source.mode
         || copied.linkCount !== 1n
@@ -777,20 +848,14 @@ export function createMutationExecutor(options: {
     } catch (error) {
       if (
         !published
+        && temporaryDescriptor !== undefined
         && temporaryName !== undefined
         && temporaryPath !== undefined
       ) {
         try {
-          if (temporaryDescriptor !== undefined) {
-            closeDescriptor(temporaryDescriptor);
-            temporaryDescriptor = undefined;
-          }
-          const temporary = captureFileAt(
-            destinationParent,
-            temporaryName,
-            temporaryPath,
-          );
-          retireFile(kind, destinationParent, temporary);
+          const sanitized = sanitizeOwnedTemporary();
+          if (!temporaryNameStillOwned()) failure('OWNERSHIP_LOST');
+          retireFile(kind, destinationParent, sanitized);
         } catch {
           failure('OWNERSHIP_LOST');
         }
