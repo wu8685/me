@@ -1001,7 +1001,8 @@ export function executeFreshSetup(options: SetupOptions): SetupResult {
         rollbackComplete = false;
       }
     }
-    const recoveryRequired = !rollbackComplete
+    const recoveryRequired = lockRecovery
+      || !rollbackComplete
       || vaultCommitted
       || operationDirectory !== undefined;
     if (recoveryRequired && journal) {

@@ -378,6 +378,63 @@ describe('fresh setup transaction', () => {
       .toBe(foreign);
   });
 
+  test('lock replacement during locked recheck reports durable lock recovery', () => {
+    const vault = temporaryDirectory('me-setup-locked-replacement-vault-');
+    const runtime = path.join(
+      temporaryDirectory('me-setup-locked-replacement-root-'),
+      'runtime',
+    );
+    let publishAttempts = 0;
+    let foreignLockPath = '';
+    const beforeVault = manifest(vault);
+
+    const result = executeFreshSetup({
+      ...setupOptions(vault, runtime),
+      hooks: {
+        afterLockAcquired(lockPath) {
+          foreignLockPath = lockPath;
+          fs.renameSync(lockPath, `${lockPath}.previous-owner`);
+          fs.writeFileSync(lockPath, '{"foreign":true}\n', { mode: 0o600 });
+        },
+        beforePublish() {
+          publishAttempts += 1;
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: 'blocked',
+      error: { code: 'RECOVERY_REQUIRED' },
+      recoveryState: 'manual',
+      recoveryActions: [{
+        path: '<ME_RUNTIME>/locks/vault.lock',
+      }],
+      preservedPaths: ['<ME_RUNTIME>/locks/vault.lock'],
+    });
+    expect(publishAttempts).toBe(0);
+    expect(manifest(vault)).toEqual(beforeVault);
+    expect(fs.readFileSync(foreignLockPath, 'utf8')).toBe('{"foreign":true}\n');
+    expect(setupOperationDirectories(runtime)).toEqual([]);
+
+    const beforeRetryVault = manifest(vault);
+    const beforeRetryRuntime = manifest(runtime);
+    const retry = executeFreshSetup({
+      ...setupOptions(vault, runtime),
+      preview: true,
+    });
+    expect(retry).toMatchObject({
+      status: 'blocked',
+      error: { code: 'RECOVERY_REQUIRED' },
+      recoveryState: 'manual',
+      recoveryActions: [{
+        path: '<ME_RUNTIME>/locks/vault.lock',
+      }],
+      preservedPaths: ['<ME_RUNTIME>/locks/vault.lock'],
+    });
+    expect(manifest(vault)).toEqual(beforeRetryVault);
+    expect(manifest(runtime)).toEqual(beforeRetryRuntime);
+  });
+
   test.each([
     'vault-write',
     'me-update',
