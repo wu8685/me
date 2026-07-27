@@ -9,6 +9,7 @@ import {
   validatePlannedMutations,
   type FilesystemMutationKind,
   type MutationFailureCode,
+  type MutationFileOperations,
   type MutationPathPolicy,
   type PlannedMutation,
 } from '../bin/mutation/contracts.ts';
@@ -174,6 +175,91 @@ describe('shared mutation planning contracts', () => {
       type: 'directory',
       mode: 0o750,
     });
+  });
+
+  test('fingerprinting never follows a symlink substituted between lstat and open', () => {
+    const { root, policy } = fixture();
+    const source = path.join(root, 'source.md');
+    const outside = path.join(path.dirname(root), `${path.basename(root)}-outside.md`);
+    temporaryDirectories.push(outside);
+    fs.writeFileSync(source, 'safe');
+    fs.writeFileSync(outside, 'outside');
+    let swapped = false;
+
+    expect(() => fingerprintMutationSource({
+      vaultRoot: root,
+      vaultRelativePath: 'source.md',
+      pathPolicy: policy,
+      fileOps: {
+        lstatSync(candidate, options?: fs.StatSyncOptions) {
+          const stat = fs.lstatSync(candidate, options as never);
+          if (candidate === source && !swapped) {
+            swapped = true;
+            fs.unlinkSync(source);
+            fs.symlinkSync(outside, source);
+          }
+          return stat;
+        },
+      } as Partial<MutationFileOperations>,
+    } as Parameters<typeof fingerprintMutationSource>[0] & {
+      fileOps: Partial<MutationFileOperations>;
+    })).toThrow(new MutationFailure('UNSAFE_PATH'));
+  });
+
+  test('fingerprinting rejects a changed path identity after descriptor read and closes it', () => {
+    const { root, policy } = fixture();
+    const source = path.join(root, 'source.md');
+    fs.writeFileSync(source, 'owned');
+    let replaced = false;
+    let closes = 0;
+
+    expect(() => fingerprintMutationSource({
+      vaultRoot: root,
+      vaultRelativePath: 'source.md',
+      pathPolicy: policy,
+      fileOps: {
+        readFileSync(candidate: fs.PathOrFileDescriptor) {
+          const bytes = fs.readFileSync(candidate);
+          if (typeof candidate === 'number' && !replaced) {
+            replaced = true;
+            fs.unlinkSync(source);
+            fs.writeFileSync(source, 'foreign');
+          }
+          return bytes;
+        },
+        closeSync(descriptor: number) {
+          closes += 1;
+          fs.closeSync(descriptor);
+        },
+      } as Partial<MutationFileOperations>,
+    } as Parameters<typeof fingerprintMutationSource>[0] & {
+      fileOps: Partial<MutationFileOperations>;
+    })).toThrow(new MutationFailure('UNSAFE_PATH'));
+    expect(closes).toBe(1);
+  });
+
+  test('fingerprinting does not block on a FIFO substituted before descriptor open', () => {
+    const { root, policy } = fixture();
+    const source = path.join(root, 'source.md');
+    fs.writeFileSync(source, 'owned');
+    let swapped = false;
+
+    expect(() => fingerprintMutationSource({
+      vaultRoot: root,
+      vaultRelativePath: 'source.md',
+      pathPolicy: policy,
+      fileOps: {
+        lstatSync(candidate, options?: fs.StatSyncOptions) {
+          const stat = fs.lstatSync(candidate, options as never);
+          if (candidate === source && !swapped) {
+            swapped = true;
+            fs.unlinkSync(source);
+            Bun.spawnSync(['mkfifo', source]);
+          }
+          return stat;
+        },
+      } as Partial<MutationFileOperations>,
+    })).toThrow(new MutationFailure('UNSAFE_PATH'));
   });
 
   test('update re-export and shared helper reject symlinks and special files identically', () => {

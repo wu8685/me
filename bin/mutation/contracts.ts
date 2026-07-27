@@ -109,6 +109,35 @@ export interface MutationFileOperations {
   rmdirSync: typeof fs.rmdirSync;
 }
 
+export interface MutationAtomicOperations {
+  openAt(
+    parentDescriptor: number,
+    name: string,
+    flags: number,
+    mode?: number,
+  ): number;
+  linkAt(
+    sourceParentDescriptor: number,
+    sourceName: string,
+    destinationParentDescriptor: number,
+    destinationName: string,
+  ): void;
+  renameAt(
+    sourceParentDescriptor: number,
+    sourceName: string,
+    destinationParentDescriptor: number,
+    destinationName: string,
+  ): void;
+  unlinkAt(parentDescriptor: number, name: string, directory: boolean): void;
+  mkdirAt(parentDescriptor: number, name: string, mode: number): void;
+}
+
+export type AtomicMutationPhase =
+  | 'publish'
+  | 'quarantine'
+  | 'remove'
+  | 'create';
+
 export interface MutationExecutor {
   captureFile(path: string): OwnedFileFingerprint;
   captureDirectory(path: string): OwnedDirectoryFingerprint;
@@ -190,7 +219,24 @@ export function fingerprintMutationSource(options: {
   vaultRoot: string;
   vaultRelativePath: string;
   pathPolicy: MutationPathPolicy;
+  fileOps?: Partial<MutationFileOperations>;
 }): SourceFingerprint {
+  const operations: MutationFileOperations = {
+    openSync: fs.openSync,
+    closeSync: fs.closeSync,
+    fstatSync: fs.fstatSync,
+    fsyncSync: fs.fsyncSync,
+    lstatSync: fs.lstatSync,
+    statSync: fs.statSync,
+    readFileSync: fs.readFileSync,
+    readdirSync: fs.readdirSync,
+    linkSync: fs.linkSync,
+    renameSync: fs.renameSync,
+    unlinkSync: fs.unlinkSync,
+    mkdirSync: fs.mkdirSync,
+    rmdirSync: fs.rmdirSync,
+    ...options.fileOps,
+  };
   if (!safeRelativePath(options.vaultRelativePath)) fail('UNSAFE_PATH');
   const absolute = path.resolve(
     options.vaultRoot,
@@ -203,9 +249,9 @@ export function fingerprintMutationSource(options: {
     fail('UNSAFE_PATH');
   }
 
-  let stat: fs.Stats;
+  let stat: fs.BigIntStats;
   try {
-    stat = fs.lstatSync(absolute);
+    stat = operations.lstatSync(absolute, { bigint: true }) as fs.BigIntStats;
   } catch (error) {
     if (errno(error) === 'ENOENT') {
       return {
@@ -217,18 +263,91 @@ export function fingerprintMutationSource(options: {
   }
   if (stat.isSymbolicLink()) fail('UNSAFE_PATH');
   if (stat.isFile()) {
-    return {
-      vaultRelativePath: options.vaultRelativePath,
-      type: 'file',
-      sha256: crypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex'),
-      mode: stat.mode & 0o777,
-    };
+    let descriptor: number | undefined;
+    try {
+      descriptor = operations.openSync(
+        absolute,
+        fs.constants.O_RDONLY
+          | fs.constants.O_NOFOLLOW
+          | fs.constants.O_NONBLOCK,
+      );
+      const openedBefore = operations.fstatSync(
+        descriptor,
+        { bigint: true },
+      ) as fs.BigIntStats;
+      if (
+        !openedBefore.isFile()
+        || openedBefore.dev !== stat.dev
+        || openedBefore.ino !== stat.ino
+        || openedBefore.mode !== stat.mode
+        || openedBefore.size !== stat.size
+        || openedBefore.nlink !== stat.nlink
+      ) fail('UNSAFE_PATH');
+      const bytes = operations.readFileSync(descriptor) as Buffer;
+      const openedAfter = operations.fstatSync(
+        descriptor,
+        { bigint: true },
+      ) as fs.BigIntStats;
+      const entryAfter = operations.lstatSync(
+        absolute,
+        { bigint: true },
+      ) as fs.BigIntStats;
+      if (
+        !openedAfter.isFile()
+        || !entryAfter.isFile()
+        || entryAfter.isSymbolicLink()
+        || openedAfter.dev !== openedBefore.dev
+        || openedAfter.ino !== openedBefore.ino
+        || openedAfter.mode !== openedBefore.mode
+        || openedAfter.size !== openedBefore.size
+        || openedAfter.nlink !== openedBefore.nlink
+        || openedAfter.mtimeNs !== openedBefore.mtimeNs
+        || openedAfter.ctimeNs !== openedBefore.ctimeNs
+        || entryAfter.dev !== openedAfter.dev
+        || entryAfter.ino !== openedAfter.ino
+        || entryAfter.mode !== openedAfter.mode
+        || entryAfter.size !== openedAfter.size
+        || entryAfter.nlink !== openedAfter.nlink
+      ) fail('UNSAFE_PATH');
+      return {
+        vaultRelativePath: options.vaultRelativePath,
+        type: 'file',
+        sha256: crypto.createHash('sha256')
+          .update(Uint8Array.from(bytes))
+          .digest('hex'),
+        mode: Number(openedAfter.mode & 0o777n),
+      };
+    } catch (error) {
+      if (error instanceof MutationFailure) throw error;
+      fail('UNSAFE_PATH');
+    } finally {
+      if (descriptor !== undefined) {
+        try {
+          operations.closeSync(descriptor);
+        } catch {
+          // Closing cannot change the already rejected or returned fingerprint.
+        }
+      }
+    }
   }
   if (stat.isDirectory()) {
+    let entryAfter: fs.BigIntStats;
+    try {
+      entryAfter = operations.lstatSync(absolute, { bigint: true }) as fs.BigIntStats;
+    } catch {
+      fail('UNSAFE_PATH');
+    }
+    if (
+      !entryAfter.isDirectory()
+      || entryAfter.isSymbolicLink()
+      || entryAfter.dev !== stat.dev
+      || entryAfter.ino !== stat.ino
+      || entryAfter.mode !== stat.mode
+    ) fail('UNSAFE_PATH');
     return {
       vaultRelativePath: options.vaultRelativePath,
       type: 'directory',
-      mode: stat.mode & 0o777,
+      mode: Number(stat.mode & 0o777n),
     };
   }
   fail('UNSAFE_PATH');
@@ -253,7 +372,9 @@ export function validatePlannedMutations(
         !Buffer.isBuffer(mutation.desiredBytes)
         || !safeMode(mutation.desiredMode)
         || !/^[a-f0-9]{64}$/.test(mutation.desiredSha256)
-        || crypto.createHash('sha256').update(mutation.desiredBytes).digest('hex')
+        || crypto.createHash('sha256')
+          .update(Uint8Array.from(mutation.desiredBytes))
+          .digest('hex')
           !== mutation.desiredSha256
       ) fail('UNSAFE_PATH');
     } else if (mutation.kind === 'mkdir') {

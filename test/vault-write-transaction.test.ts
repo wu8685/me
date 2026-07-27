@@ -688,6 +688,41 @@ describe('lock precedence and operation discovery', () => {
     expect(outer.status).toBe('committed');
   });
 
+  test('bootstraps lock and transaction directories through the shared durable boundary', () => {
+    const vault = makeVault();
+    const layout = resolveVaultLayout(vault);
+    const events: string[] = [];
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      hooks: {
+        beforeFsMutation(kind, paths) {
+          if (
+            kind === 'mkdir'
+            && (paths[0] === layout.lockDir || paths[0] === layout.transactionDir)
+          ) {
+            events.push(`hook:${paths[0]}`);
+          }
+        },
+        afterLock() {
+          events.push('afterLock');
+        },
+      },
+      directoryFsync(directory) {
+        if (directory === layout.runtimeRoot) events.push(`fsync:${directory}`);
+      },
+    });
+
+    expect(result.status).toBe('committed');
+    expect(events.slice(0, 5)).toEqual([
+      `hook:${layout.lockDir}`,
+      `fsync:${layout.runtimeRoot}`,
+      `hook:${layout.transactionDir}`,
+      `fsync:${layout.runtimeRoot}`,
+      'afterLock',
+    ]);
+  });
+
   test('a me-update owner blocks vault-write without publishing content', () => {
     const vault = makeVault();
     const layout = prepareRuntime(vault);
@@ -915,11 +950,13 @@ describe('fingerprint, no-clobber, and rollback windows', () => {
     const result = executeVaultWrite(vault, request(), {
       pluginRoot,
       mode: 'write',
-      fileOps: {
-        linkSync() {
-          const error = new Error(code) as NodeJS.ErrnoException;
-          error.code = code;
-          throw error;
+      atomicHooks: {
+        beforeAtomicMutation(kind, phase) {
+          if (kind === 'link' && phase === 'publish') {
+            const error = new Error(code) as NodeJS.ErrnoException;
+            error.code = code;
+            throw error;
+          }
         },
       },
     });
@@ -1317,10 +1354,11 @@ describe('README concurrency and cleanup ownership', () => {
     const result = executeVaultWrite(vault, request(), {
       pluginRoot,
       mode: 'write',
-      fileOps: {
-        renameSync(source, destination) {
-          fs.renameSync(source, destination);
-          fs.writeFileSync(destination, '# Changed after rename\n');
+      atomicHooks: {
+        afterAtomicMutation(kind, phase, paths) {
+          if (kind === 'rename' && phase === 'publish') {
+            fs.writeFileSync(paths[1], '# Changed after rename\n');
+          }
         },
       },
     });
@@ -1340,15 +1378,15 @@ describe('README concurrency and cleanup ownership', () => {
     const result = executeVaultWrite(vault, request(), {
       pluginRoot,
       mode: 'write',
-      fileOps: {
-        linkSync(source, destination) {
+      atomicHooks: {
+        beforeAtomicMutation(kind, phase) {
+          if (kind !== 'link' || phase !== 'publish') return;
           links += 1;
           if (links === 2) {
             const error = new Error('second link unsupported') as NodeJS.ErrnoException;
             error.code = 'EXDEV';
             throw error;
           }
-          fs.linkSync(source, destination);
         },
       },
     });

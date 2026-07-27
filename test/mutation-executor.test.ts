@@ -28,14 +28,23 @@ function fixture(options: {
   ): void;
   onWarning?(code: 'DIRECTORY_FSYNC_UNSUPPORTED'): void;
   fileOps?: Partial<MutationFileOperations>;
+  atomicHooks?: NonNullable<
+    Parameters<typeof createMutationExecutor>[0]['atomicHooks']
+  >;
   directoryFsync?(directory: string): void;
+  quarantine?: boolean;
 } = {}): {
   root: string;
   executor: MutationExecutor;
   policy: MutationPathPolicy;
+  quarantineDirectory?: string;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-mutation-executor-'));
   temporaryDirectories.push(root);
+  const quarantineDirectory = options.quarantine !== false
+    ? path.join(root, 'quarantine')
+    : undefined;
+  if (quarantineDirectory) fs.mkdirSync(quarantineDirectory, { mode: 0o700 });
   const policy: MutationPathPolicy = {
     assertSafe(candidate) {
       const absolute = path.resolve(candidate);
@@ -85,8 +94,11 @@ function fixture(options: {
         onWarning: options.onWarning,
       },
       fileOps: { ...defaults, ...options.fileOps },
+      atomicHooks: options.atomicHooks,
       directoryFsync: options.directoryFsync,
-    }),
+      quarantineDirectory,
+    } as Parameters<typeof createMutationExecutor>[0]),
+    quarantineDirectory,
   };
 }
 
@@ -188,6 +200,63 @@ describe('shared filesystem mutation executor', () => {
     expect(fs.readFileSync(source, 'utf8')).toBe('source');
   });
 
+  test('rename remains no-clobber when the destination appears inside the primitive', () => {
+    let logicalDestination = '';
+    const injectDestination = (): void => {
+      if (!fs.existsSync(logicalDestination)) {
+        fs.writeFileSync(logicalDestination, 'foreign');
+      }
+    };
+    const { root, executor } = fixture({
+      atomicHooks: {
+        beforeAtomicMutation(kind, phase) {
+          if (kind === 'rename' && phase === 'publish') injectDestination();
+        },
+      },
+      directoryFsync() {},
+    });
+    const source = path.join(root, 'source.md');
+    logicalDestination = path.join(root, 'destination.md');
+    fs.writeFileSync(source, 'owned');
+
+    expect(() => executor.rename(
+      executor.captureFile(source),
+      logicalDestination,
+    )).toThrow(new MutationFailure('TARGET_EXISTS'));
+    expect(fs.readFileSync(logicalDestination, 'utf8')).toBe('foreign');
+    expect(fs.readFileSync(source, 'utf8')).toBe('owned');
+  });
+
+  test('link cannot escape when the destination parent is replaced inside the primitive', () => {
+    let replaced = false;
+    let logicalParent = '';
+    let outside = '';
+    const { root, executor } = fixture({
+      atomicHooks: {
+        beforeAtomicMutation(kind, phase) {
+          if (kind === 'link' && phase === 'publish' && !replaced) {
+            replaced = true;
+            fs.rmdirSync(logicalParent);
+            fs.symlinkSync(outside, logicalParent);
+          }
+        },
+      },
+      directoryFsync() {},
+    });
+    const source = path.join(root, 'source.md');
+    logicalParent = path.join(root, 'destination');
+    outside = path.join(root, 'outside');
+    fs.writeFileSync(source, 'owned');
+    fs.mkdirSync(logicalParent);
+    fs.mkdirSync(outside);
+
+    expect(() => executor.link(
+      executor.captureFile(source),
+      path.join(logicalParent, 'published.md'),
+    )).toThrow();
+    expect(fs.existsSync(path.join(outside, 'published.md'))).toBeFalse();
+  });
+
   test('rejects lost file and directory ownership before destructive cleanup', () => {
     const { root, executor } = fixture({ directoryFsync() {} });
     const file = path.join(root, 'owned.md');
@@ -207,6 +276,93 @@ describe('shared filesystem mutation executor', () => {
       .toThrow(new MutationFailure('OWNERSHIP_LOST'));
     expect(fs.readFileSync(file, 'utf8')).toBe('foreign');
     expect(fs.statSync(directory).isDirectory()).toBeTrue();
+  });
+
+  test('quarantines and preserves a foreign file replacement instead of unlinking it', () => {
+    let source = '';
+    let replaced = false;
+    const replaceSource = (): void => {
+      if (replaced) return;
+      replaced = true;
+      fs.unlinkSync(source);
+      fs.writeFileSync(source, 'foreign');
+    };
+    const { root, executor, quarantineDirectory } = fixture({
+      atomicHooks: {
+        beforeAtomicMutation(kind, phase) {
+          if (kind === 'unlink' && phase === 'quarantine') replaceSource();
+        },
+      },
+      directoryFsync() {},
+      quarantine: true,
+    });
+    source = path.join(root, 'owned.md');
+    fs.writeFileSync(source, 'owned');
+    const owned = executor.captureFile(source);
+
+    expect(() => executor.unlink(owned))
+      .toThrow(new MutationFailure('OWNERSHIP_LOST'));
+    const preserved = fs.readdirSync(quarantineDirectory!);
+    expect(preserved).toHaveLength(1);
+    expect(fs.readFileSync(path.join(quarantineDirectory!, preserved[0]), 'utf8'))
+      .toBe('foreign');
+  });
+
+  test('quarantines and preserves a foreign directory replacement instead of removing it', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'me-mutation-rmdir-race-'));
+    temporaryDirectories.push(root);
+    const source = path.join(root, 'owned');
+    const quarantine = path.join(root, 'quarantine');
+    fs.mkdirSync(source);
+    fs.mkdirSync(quarantine, { mode: 0o700 });
+    let replaced = false;
+    const replaceSource = (): void => {
+      if (replaced) return;
+      replaced = true;
+      fs.rmdirSync(source);
+      fs.mkdirSync(source);
+      fs.writeFileSync(path.join(source, 'foreign.txt'), 'foreign');
+    };
+    const guarded = createMutationExecutor({
+      pathPolicy: {
+        assertSafe(candidate) {
+          const absolute = path.resolve(candidate);
+          if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) {
+            throw new Error('unsafe');
+          }
+        },
+        display: candidate => path.relative(root, candidate),
+      },
+      journal: { beforeMutation() {}, afterMutation() {} },
+      atomicHooks: {
+        beforeAtomicMutation(kind, phase) {
+          if (kind === 'rmdir' && phase === 'quarantine') replaceSource();
+        },
+      },
+      fileOps: {
+        openSync: fs.openSync,
+        closeSync: fs.closeSync,
+        fstatSync: fs.fstatSync,
+        fsyncSync: fs.fsyncSync,
+        lstatSync: fs.lstatSync,
+        statSync: fs.statSync,
+        readFileSync: fs.readFileSync,
+        readdirSync: fs.readdirSync,
+        linkSync: fs.linkSync,
+        renameSync: fs.renameSync,
+        unlinkSync: fs.unlinkSync,
+        rmdirSync: fs.rmdirSync,
+      },
+      directoryFsync() {},
+      quarantineDirectory: quarantine,
+    } as Parameters<typeof createMutationExecutor>[0]);
+    const owned = guarded.captureDirectory(source);
+
+    expect(() => guarded.rmdir(owned))
+      .toThrow(new MutationFailure('OWNERSHIP_LOST'));
+    const [preserved] = fs.readdirSync(quarantine);
+    expect(fs.readFileSync(path.join(quarantine, preserved, 'foreign.txt'), 'utf8'))
+      .toBe('foreign');
   });
 
   test('rejects symlinks and special files at capture', () => {
@@ -254,11 +410,12 @@ describe('shared filesystem mutation executor', () => {
   test.each(['link', 'rename'] as const)(
     'maps cross-filesystem %s failures to UNSUPPORTED_FILESYSTEM',
     primitive => {
-      const injected = primitive === 'link'
-        ? { linkSync: () => { throw errno('EXDEV'); } }
-        : { renameSync: () => { throw errno('EXDEV'); } };
       const { root, executor } = fixture({
-        fileOps: injected,
+        atomicHooks: {
+          beforeAtomicMutation(kind, phase) {
+            if (kind === primitive && phase === 'publish') throw errno('EXDEV');
+          },
+        },
         directoryFsync() {},
       });
       const source = path.join(root, 'source.md');
@@ -271,6 +428,24 @@ describe('shared filesystem mutation executor', () => {
       expect(fs.existsSync(destination)).toBeFalse();
     },
   );
+
+  test('fails closed when quarantine rename is unsupported', () => {
+    const { root, executor, quarantineDirectory } = fixture({
+      atomicHooks: {
+        beforeAtomicMutation(kind, phase) {
+          if (kind === 'unlink' && phase === 'quarantine') throw errno('ENOTSUP');
+        },
+      },
+      directoryFsync() {},
+    });
+    const source = path.join(root, 'source.md');
+    fs.writeFileSync(source, 'owned');
+
+    expect(() => executor.unlink(executor.captureFile(source)))
+      .toThrow(new MutationFailure('UNSUPPORTED_FILESYSTEM'));
+    expect(fs.readFileSync(source, 'utf8')).toBe('owned');
+    expect(fs.readdirSync(quarantineDirectory!)).toEqual([]);
+  });
 
   test.each(['link', 'rename'] as const)(
     'checks source and destination devices before %s',
@@ -319,6 +494,44 @@ describe('shared filesystem mutation executor', () => {
     });
     expect(() => failing.executor.mkdir(path.join(failing.root, 'created'), 0o700))
       .toThrow('EIO');
+  });
+
+  test('fsyncs parent directories before recording the after boundary', () => {
+    const events: string[] = [];
+    const { root, executor } = fixture({
+      journal: {
+        beforeMutation: kind => events.push(`before:${kind}`),
+        afterMutation: kind => events.push(`after:${kind}`),
+      },
+      beforeFilesystemMutation: kind => events.push(`primitive:${kind}`),
+      directoryFsync: directory => events.push(`fsync:${directory}`),
+    });
+    const target = path.join(root, 'created');
+
+    executor.mkdir(target, 0o700);
+    expect(events).toEqual([
+      'before:mkdir',
+      'primitive:mkdir',
+      `fsync:${root}`,
+      'after:mkdir',
+    ]);
+  });
+
+  test('does not record afterMutation when directory fsync fails', () => {
+    const events: string[] = [];
+    const { root, executor } = fixture({
+      journal: {
+        beforeMutation: kind => events.push(`before:${kind}`),
+        afterMutation: kind => events.push(`after:${kind}`),
+      },
+      directoryFsync() {
+        events.push('fsync');
+        throw errno('EIO');
+      },
+    });
+
+    expect(() => executor.mkdir(path.join(root, 'created'), 0o700)).toThrow('EIO');
+    expect(events).toEqual(['before:mkdir', 'fsync']);
   });
 
   test.each(

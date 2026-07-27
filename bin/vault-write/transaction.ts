@@ -48,6 +48,7 @@ import {
   MutationFailure,
   fingerprintMutationSource,
   validatePlannedMutations,
+  type AtomicMutationPhase,
   type FilesystemMutationKind,
   type MutationExecutor,
   type MutationFileOperations,
@@ -111,6 +112,19 @@ export interface VaultWriterOptions {
   lockOps?: Partial<LockOperations>;
   /** Test-only injection. Production callers omit this. */
   directoryFsync?(directory: string): void;
+  /** Test-only injection immediately around descriptor-relative syscalls. */
+  atomicHooks?: {
+    beforeAtomicMutation?(
+      kind: FilesystemMutationKind,
+      phase: AtomicMutationPhase,
+      paths: readonly string[],
+    ): void;
+    afterAtomicMutation?(
+      kind: FilesystemMutationKind,
+      phase: AtomicMutationPhase,
+      paths: readonly string[],
+    ): void;
+  };
 }
 
 type JournalState =
@@ -883,6 +897,11 @@ class Transaction {
         },
       },
       fileOps: this.operations,
+      atomicHooks: options.atomicHooks,
+      quarantineDirectory: path.join(
+        this.plan.layout.transactionDir,
+        `vault-write-${this.operationId}`,
+      ),
       directoryFsync: options.directoryFsync,
     });
   }
@@ -1219,24 +1238,45 @@ function bootstrapDirectory(
   options: VaultWriterOptions,
   operations: FileOperations,
 ): void {
+  const executor = createMutationExecutor({
+    pathPolicy: {
+      assertSafe: candidate =>
+        assertSafeMutationPath(layout, candidate, 'bootstrap directory'),
+      display: candidate => displayRelative(layout, candidate),
+    },
+    journal: {
+      beforeMutation() {},
+      afterMutation() {},
+    },
+    hooks: {
+      beforeFilesystemMutation: (kind, paths) =>
+        options.hooks?.beforeFsMutation?.(kind, [...paths]),
+    },
+    atomicHooks: options.atomicHooks,
+    fileOps: operations,
+    directoryFsync: options.directoryFsync,
+  });
   try {
-    const stat = operations.lstatSync(directory) as fs.Stats;
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new VaultWriterError('UNSAFE_PATH');
+    executor.captureDirectory(directory);
     return;
   } catch (error) {
-    if (error instanceof VaultWriterError) throw error;
-    if (errno(error) !== 'ENOENT') throw error;
+    if (!(error instanceof MutationFailure) || error.code !== 'UNSAFE_PATH') {
+      mapMutationFailure(error);
+    }
+    let missing = false;
+    try {
+      operations.lstatSync(directory);
+    } catch (entryError) {
+      if (errno(entryError) === 'ENOENT') missing = true;
+      else mapMutationFailure(error);
+    }
+    if (!missing) mapMutationFailure(error);
   }
-  options.hooks?.beforeFsMutation?.('mkdir', [directory]);
-  assertSafeMutationPath(layout, directory, 'bootstrap directory');
   try {
-    operations.lstatSync(directory);
-    throw new VaultWriterError('INPUT_CHANGED');
+    executor.mkdir(directory, 0o700);
   } catch (error) {
-    if (error instanceof VaultWriterError) throw error;
-    if (errno(error) !== 'ENOENT') throw error;
+    mapMutationFailure(error);
   }
-  operations.mkdirSync(directory, { mode: 0o700 });
 }
 
 function bootstrapRuntimeRoot(layout: ResolvedVaultLayout): void {
