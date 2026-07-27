@@ -7,6 +7,7 @@ import {
   acquireVaultLock,
   releaseVaultLock,
 } from '../bin/cooperative-lock.ts';
+import { MutationFailure } from '../bin/mutation/contracts.ts';
 import { resolveRuntimeLayout } from '../bin/runtime-paths.ts';
 import { planVaultUpdate } from '../bin/update/planner.ts';
 import { executeVaultUpdate } from '../bin/update/transaction.ts';
@@ -132,6 +133,38 @@ describe('me-update transaction', () => {
     expect(result.changedPaths).toEqual([]);
     expect(fs.readFileSync(path.join(vault, 'AGENTS.md'), 'utf8'))
       .toBe('# arrived after staging\n');
+    expect(fs.existsSync(path.join(vault, 'CLAUDE.md'))).toBeFalse();
+    expect(configVersion(vault)).toBeUndefined();
+  });
+
+  test('maps a first-boundary target race to stale preview and preserves the foreign file', () => {
+    const { vault, environment } = makeVault();
+    const canonicalVault = fs.realpathSync(vault);
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    let injected = false;
+    const result = executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+      hooks: {
+        beforeMutation(kind, paths) {
+          if (
+            injected
+            || kind !== 'link'
+            || !paths.includes(path.join(canonicalVault, 'AGENTS.md'))
+          ) return;
+          injected = true;
+          writeFile(vault, 'AGENTS.md', '# foreign winner\n');
+          throw new MutationFailure('TARGET_EXISTS');
+        },
+      },
+    });
+
+    expect(injected).toBeTrue();
+    expect(result.status).toBe('blocked');
+    expect(result.error?.code).toBe('STALE_PREVIEW');
+    expect(result.changedPaths).toEqual([]);
+    expect(fs.readFileSync(path.join(vault, 'AGENTS.md'), 'utf8'))
+      .toBe('# foreign winner\n');
     expect(fs.existsSync(path.join(vault, 'CLAUDE.md'))).toBeFalse();
     expect(configVersion(vault)).toBeUndefined();
   });
@@ -375,5 +408,277 @@ describe('me-update transaction', () => {
     expect(result.status).toBe('recovery_required');
     expect(result.error?.code).toBe('RECOVERY_REQUIRED');
     expect(configVersion(vault)).toBeUndefined();
+  });
+
+  test('rejects minimal committed journals even when an originals directory is present', () => {
+    for (const owner of ['me-update', 'vault-write'] as const) {
+      const { vault, environment } = makeVault();
+      const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+      const layout = resolveRuntimeLayout(vault, environment);
+      const id = owner === 'me-update'
+        ? '00000000-0000-4000-8000-000000000606'
+        : '00000000-0000-4000-8000-000000000607';
+      const operation = path.join(layout.transactionDir, `${owner}-${id}`);
+      fs.mkdirSync(path.join(operation, 'originals'), {
+        recursive: true,
+        mode: 0o700,
+      });
+      fs.writeFileSync(
+        path.join(operation, 'originals', owner === 'me-update'
+          ? '000000.original'
+          : 'README.md'),
+        'foreign residual bytes',
+      );
+      fs.writeFileSync(
+        path.join(operation, 'journal.json'),
+        JSON.stringify({
+          version: 1,
+          operationId: id,
+          state: 'committed',
+        }),
+        { mode: 0o600 },
+      );
+
+      const result = executeVaultUpdate(vault, preview.planDigest, {
+        pluginRoot,
+        environment,
+      });
+      expect(result.status).toBe('recovery_required');
+      expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+      expect(configVersion(vault)).toBeUndefined();
+    }
+  });
+
+  test('rejects full-shape updater journals with forged completed mutation history', () => {
+    const corruptions: Array<
+      (completed: Array<{ kind: string; paths: string[] }>) => void
+    > = [
+      completed => {
+        completed[0] = { kind: 'link', paths: ['AGENTS.md'] };
+      },
+      completed => {
+        completed[0] = {
+          kind: 'mkdir',
+          paths: ['<ME_RUNTIME>/transactions/foreign/staged'],
+        };
+      },
+      completed => {
+        completed.reverse();
+      },
+    ];
+
+    for (const [index, corrupt] of corruptions.entries()) {
+      const { vault, environment } = makeVault();
+      const id = `00000000-0000-4000-8000-${String(610 + index).padStart(12, '0')}`;
+      const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+      expect(executeVaultUpdate(vault, preview.planDigest, {
+        pluginRoot,
+        environment,
+        operationIdFactory: () => id,
+      }).status).toBe('committed');
+
+      const layout = resolveRuntimeLayout(vault, environment);
+      const journalPath = path.join(
+        layout.transactionDir,
+        `me-update-${id}`,
+        'journal.json',
+      );
+      const journal = JSON.parse(
+        fs.readFileSync(journalPath, 'utf8'),
+      ) as {
+        completedMutations: Array<{ kind: string; paths: string[] }>;
+      };
+      corrupt(journal.completedMutations);
+      fs.writeFileSync(journalPath, `${JSON.stringify(journal, null, 2)}\n`, {
+        mode: 0o600,
+      });
+
+      const next = planVaultUpdate({ vaultDir: vault, pluginRoot });
+      const result = executeVaultUpdate(vault, next.planDigest, {
+        pluginRoot,
+        environment,
+      });
+      expect(result.status).toBe('recovery_required');
+      expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+    }
+  });
+
+  test('rejects an impossible successful updater mutation discriminant', () => {
+    const { vault, environment } = makeVault();
+    const id = '00000000-0000-4000-8000-000000000614';
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    expect(executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+      operationIdFactory: () => id,
+    }).status).toBe('committed');
+
+    const layout = resolveRuntimeLayout(vault, environment);
+    const journalPath = path.join(
+      layout.transactionDir,
+      `me-update-${id}`,
+      'journal.json',
+    );
+    const journal = JSON.parse(
+      fs.readFileSync(journalPath, 'utf8'),
+    ) as {
+      mutations: Array<{
+        kind: string;
+        path: string;
+        source: { type: string; vaultRelativePath: string; mode?: number };
+      }>;
+    };
+    const create = journal.mutations.find(
+      mutation => (
+        mutation.kind === 'write-file'
+        && mutation.source.type === 'missing'
+      ),
+    );
+    expect(create).toBeDefined();
+    create!.source = {
+      type: 'directory',
+      vaultRelativePath: create!.path,
+      mode: 0o755,
+    };
+    fs.writeFileSync(journalPath, `${JSON.stringify(journal, null, 2)}\n`, {
+      mode: 0o600,
+    });
+
+    const next = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    const result = executeVaultUpdate(vault, next.planDigest, {
+      pluginRoot,
+      environment,
+    });
+    expect(result.status).toBe('recovery_required');
+    expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+  });
+
+  test('accepts only the full committed vault-write journal contract', () => {
+    const { vault, environment } = makeVault();
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    const layout = resolveRuntimeLayout(vault, environment);
+    const id = '00000000-0000-4000-8000-000000000608';
+    const operation = path.join(layout.transactionDir, `vault-write-${id}`);
+    fs.mkdirSync(operation, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(operation, 'journal.json'), JSON.stringify({
+      version: 1,
+      operationId: id,
+      state: 'committed',
+      notePath: 'knowledge/raw/2026-07-28-existing.md',
+      requestDigest: '1'.repeat(64),
+      plannedNoteSha256: '2'.repeat(64),
+      metadataPolicy:
+        'POSIX mode preserved for replaced README; uid/gid/ACL/xattr/timestamps are not preserved.',
+    }), { mode: 0o600 });
+
+    const result = executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+    });
+    expect(result.status).toBe('committed');
+    expect(configVersion(vault)).toBe(1);
+  });
+
+  test('rejects committed vault-write residue with a non-v4 id or non-private operation directory', () => {
+    for (const variant of ['id', 'mode'] as const) {
+      const { vault, environment } = makeVault();
+      const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+      const layout = resolveRuntimeLayout(vault, environment);
+      const id = variant === 'id'
+        ? 'forged-operation'
+        : '00000000-0000-4000-8000-000000000609';
+      const operation = path.join(
+        layout.transactionDir,
+        `vault-write-${id}`,
+      );
+      fs.mkdirSync(operation, {
+        recursive: true,
+        mode: variant === 'mode' ? 0o755 : 0o700,
+      });
+      fs.writeFileSync(path.join(operation, 'journal.json'), JSON.stringify({
+        version: 1,
+        operationId: id,
+        state: 'committed',
+        notePath: 'knowledge/raw/2026-07-28-existing.md',
+        requestDigest: '1'.repeat(64),
+        plannedNoteSha256: '2'.repeat(64),
+        metadataPolicy:
+          'POSIX mode preserved for replaced README; uid/gid/ACL/xattr/timestamps are not preserved.',
+      }), { mode: 0o600 });
+
+      const result = executeVaultUpdate(vault, preview.planDigest, {
+        pluginRoot,
+        environment,
+      });
+      expect(result.status).toBe('recovery_required');
+      expect(result.error?.code).toBe('RECOVERY_REQUIRED');
+      expect(configVersion(vault)).toBeUndefined();
+    }
+  });
+
+  test('fsyncs the operation directory after the first journal and before vault mutation', () => {
+    const { vault, environment } = makeVault();
+    const canonicalVault = fs.realpathSync(vault);
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    let journalDirectoryDurable = false;
+    const result = executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+      directoryFsync(directory) {
+        if (
+          !journalDirectoryDurable
+          &&
+          path.basename(directory).startsWith('me-update-')
+          && fs.existsSync(path.join(directory, 'journal.json'))
+        ) {
+          const journal = JSON.parse(
+            fs.readFileSync(path.join(directory, 'journal.json'), 'utf8'),
+          ) as { version?: unknown; state?: unknown };
+          expect(journal).toMatchObject({ version: 1, state: 'locked' });
+          journalDirectoryDurable = true;
+        }
+      },
+      hooks: {
+        beforeMutation(_kind, paths) {
+          if (paths.some(candidate => (
+            candidate === canonicalVault
+            || candidate.startsWith(`${canonicalVault}${path.sep}`)
+          ))) {
+            expect(journalDirectoryDurable).toBeTrue();
+          }
+        },
+      },
+    });
+
+    expect(result.status).toBe('committed');
+    expect(journalDirectoryDurable).toBeTrue();
+  });
+
+  test('downgrades unsupported operation-directory fsync to one warning', () => {
+    const { vault, environment } = makeVault();
+    const preview = planVaultUpdate({ vaultDir: vault, pluginRoot });
+    let injected = false;
+    const result = executeVaultUpdate(vault, preview.planDigest, {
+      pluginRoot,
+      environment,
+      directoryFsync(directory) {
+        if (
+          !injected
+          && path.basename(directory).startsWith('me-update-')
+          && fs.existsSync(path.join(directory, 'journal.json'))
+        ) {
+          injected = true;
+          const error = new Error('unsupported') as NodeJS.ErrnoException;
+          error.code = 'ENOTSUP';
+          throw error;
+        }
+      },
+    });
+
+    expect(result.status).toBe('committed');
+    expect(injected).toBeTrue();
+    expect(result.warnings.filter(item => (
+      item === 'Directory fsync is not supported on this filesystem.'
+    ))).toHaveLength(1);
   });
 });
