@@ -35,6 +35,7 @@ export type ManagedAssetCurrent =
 export interface ManagedAssetRenderResult {
   desiredBytes: Buffer;
   desiredMode: number;
+  adoptedLegacySections: readonly string[];
 }
 
 function fail(code: 'MIGRATION_CONFLICT' | 'UNSAFE_PATH' | 'UNSUPPORTED_FILESYSTEM'): never {
@@ -228,7 +229,12 @@ function validateIntent(intent: ManagedAssetIntent): void {
     || !['create-if-absent', 'replace-known-template', 'merge-owned-sections']
       .includes(intent.strategy)
     || !['create', 'skip'].includes(intent.onAbsent)
-    || !['adopt-known-legacy', 'append-marked-block', 'conflict']
+    || ![
+      'adopt-known-legacy',
+      'adopt-legacy-sections',
+      'append-marked-block',
+      'conflict',
+    ]
       .includes(intent.onUnmarked)
     || intent.knownTemplatePaths?.some(known => !safeRelativePath(known))
   ) fail('UNSAFE_PATH');
@@ -278,6 +284,7 @@ export function renderManagedAssetBytes(options: {
       : {
           desiredBytes: Buffer.from(Uint8Array.from(desiredBytes)),
           desiredMode: 0o644,
+          adoptedLegacySections: [],
         };
   }
   if (bytesEqual(current.bytes, desiredBytes)) return undefined;
@@ -295,6 +302,7 @@ export function renderManagedAssetBytes(options: {
     return {
       desiredBytes: Buffer.from(Uint8Array.from(desiredBytes)),
       desiredMode: current.mode,
+      adoptedLegacySections: [],
     };
   }
 
@@ -303,10 +311,14 @@ export function renderManagedAssetBytes(options: {
     desiredText as string,
     intent.onUnmarked,
     knownBytes.map(known => utf8(known, true)),
-  ).content;
-  const mergedBytes = Buffer.from(merged);
+  );
+  const mergedBytes = Buffer.from(merged.content);
   if (bytesEqual(current.bytes, mergedBytes)) return undefined;
-  return { desiredBytes: mergedBytes, desiredMode: current.mode };
+  return {
+    desiredBytes: mergedBytes,
+    desiredMode: current.mode,
+    adoptedLegacySections: merged.adoptedLegacySections,
+  };
 }
 
 export function planManagedAsset(

@@ -12,7 +12,10 @@ import {
   type UpdatePlan,
   type UpdateResultV1,
 } from './update/contracts.ts';
-import { planVaultUpdate } from './update/planner.ts';
+import {
+  planVaultUpdate,
+  type ManagedAgent,
+} from './update/planner.ts';
 import {
   executeVaultUpdate,
   inspectVaultUpdateRecovery,
@@ -22,12 +25,14 @@ import { RuntimePathError } from './runtime-paths.ts';
 interface PreviewArguments {
   mode: 'preview';
   vaultDir: string;
+  managedAgents?: readonly ManagedAgent[];
 }
 
 interface ApplyArguments {
   mode: 'apply';
   vaultDir: string;
   expectedPlanDigest: string;
+  managedAgents?: readonly ManagedAgent[];
 }
 
 export interface UpdateCliOptions {
@@ -51,6 +56,12 @@ function safeOperationId(value: unknown): value is string {
 function parseArguments(
   argv: readonly string[],
 ): PreviewArguments | ApplyArguments {
+  const managedAgents = (value: string | undefined): readonly ManagedAgent[] => {
+    if (value === 'codex') return ['codex'];
+    if (value === 'claude') return ['claude'];
+    if (value === 'codex,claude') return ['codex', 'claude'];
+    throw new UpdateError('INVALID_REQUEST');
+  };
   if (
     argv.length === 3
     && argv[0] === 'preview'
@@ -59,6 +70,20 @@ function parseArguments(
     && !argv[2].startsWith('--')
   ) {
     return { mode: 'preview', vaultDir: argv[2] };
+  }
+  if (
+    argv.length === 5
+    && argv[0] === 'preview'
+    && argv[1] === '--vault-dir'
+    && argv[2]
+    && !argv[2].startsWith('--')
+    && argv[3] === '--managed-agents'
+  ) {
+    return {
+      mode: 'preview',
+      vaultDir: argv[2],
+      managedAgents: managedAgents(argv[4]),
+    };
   }
   if (
     argv.length === 5
@@ -73,6 +98,23 @@ function parseArguments(
       mode: 'apply',
       vaultDir: argv[2],
       expectedPlanDigest: argv[4],
+    };
+  }
+  if (
+    argv.length === 7
+    && argv[0] === 'apply'
+    && argv[1] === '--vault-dir'
+    && argv[2]
+    && !argv[2].startsWith('--')
+    && argv[3] === '--expected-plan-digest'
+    && /^[a-f0-9]{64}$/.test(argv[4] ?? '')
+    && argv[5] === '--managed-agents'
+  ) {
+    return {
+      mode: 'apply',
+      vaultDir: argv[2],
+      expectedPlanDigest: argv[4],
+      managedAgents: managedAgents(argv[6]),
     };
   }
   throw new UpdateError('INVALID_REQUEST');
@@ -185,6 +227,7 @@ export function runUpdateCli(
           environment: options.environment,
           operationIdFactory: () => operationId,
           signal: options.signal,
+          managedAgents: args.managedAgents,
         },
       ));
     }
@@ -202,6 +245,7 @@ export function runUpdateCli(
     const plan = planner({
       vaultDir: args.vaultDir,
       pluginRoot,
+      managedAgents: args.managedAgents,
     });
 
     if (options.signal?.aborted) throw new UpdateError('INVALID_REQUEST');

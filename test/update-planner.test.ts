@@ -381,6 +381,61 @@ describe('pure vault update planning', () => {
     }]);
   });
 
+  test('explicit Codex-only legacy adoption marks AGENTS and never touches CLAUDE', () => {
+    const vault = makeVault();
+    const legacy = fs.readFileSync(path.join(
+      repositoryPluginRoot,
+      'templates/migration-history/0000/CLAUDE-template.md',
+    ), 'utf8').replaceAll('/me:', '$me:');
+    const projectRules = '\n## Project Rules\n\nKeep exactly.\n';
+    writeFile(vault, 'AGENTS.md', `${legacy}${projectRules}`, 0o600);
+    fs.mkdirSync(path.join(vault, 'CLAUDE.md'));
+
+    const plan = planVaultUpdate({
+      vaultDir: vault,
+      pluginRoot: repositoryPluginRoot,
+      managedAgents: ['codex'],
+    });
+
+    expect(plan.status).toBe('preview');
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.plannedPaths).not.toContain('CLAUDE.md');
+    expect(plan.warnings).toEqual([
+      'LEGACY_AGENT_SECTIONS_ADOPTED: AGENTS.md',
+    ]);
+    const agents = mutationFor(plan, 'AGENTS.md');
+    expect(agents?.kind === 'write-file'
+      && agents.desiredBytes.toString('utf8').endsWith(projectRules)).toBeTrue();
+    expect(agents?.kind === 'write-file'
+      && agents.desiredBytes.toString('utf8').match(/me:managed:start/g)?.length)
+      .toBe(8);
+    const config = mutationFor(plan, '.me/config.yaml');
+    expect(config?.kind === 'write-file'
+      && parseDocument(config.desiredBytes.toString('utf8'))
+        .toJS().managed_agents).toEqual(['codex']);
+  });
+
+  test('explicit legacy adoption still blocks partial or reordered owned sections', () => {
+    const vault = makeVault();
+    const partial = fs.readFileSync(path.join(
+      repositoryPluginRoot,
+      'templates/migration-history/0000/CLAUDE-template.md',
+    ), 'utf8').replace('## Commands', '## User Commands');
+    writeFile(vault, 'AGENTS.md', partial);
+
+    const plan = planVaultUpdate({
+      vaultDir: vault,
+      pluginRoot: repositoryPluginRoot,
+      managedAgents: ['codex'],
+    });
+
+    expect(plan.status).toBe('blocked');
+    expect(plan.conflicts).toEqual([{
+      path: 'AGENTS.md',
+      reason: 'MIGRATION_CONFLICT',
+    }]);
+  });
+
   test('replaces SCHEMA only from known historical bytes and preserves its mode', () => {
     const plugin = copyPlugin();
     fs.appendFileSync(

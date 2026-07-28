@@ -236,6 +236,49 @@ describe('managed asset ownership strategies', () => {
     }
   });
 
+  test('explicitly adopts one complete legacy section set and preserves outside bytes', () => {
+    const desired = fs.readFileSync(
+      path.join(pluginRoot, 'templates/AGENTS-template.md'),
+      'utf8',
+    );
+    const legacy = fs.readFileSync(
+      path.join(pluginRoot, 'templates/migration-history/0000/CLAUDE-template.md'),
+      'utf8',
+    )
+      .replaceAll('/me:', '$me:');
+    const nestedRule = [
+      '### Preserve Illustrations',
+      '',
+      'Keep this nested rule byte-for-byte.',
+      '',
+    ].join('\n');
+    const projectRules = '\n## Project Rules\n\nKeep this byte-for-byte.\n';
+    const withNestedRule = legacy.replace(
+      '\n## Search\n',
+      `\n${nestedRule}## Search\n`,
+    );
+
+    const adopted = mergeMeOwnedSections(
+      `${withNestedRule}${projectRules}`,
+      desired,
+      'adopt-legacy-sections',
+    );
+
+    expect(markerIds(adopted.content)).toEqual(markerIds(desired));
+    expect(adopted.adoptedLegacySections).toEqual(markerIds(desired));
+    expect(adopted.content.endsWith(projectRules)).toBeTrue();
+    expect(adopted.content).toContain(nestedRule);
+    expect(adopted.content.indexOf('<!-- me:managed:end after-creating-a-note -->'))
+      .toBeLessThan(adopted.content.indexOf('### Preserve Illustrations'));
+    expect(adopted.content).not.toContain('/me:');
+
+    expectConflict(() => mergeMeOwnedSections(
+      `${legacy.replace('## Commands', '## User Commands')}${projectRules}`,
+      desired,
+      'adopt-legacy-sections',
+    ));
+  });
+
   test('appends the complete marked template without changing existing AGENTS bytes', () => {
     const vault = makeVault();
     const userBytes = Buffer.from(
