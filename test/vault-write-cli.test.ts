@@ -445,6 +445,7 @@ describe('vault-write CLI JSON boundary', () => {
 
   test('SIGINT after a recognizable journal preserves it for manual recovery', async () => {
     const vault = makeVault();
+    const transactionDirectory = resolveVaultLayout(vault).transactionDir;
     const preloadDirectory = temporaryDirectory('me-vault-cli-sigint-');
     const preload = path.join(preloadDirectory, 'preload.ts');
     const afterJournalMarker = path.join(preloadDirectory, 'after-journal.marker');
@@ -452,15 +453,17 @@ describe('vault-write CLI JSON boundary', () => {
       "import { createRequire, syncBuiltinESMExports } from 'node:module';",
       'const require = createRequire(import.meta.url);',
       "const fs = require('node:fs') as typeof import('node:fs');",
-      'const original = fs.linkSync;',
-      'fs.linkSync = ((source, destination) => {',
-      "  if (String(destination).endsWith('.probe')) {",
+      'const original = fs.lstatSync;',
+      'fs.lstatSync = ((candidate, options) => {',
+      '  const result = original(candidate, options);',
+      "  if (String(candidate).endsWith('/fingerprint.json')",
+      `    && !fs.existsSync(${JSON.stringify(afterJournalMarker)})) {`,
       `    fs.writeFileSync(${JSON.stringify(afterJournalMarker)}, 'ready');`,
       '    const deadline = Date.now() + 10_000;',
       '    while (Date.now() < deadline) {}',
       '  }',
-      '  return original(source, destination);',
-      '}) as typeof fs.linkSync;',
+      '  return result;',
+      '}) as typeof fs.lstatSync;',
       'syncBuiltinESMExports();',
     ].join('\n'));
     const child = spawn(
@@ -473,7 +476,7 @@ describe('vault-write CLI JSON boundary', () => {
     let journalPath: string | undefined;
     try {
       await waitFor(() => {
-        const tmp = resolveVaultLayout(vault).transactionDir;
+        const tmp = transactionDirectory;
         if (!fs.existsSync(afterJournalMarker) || !fs.existsSync(tmp)) return false;
         for (const name of fs.readdirSync(tmp)) {
           const operation = name.match(
@@ -524,7 +527,7 @@ describe('vault-write CLI JSON boundary', () => {
     expect(fs.existsSync(journalPath!)).toBeTrue();
 
     const layout = resolveVaultLayout(vault);
-    const staleLock = path.join(layout.lockDir, 'vault-write.lock');
+    const staleLock = path.join(layout.lockDir, 'vault.lock');
     if (fs.existsSync(staleLock)) fs.unlinkSync(staleLock);
     const recovery = invoke(['write', '--vault-dir', vault], JSON.stringify(request()));
     const body = expectPublicFailure(recovery, 'INCOMPLETE_OPERATION');
@@ -548,16 +551,17 @@ describe('vault-write CLI JSON boundary', () => {
       "import { createRequire, syncBuiltinESMExports } from 'node:module';",
       'const require = createRequire(import.meta.url);',
       "const fs = require('node:fs') as typeof import('node:fs');",
-      'const original = fs.mkdirSync;',
-      'fs.mkdirSync = ((directory, options) => {',
-      '  const result = original(directory, options);',
-      "  if (/\\/vault-write-[0-9a-f-]+$/.test(String(directory))) {",
+      'const original = fs.lstatSync;',
+      'fs.lstatSync = ((candidate, options) => {',
+      '  const result = original(candidate, options);',
+      "  if (/\\/vault-write-[0-9a-f-]+$/.test(String(candidate))",
+      `    && !fs.existsSync(${JSON.stringify(beforeJournalMarker)})) {`,
       `    fs.writeFileSync(${JSON.stringify(beforeJournalMarker)}, 'ready');`,
       '    const deadline = Date.now() + 10_000;',
       '    while (Date.now() < deadline) {}',
       '  }',
       '  return result;',
-      '}) as typeof fs.mkdirSync;',
+      '}) as typeof fs.lstatSync;',
       'syncBuiltinESMExports();',
     ].join('\n'));
     const child = spawn(
@@ -595,7 +599,7 @@ describe('vault-write CLI JSON boundary', () => {
     expect(fs.existsSync(path.join(operationDirectory!, 'journal.json'))).toBeFalse();
 
     const layout = resolveVaultLayout(vault);
-    const staleLock = path.join(layout.lockDir, 'vault-write.lock');
+    const staleLock = path.join(layout.lockDir, 'vault.lock');
     if (fs.existsSync(staleLock)) fs.unlinkSync(staleLock);
     const recovery = invoke(['write', '--vault-dir', vault], JSON.stringify(request()));
     const body = expectPublicFailure(recovery, 'INCOMPLETE_OPERATION');

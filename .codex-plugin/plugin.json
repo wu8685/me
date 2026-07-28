@@ -31,6 +31,7 @@
     "websiteURL": "https://github.com/wu8685/me",
     "defaultPrompt": [
       "Initialize this workspace as a ME vault.",
+      "Use $me:update to preview and confirm forward-only ME vault migrations after upgrading the plugin.",
       "Ingest this URL into my knowledge base.",
       "Build a decision brief from my local evidence.",
       "Check wikilinks in this vault."

@@ -1,33 +1,49 @@
-# CLAUDE.md Smart Merge Rules
+# Agent Instruction Managed Merge Rules
 
-Used during version upgrade (Step 2b) when CLAUDE.md already exists.
+These Agent-neutral rules apply identically to workspace `CLAUDE.md` and
+`AGENTS.md`. ME ownership markers are the primary and durable ownership
+mechanism:
 
-## Template-owned sections (replace with latest)
+```html
+<!-- me:managed:start configuration -->
+## Configuration
+...
+<!-- me:managed:end configuration -->
+```
 
-These sections are maintained by the plugin — replace entirely with latest template content:
+Only content inside a complete, matching marker pair is plugin-owned. Preserve
+every byte outside ME managed markers. Duplicate, nested, mismatched, unknown,
+or incomplete markers are conflicts and must not be guessed through.
 
-- `# Knowledge Base` (intro paragraph and layer descriptions)
-- `## Configuration`
-- `## Layer Map` (the table)
-- `## Commands` (the command reference table)
-- `## Note Templates`
-- `## After Creating a Note`
-- `## Search`
-- `## Conventions`
+## Current managed section IDs
 
-## User-added sections (preserve)
+- `knowledge-base` — exact heading `# Knowledge Base`
+- `configuration` — exact heading `## Configuration`
+- `layer-map` — exact heading `## Layer Map`
+- `commands` — exact heading `## Commands`
+- `note-templates` — exact heading `## Note Templates`
+- `after-creating-a-note` — exact heading `## After Creating a Note`
+- `search` — exact heading `## Search`
+- `conventions` — exact heading `## Conventions`
 
-Any `##` or `###` headers that do NOT exist in the template are user-added. Preserve them at their current position relative to other sections.
+ATX headings inside fenced code blocks are opaque and never identify a
+section.
 
-## Merge algorithm
+## One-time legacy CLAUDE.md adoption
 
-1. Read current workspace CLAUDE.md
-2. Read latest `${CLAUDE_PLUGIN_ROOT}/templates/CLAUDE-template.md`
-3. For each section in the merged output:
-   - **Template-owned** → use latest template content
-   - **User-added** → preserve at original position
-   - **New in template** → insert at position from template
-   - **User content within template sections** → replaced (template sections are fully replaced)
-4. Write merged result to `{target}/CLAUDE.md`
+Version-zero setup emitted an unmarked `CLAUDE.md`. A migration may adopt the
+exact historical template from
+`templates/migration-history/0000/CLAUDE-template.md` once. The headings above
+are the only recognized legacy ME headings. Duplicates, partial matches,
+modified legacy sections, or ambiguous structure are migration conflicts.
+There is no historical `AGENTS.md` template.
 
-The merge is performed by Claude's reasoning — read both files and produce the merged output following these rules.
+## Unrelated existing Agent instructions
+
+When an existing unmarked `CLAUDE.md` or `AGENTS.md` has no legacy ME-owned
+heading collision, preserve its existing bytes and append the complete current
+marked template. Never reinterpret unrelated project instructions as
+plugin-owned content.
+
+An absent Agent file may be created from its current template. Repeating
+create, legacy adoption, safe append, or marked replacement must be a no-op.

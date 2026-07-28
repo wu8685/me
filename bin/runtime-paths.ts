@@ -19,6 +19,7 @@ export interface RuntimeLayout {
   runtimeRoot: string;
   lockDir: string;
   transactionDir: string;
+  retirementDir: string;
   inboxDir: string;
   ingestDir: string;
   ingestLockDir: string;
@@ -141,6 +142,7 @@ export function resolveRuntimeLayout(
     runtimeRoot,
     lockDir: path.join(runtimeRoot, 'locks'),
     transactionDir: path.join(runtimeRoot, 'transactions'),
+    retirementDir: path.join(runtimeRoot, 'retired'),
     inboxDir: path.join(runtimeRoot, 'inbox'),
     ingestDir: path.join(runtimeRoot, 'ingest'),
     ingestLockDir: path.join(runtimeRoot, 'ingest', 'locks'),

@@ -137,9 +137,9 @@ describe('resolveVaultLayout containment matrices', () => {
     const layout = resolveVaultLayout(vault);
     bootstrapRuntimeDirectories(layout, [layout.transactionDir, layout.lockDir]);
     fs.mkdirSync(path.join(layout.transactionDir, 'vault-write-op/originals'), { recursive: true });
-    fs.writeFileSync(path.join(layout.lockDir, 'vault-write.lock'), 'lock');
+    fs.writeFileSync(path.join(layout.lockDir, 'vault.lock'), 'lock');
     assertSafeRuntimePath(layout, path.join(layout.transactionDir, 'vault-write-op/originals'));
-    assertSafeRuntimePath(layout, path.join(layout.lockDir, 'vault-write.lock'));
+    assertSafeRuntimePath(layout, path.join(layout.lockDir, 'vault.lock'));
     expect(path.relative(layout.transactionDir, layout.lockDir).startsWith('..')).toBeTrue();
     expect(fs.existsSync(path.join(vault, '.me/tmp'))).toBeFalse();
     expect(fs.existsSync(path.join(vault, '.me/locks'))).toBeFalse();

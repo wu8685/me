@@ -27,7 +27,7 @@ codex plugin add me@me-marketplace
 
 Codex 支持 `codex plugin marketplace add <SOURCE>` 和 `codex plugin add me@me-marketplace`。本仓库提供 Codex 原生 marketplace：`.agents/plugins/marketplace.json`，其中 `source.path: "./"` 指向仓库根目录的插件本体；插件能力由 `.codex-plugin/plugin.json` 暴露，`skills: "./skills/"` 会自动加载包括 `me:decision-brief` 在内的 `me:*` skills。
 
-本指南后续命令默认写成 Claude Code 的 `/me:*` slash command。Codex 中对应的 skill 名称是 `me:*`：运行 `/skills` 选择 `me:setup`，或在 prompt 中显式写 `$me:setup`、`$me:ingest https://example.com/article`。
+本指南后续命令默认写成 Claude Code 的 `/me:*` slash command。Codex 中对应的 skill 名称是 `me:*`：运行 `/skills` 选择，或在 prompt 中显式写 `$me:setup`、`$me:update`、`$me:ingest https://example.com/article`。
 
 ## 初始化工作空间
 
@@ -43,17 +43,59 @@ Codex 等价调用：`$me:setup`。
 me vault initialized.
 
 Created:
-  .me/config.yaml     (layer mapping: raw -> raw, practices -> practices, cognition -> cognition)
+  .me/config.yaml     (vault_schema_version: 1; layer mapping: raw -> raw, practices -> practices, cognition -> cognition)
   raw/                 (+ .gitkeep)
   practices/           (+ .gitkeep)
   cognition/           (+ .gitkeep)
   SCHEMA.md
   CLAUDE.md
+  AGENTS.md
   .gitignore           (added .obsidian/ entry)
 
 Next steps:
   Run `/me:ingest <url>` to add your first research note.
 ```
+
+`setup` 只初始化新 vault。若 `.me/config.yaml` 已存在，它不会写 vault 或
+runtime，只会提示改用 `/me:update` 或 `$me:update`。
+fresh setup 会在首次写入前对 config、layer、SCHEMA、双 Agent markers、
+symlink/type 和 `.gitignore` 做完整只读 preflight；任一目标冲突则保持
+vault/runtime 不变。所有目标成功后才最后发布 schema v1 config。
+
+## 升级插件与 vault
+
+升级插件代码不会自动修改用户 vault。这是两个独立步骤：
+
+```bash
+codex plugin marketplace upgrade me-marketplace
+# then, in the vault
+$me:update
+```
+
+Claude Code 更新插件后在 vault 中运行 `/me:update`。两端语义完全相同：
+
+1. 先做零写入 preview，展示有序 migrations、目标路径、warnings 和 exact
+   diffs；
+2. 用户对这一次展示的 plan 做一次明确确认；
+3. Agent 只把该 preview 返回的 `planDigest` 交给 `apply`。
+
+vault 通过 `.me/config.yaml` 的 `vault_schema_version` 记录 managed schema。
+迁移是 forward-only；vault 比当前插件更新时会停止，不能降级。若确认后
+输入已变化，`apply` 返回 `STALE_PREVIEW` 且不使用旧授权，必须重新 preview
+并再次确认。
+
+发生未完成事务或 `recovery_required` 时，停止更新并按结构化结果列出的
+`preservedPaths` 与 `recoveryActions` 检查恢复材料。这些路径只会是 vault
+相对路径或 `<ME_RUNTIME>/...` 显示路径，不暴露本机绝对路径。后续 preview
+也会以零写入方式先检查 recovery residue；未处理前会继续返回
+`recovery_required`，不会误报 `up_to_date`。不要直接编辑 migration targets
+或 recovery state。只有 `committed` 表示迁移成功；ME 不会 stage、commit
+或 push 用户的 vault。
+
+preview 遇到格式和 ownership record 均有效的活动锁时返回
+`UPDATE_IN_PROGRESS`，不把它误报为 recovery；遇到 foreign、损坏或无法稳定
+识别的 lock entry 时返回 `RECOVERY_REQUIRED`，并只公开
+`<ME_RUNTIME>/locks/vault.lock`。
 
 ## 同步与本机运行时
 
@@ -374,9 +416,11 @@ open /path/to/your-workspace
 
 创建 `.me/config.yaml`：
 ```yaml
-raw: 调研
-practices: 实践
-cognition: 认知
+vault_schema_version: 1
+layers:
+  raw: 调研
+  practices: 实践
+  cognition: 认知
 ```
 
 ## 常见问题
