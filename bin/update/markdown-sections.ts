@@ -7,6 +7,7 @@ export interface ManagedSectionMergeResult {
 
 export type UnmarkedManagedAssetPolicy =
   | 'adopt-known-legacy'
+  | 'adopt-legacy-sections'
   | 'append-marked-block'
   | 'conflict';
 
@@ -33,6 +34,7 @@ interface LegacySection {
   id: string;
   start: number;
   end: number;
+  preservedStart?: number;
 }
 
 const OWNED_HEADINGS = Object.freeze([
@@ -198,6 +200,12 @@ function legacySections(source: string): LegacySection[] {
       }
     }
     sections.push({ id: owned.id, start: heading.start, end });
+    const nested = headings.find(candidate => (
+      candidate.start > heading.start
+      && candidate.start < end
+      && candidate.level > owned.level
+    ));
+    if (nested) sections.at(-1)!.preservedStart = nested.start;
   }
   return sections;
 }
@@ -205,6 +213,34 @@ function legacySections(source: string): LegacySection[] {
 function appendMarkedTemplate(current: string, desiredTemplate: string): string {
   if (!current) return desiredTemplate;
   return `${current}${current.endsWith('\n') ? '\n' : '\n\n'}${desiredTemplate}`;
+}
+
+function adoptLegacySections(
+  current: string,
+  legacy: readonly LegacySection[],
+  desiredBlocks: readonly ManagedBlock[],
+): string {
+  const desiredIds = desiredBlocks.map(block => block.id);
+  if (
+    legacy.length !== desiredIds.length
+    || legacy.some((section, index) => section.id !== desiredIds[index])
+  ) {
+    conflict();
+  }
+
+  let result = '';
+  let offset = 0;
+  for (let index = 0; index < legacy.length; index += 1) {
+    const section = legacy[index];
+    result += current.slice(offset, section.start);
+    result += desiredBlocks[index].content;
+    if (section.preservedStart !== undefined) {
+      if (!result.endsWith('\n')) result += '\n';
+      result += current.slice(section.preservedStart, section.end);
+    }
+    offset = section.end;
+  }
+  return result + current.slice(offset);
 }
 
 function mergeMarkedBlocks(
@@ -283,6 +319,12 @@ export function mergeMeOwnedSections(
 
   if (onUnmarked === 'conflict') conflict();
   const legacy = legacySections(current);
+  if (onUnmarked === 'adopt-legacy-sections') {
+    return {
+      content: adoptLegacySections(current, legacy, desiredBlocks),
+      adoptedLegacySections: legacy.map(section => section.id),
+    };
+  }
   if (onUnmarked === 'append-marked-block') {
     if (legacy.length > 0) conflict();
     return {

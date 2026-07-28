@@ -232,6 +232,46 @@ describe('me-update preview CLI', () => {
     expect(exitCodeForUpdateResult(result)).toBe(0);
   });
 
+  test('binds an explicit managed-Agent selection into preview and apply', () => {
+    const vault = makeVault();
+    const legacy = fs.readFileSync(path.join(
+      pluginRoot,
+      'templates/migration-history/0000/CLAUDE-template.md',
+    ), 'utf8').replaceAll('/me:', '$me:');
+    fs.writeFileSync(
+      path.join(vault, 'AGENTS.md'),
+      `${legacy}\n## Project Rules\n\nKeep.\n`,
+    );
+    fs.mkdirSync(path.join(vault, 'CLAUDE.md'));
+
+    const preview = runUpdateCli(
+      ['preview', '--vault-dir', vault, '--managed-agents', 'codex'],
+      options(),
+    );
+    expect(preview.status).toBe('preview');
+    expect(preview.plannedPaths).not.toContain('CLAUDE.md');
+    expect(preview.warnings).toEqual([
+      'LEGACY_AGENT_SECTIONS_ADOPTED: AGENTS.md',
+    ]);
+
+    const applied = runUpdateCli(
+      [
+        'apply',
+        '--vault-dir',
+        vault,
+        '--expected-plan-digest',
+        preview.planDigest!,
+        '--managed-agents',
+        'codex',
+      ],
+      options(),
+    );
+    expect(applied.status).toBe('committed');
+    expect(fs.statSync(path.join(vault, 'CLAUDE.md')).isDirectory()).toBeTrue();
+    expect(fs.readFileSync(path.join(vault, '.me/config.yaml'), 'utf8'))
+      .toContain('managed_agents:');
+  });
+
   test('returns exact up_to_date result and keeps the operation id per invocation', () => {
     const vault = makeVault('vault_schema_version: 1\n');
     let calls = 0;
@@ -368,6 +408,18 @@ describe('me-update preview CLI', () => {
       ['preview', '--vault', vault],
       ['unknown', '--vault-dir', vault],
       ['preview', '--vault-dir', vault, 'trailing'],
+      ['preview', '--vault-dir', vault, '--managed-agents', ''],
+      ['preview', '--vault-dir', vault, '--managed-agents', 'both'],
+      ['preview', '--vault-dir', vault, '--managed-agents', 'claude,codex'],
+      [
+        'apply',
+        '--vault-dir',
+        vault,
+        '--expected-plan-digest',
+        digest,
+        '--managed-agents',
+        'codex,codex',
+      ],
     ];
 
     for (const argv of invalid) {

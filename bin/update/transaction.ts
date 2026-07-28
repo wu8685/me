@@ -40,7 +40,10 @@ import {
   type UpdatePlan,
   type UpdateResultV1,
 } from './contracts.ts';
-import { planVaultUpdate } from './planner.ts';
+import {
+  planVaultUpdate,
+  type ManagedAgent,
+} from './planner.ts';
 
 const CONFIG_PATH = '.me/config.yaml';
 const DIGEST = /^[a-f0-9]{64}$/;
@@ -105,6 +108,7 @@ interface UpdateJournalV1 {
 
 export interface UpdateTransactionOptions {
   pluginRoot: string;
+  managedAgents?: readonly ManagedAgent[];
   environment?: NodeJS.ProcessEnv;
   hooks?: {
     beforeMutation?(
@@ -1953,6 +1957,7 @@ export function executeVaultUpdate(
     plan = planVaultUpdate({
       vaultDir: layout.canonicalVault,
       pluginRoot: options.pluginRoot,
+      managedAgents: options.managedAgents,
     });
     if (plan.status === 'up_to_date') {
       completed = true;

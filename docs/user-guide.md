@@ -84,6 +84,24 @@ vault 通过 `.me/config.yaml` 的 `vault_schema_version` 记录 managed schema�
 输入已变化，`apply` 返回 `STALE_PREVIEW` 且不使用旧授权，必须重新 preview
 并再次确认。
 
+如果旧 vault 的 Agent 文件含有未标记的历史 ME 章节，先显式选择由 ME 管理
+的 Agent surface。例如仅管理 Codex：
+
+```bash
+$me:update --managed-agents codex
+```
+
+底层 preview/apply runner 会把同一选择绑定进 plan digest，并在确认后把它
+持久化为：
+
+```yaml
+managed_agents:
+  - codex
+```
+
+只有完整、唯一、顺序正确的旧 ME 章节可以被接管。额外的嵌套项目章节保留在
+managed marker 外；未选择的 `CLAUDE.md` 不会被读取、创建或修改。
+
 发生未完成事务或 `recovery_required` 时，停止更新并按结构化结果列出的
 `preservedPaths` 与 `recoveryActions` 检查恢复材料。这些路径只会是 vault
 相对路径或 `<ME_RUNTIME>/...` 显示路径，不暴露本机绝对路径。后续 preview

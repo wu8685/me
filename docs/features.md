@@ -118,6 +118,13 @@ paths、warnings 与 exact diffs，再询问一次明确确认。确认只绑定
 事务失败时报告 rollback 或 recovery actions；ME 不直接编辑恢复材料，也
 不会 stage 或 commit 用户 vault。
 
+旧 vault 的 `AGENTS.md` / `CLAUDE.md` 如果混合了未标记的 ME 标准章节与
+项目规则，默认继续 fail closed。用户可以显式选择
+`--managed-agents codex|claude|codex,claude` 进入 legacy adoption：
+完整且顺序确定的旧 ME 章节会被当前 managed blocks 接管，额外的嵌套项目
+章节移到 marker 外原样保留；选择会写入 `.me/config.yaml` 的
+`managed_agents`。未选择的 Agent surface 不读取、不创建、不修改。
+
 ## /me:ingest - 摄入文章、PDF 与公开视频
 
 **功能：** 用一个入口把 HTML、PDF、X 文章或视频、Bilibili 视频，以及 Source Bundle 转换成可检索的 Markdown 笔记。正文图片、PDF 图表和视频讲义素材会随笔记本地化；写入时以整篇材料为单位完成，避免留下半篇笔记或散落素材。

@@ -167,6 +167,10 @@ test_update_release_contract() {
   assert_file_contains "$update_skill" 'Never edit migration targets directly' || return 1
   assert_file_contains "$update_skill" "Preview does not authorize" || return 1
   assert_file_contains "$update_skill" 'STALE_PREVIEW' || return 1
+  assert_file_contains "$update_skill" '\-\-managed-agents codex' || return 1
+  assert_file_contains "$update_skill" 'LEGACY_AGENT_SECTIONS_ADOPTED' || return 1
+  assert_file_contains "$update_skill" 'Unselected' || return 1
+  assert_file_contains "$update_skill" 'must not be inspected, created, or changed' || return 1
   assert_file_contains "$setup_skill" 'vault_schema_version: 1' || return 1
   assert_file_contains "$setup_skill" 'Run \$me:update (Codex) or /me:update (Claude Code)' || return 1
   assert_file_contains "$setup_skill" 'AGENTS-template.md' || return 1
@@ -605,8 +609,8 @@ test_decision_brief_discovery_and_release_version() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.6.2" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected current release version 1.6.2"
+  [ "$(echo "$versions" | head -n 1)" = "1.6.3" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected current release version 1.6.3"
     return 1
   }
 }
@@ -779,8 +783,8 @@ test_ingest_docs_rich_media() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.6.2" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.6.2"
+  [ "$(echo "$versions" | head -n 1)" = "1.6.3" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.6.3"
     return 1
   }
 

@@ -24,6 +24,19 @@ files, push, or otherwise commit the user's vault.
 Use cwd when no path is supplied. Otherwise accept one explicit vault path.
 Reject multiple paths. The target must contain `.me/config.yaml`.
 
+For a legacy schema-0 vault whose unmarked Agent files contain the complete
+ordered ME heading set, accept one explicit managed-surface selection:
+
+```text
+--managed-agents codex
+--managed-agents claude
+--managed-agents codex,claude
+```
+
+This is an ownership-adoption request, not a generic conflict override. It
+persists the selection as `managed_agents` in `.me/config.yaml`. Unselected
+Agent files must not be inspected, created, or changed.
+
 Resolve `PLUGIN_ROOT` without writing:
 
 1. In Claude Code, if `CLAUDE_PLUGIN_ROOT` is non-empty, canonicalize it and
@@ -47,6 +60,21 @@ Run:
 ```bash
 bun run "<PLUGIN_ROOT>/bin/update.ts" preview --vault-dir "<target>"
 ```
+
+For an explicitly selected legacy adoption, append the exact selection:
+
+```bash
+bun run "<PLUGIN_ROOT>/bin/update.ts" preview \
+  --vault-dir "<target>" \
+  --managed-agents codex
+```
+
+Adoption requires one complete, unique, ordered legacy ME section set. The
+runner replaces direct ME-owned section bodies with current marked blocks.
+Additional nested headings and their content are preserved outside the new
+managed block. Partial, duplicated, reordered, fenced, or ambiguous legacy
+sections remain blocked. Surface the `LEGACY_AGENT_SECTIONS_ADOPTED` warning
+and its exact diff; never infer adoption without the explicit option.
 
 Parse the single structured JSON result.
 
@@ -88,6 +116,15 @@ After an affirmative response, pass the exact digest from Step 2:
 bun run "<PLUGIN_ROOT>/bin/update.ts" apply \
   --vault-dir "<target>" \
   --expected-plan-digest "<planDigest>"
+```
+
+If preview used `--managed-agents`, apply must pass the identical selection:
+
+```bash
+bun run "<PLUGIN_ROOT>/bin/update.ts" apply \
+  --vault-dir "<target>" \
+  --expected-plan-digest "<planDigest>" \
+  --managed-agents codex
 ```
 
 Never substitute a digest from another preview or conversation.

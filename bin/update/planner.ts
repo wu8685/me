@@ -419,6 +419,7 @@ function validateManagedAsset(
     || !['create', 'skip'].includes(record.onAbsent)
     || ![
       'adopt-known-legacy',
+      'adopt-legacy-sections',
       'append-marked-block',
       'conflict',
     ].includes(record.onUnmarked)
@@ -676,6 +677,8 @@ function renderMigrationStages(options: {
   blockedPaths: Set<string>;
   materials: DigestMaterial[];
   pathMutations: StagedPathMutation[];
+  managedAgents?: readonly ManagedAgent[];
+  warnings: Set<string>;
 }): void {
   const structuralPaths = new Set<string>();
   const fileIntentPaths = new Set<string>();
@@ -708,8 +711,18 @@ function renderMigrationStages(options: {
   for (let stage = 0; stage < options.resolved.length; stage += 1) {
     const { migration, intent } = options.resolved[stage];
     const stageTargets = new Set<string>();
+    const configEdits = options.managedAgents && migration.fromVersion === 0
+      ? [
+          ...intent.configEdits,
+          {
+            kind: 'set' as const,
+            path: ['managed_agents'],
+            value: [...options.managedAgents],
+          },
+        ]
+      : intent.configEdits;
 
-    if (intent.configEdits.length > 0) {
+    if (configEdits.length > 0) {
       stageTargets.add(CONFIG_PATH);
       const config = loadVirtualFile(
         options.files,
@@ -721,7 +734,7 @@ function renderMigrationStages(options: {
       const source = virtualFingerprint(config);
       let rendered;
       try {
-        rendered = renderConfigBytes(config.bytes, intent.configEdits);
+        rendered = renderConfigBytes(config.bytes, configEdits);
       } catch (error) {
         if (
           error instanceof UpdateError
@@ -761,7 +774,21 @@ function renderMigrationStages(options: {
       ordinal < intent.managedAssets.length;
       ordinal += 1
     ) {
-      const managed = intent.managedAssets[ordinal];
+      const declaredManaged = intent.managedAssets[ordinal];
+      const agent = managedAgentForPath(declaredManaged.vaultRelativePath);
+      if (
+        agent
+        && options.managedAgents
+        && !options.managedAgents.includes(agent)
+      ) {
+        continue;
+      }
+      const managed = agent && options.managedAgents
+        ? {
+            ...declaredManaged,
+            onUnmarked: 'adopt-legacy-sections' as const,
+          }
+        : declaredManaged;
       if (stageTargets.has(managed.vaultRelativePath)) invalidRegistry();
       stageTargets.add(managed.vaultRelativePath);
       claimFileIntentPath(managed.vaultRelativePath);
@@ -839,6 +866,11 @@ function renderMigrationStages(options: {
         outcome: rendered ? 'changed' : 'unchanged',
       });
       if (rendered) {
+        if (rendered.adoptedLegacySections.length > 0) {
+          options.warnings.add(
+            `LEGACY_AGENT_SECTIONS_ADOPTED: ${managed.vaultRelativePath}`,
+          );
+        }
         file.exists = true;
         file.bytes = Buffer.from(Uint8Array.from(rendered.desiredBytes));
         file.mode = rendered.desiredMode;
@@ -991,6 +1023,33 @@ function renderMigrationStages(options: {
   }
 }
 
+export type ManagedAgent = 'codex' | 'claude';
+
+function managedAgentForPath(relativePath: string): ManagedAgent | undefined {
+  if (relativePath === 'AGENTS.md') return 'codex';
+  if (relativePath === 'CLAUDE.md') return 'claude';
+  return undefined;
+}
+
+function validateManagedAgents(
+  value: readonly ManagedAgent[] | undefined,
+): readonly ManagedAgent[] | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !Array.isArray(value)
+    || value.length === 0
+    || value.length > 2
+    || value.some((agent, index) => (
+      !Object.hasOwn(value, index)
+      || !['codex', 'claude'].includes(agent)
+      || (index > 0 && value[index - 1] >= agent)
+    ))
+  ) {
+    throw new UpdateError('INVALID_REQUEST');
+  }
+  return value;
+}
+
 function mutationDigestRecord(mutation: PlannedMutation): unknown {
   if (mutation.kind === 'write-file') {
     return {
@@ -1139,10 +1198,12 @@ export function planVaultUpdate(options: {
   vaultDir: string;
   pluginRoot: string;
   registry?: readonly VaultMigration[];
+  managedAgents?: readonly ManagedAgent[];
 }): UpdatePlan {
   const vaultDir = canonicalDirectory(options.vaultDir);
   const pluginRoot = canonicalDirectory(options.pluginRoot);
   const registry = options.registry ?? MIGRATION_REGISTRY;
+  const managedAgents = validateManagedAgents(options.managedAgents);
   const targetVersion = options.registry
     ? registry.length
     : CURRENT_VAULT_SCHEMA_VERSION;
@@ -1182,6 +1243,7 @@ export function planVaultUpdate(options: {
   const blockedPaths = new Set<string>();
   const materials: DigestMaterial[] = [];
   const pathMutations: StagedPathMutation[] = [];
+  const warnings = new Set<string>();
 
   if (resolved.length === 0) {
     materials.push({
@@ -1203,6 +1265,8 @@ export function planVaultUpdate(options: {
       blockedPaths,
       materials,
       pathMutations,
+      managedAgents,
+      warnings,
     });
   }
   assertStableInputs(
@@ -1267,6 +1331,7 @@ export function planVaultUpdate(options: {
     materials,
     mutations: mutations.map(mutationDigestRecord),
     conflicts,
+    managedAgents: managedAgents ?? null,
   }));
 
   return {
@@ -1284,7 +1349,7 @@ export function planVaultUpdate(options: {
     mutations,
     plannedPaths,
     diffs,
-    warnings: [],
+    warnings: [...warnings].sort(codeUnitCompare),
     conflicts,
     planDigest,
   };
