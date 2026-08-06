@@ -5420,6 +5420,1108 @@ test_events_query_skips_malformed() {
   fi
 }
 
+# ── me:doctor (Issue #9) ────────────────────────────────────────────
+
+doctor_setup_vault() {
+  mkdir -p "$MOCK_VAULT/.me" "$MOCK_VAULT/raw" "$MOCK_VAULT/practices" "$MOCK_VAULT/cognition"
+  cat > "$MOCK_VAULT/.me/config.yaml" <<'EOF'
+layers:
+  raw: raw
+  practices: practices
+  cognition: cognition
+EOF
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+  cp "$PLUGIN_ROOT/templates/CLAUDE-template.md" "$MOCK_VAULT/CLAUDE.md"
+}
+
+doctor_run() {
+  (cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/doctor.ts" --vault-dir "$MOCK_VAULT" "$@")
+}
+
+doctor_assert_finding() {
+  local out="$1" code="$2"
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (!r.findings.some(f => f.code === process.argv[2])) {
+      console.error("missing finding " + process.argv[2]);
+      process.exit(1);
+    }
+  ' "$out" "$code" || return 1
+}
+
+doctor_assert_no_finding() {
+  local out="$1" code="$2"
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.findings.some(f => f.code === process.argv[2])) process.exit(1);
+  ' "$out" "$code" || return 1
+}
+
+test_doctor_skill_and_cli_exist() {
+  assert_file_exists "$PLUGIN_ROOT/skills/doctor/SKILL.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/skills/doctor/references/diagnostic-contract-v1.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/doctor.ts" || return 1
+  if [ ! -x "$PLUGIN_ROOT/bin/doctor.ts" ]; then
+    echo -e "    ${RED}FAIL${NC}: doctor.ts entrypoint is not executable"
+    return 1
+  fi
+  node -e '
+    const p=require(process.argv[1]);
+    if (p.bin["doctor"] !== "bin/doctor.ts") process.exit(1)
+  ' "$PLUGIN_ROOT/package.json" || return 1
+}
+
+test_doctor_invalid_arguments() {
+  local out status
+  set +e
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/doctor.ts" 2>&1)
+  status=$?
+  set -e
+  if [ "$status" -ne 2 ]; then
+    echo -e "    ${RED}FAIL${NC}: expected exit 2, got $status"
+    return 1
+  fi
+  echo "$out" | grep -q "INVALID_ARGUMENTS" || {
+    echo -e "    ${RED}FAIL${NC}: expected INVALID_ARGUMENTS error"
+    return 1
+  }
+}
+
+test_doctor_vault_not_found() {
+  local out missing
+  missing="$MOCK_VAULT/nonexistent-vault"
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/doctor.ts" --vault-dir "$missing")
+  doctor_assert_finding "$out" VAULT_NOT_FOUND || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.roots.vault.resolved !== false) process.exit(1);
+    if (r.findings.some(f => f.code === "VAULT_UNSAFE")) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_doctor_contract_fixture() {
+  assert_file_exists "$PLUGIN_ROOT/test/fixtures/doctor/report-healthy-v1.json" || return 1
+  node -e '
+    const r = require(process.argv[1]);
+    const requiredTop = ["version","state","plugin","roots","versions","config","schema","agents","managedSections","runtime","findings"];
+    for (const key of requiredTop) {
+      if (!(key in r)) { console.error("missing top-level key " + key); process.exit(1); }
+    }
+    for (const key of Object.keys(r)) {
+      if (!requiredTop.includes(key)) { console.error("unexpected top-level key " + key); process.exit(1); }
+    }
+    if (r.version !== 1) process.exit(1);
+    if (r.state !== "healthy") process.exit(1);
+    // plugin shape
+    const p = r.plugin;
+    if (typeof p.name !== "string" || typeof p.root !== "string" || typeof p.version !== "string") process.exit(1);
+    if (!["checkout","installed"].includes(p.source)) process.exit(1);
+    if (typeof p.installedVersion !== "string" || typeof p.installedMismatch !== "boolean") process.exit(1);
+    // roots shape
+    if (typeof r.roots.vault.resolved !== "boolean") process.exit(1);
+    if (typeof r.roots.vault.lexical !== "string" || typeof r.roots.vault.canonical !== "string") process.exit(1);
+    if (typeof r.roots.runtime.root !== "string" || typeof r.roots.runtime.exists !== "boolean") process.exit(1);
+    // versions shape
+    for (const key of ["package","codexPlugin","claudePlugin","claudeMarketplace","codexMarketplace"]) {
+      if (!(key in r.versions)) process.exit(1);
+    }
+    // config shape
+    if (typeof r.config.present !== "boolean" || typeof r.config.valid !== "boolean") process.exit(1);
+    if (r.config.parseError !== null && typeof r.config.parseError !== "string") process.exit(1);
+    if (typeof r.config.layers.raw !== "string" || typeof r.config.layers.practices !== "string" || typeof r.config.layers.cognition !== "string") process.exit(1);
+    // schema shape
+    if (typeof r.schema.present !== "boolean" || typeof r.schema.state !== "string") process.exit(1);
+    if (!["current","edited","future","malformed","missing"].includes(r.schema.state)) process.exit(1);
+    if (typeof r.schema.path !== "string" || typeof r.schema.sha256 !== "string") process.exit(1);
+    // agents shape
+    if (typeof r.agents.claude !== "boolean" || typeof r.agents.codex !== "boolean") process.exit(1);
+    if (!["dual","claude-only","codex-only","none"].includes(r.agents.mode)) process.exit(1);
+    // managedSections shape
+    if (typeof r.managedSections.source !== "string" || typeof r.managedSections.reordered !== "boolean") process.exit(1);
+    if (!Array.isArray(r.managedSections.sections) || r.managedSections.sections.length === 0) process.exit(1);
+    for (const s of r.managedSections.sections) {
+      if (typeof s.heading !== "string" || typeof s.level !== "number" || typeof s.state !== "string") process.exit(1);
+    }
+    // runtime shape
+    if (typeof r.runtime.exists !== "boolean") process.exit(1);
+    if (!Array.isArray(r.runtime.locks) || !Array.isArray(r.runtime.recoveries) || !Array.isArray(r.runtime.legacy) || !Array.isArray(r.runtime.ingestPending)) process.exit(1);
+    // findings shape
+    if (!Array.isArray(r.findings) || r.findings.length === 0) process.exit(1);
+    for (const f of r.findings) {
+      if (typeof f.code !== "string" || typeof f.severity !== "string" || typeof f.category !== "string") process.exit(1);
+      if (typeof f.message !== "string" || typeof f.recommendedAction !== "string") process.exit(1);
+    }
+  ' "$PLUGIN_ROOT/test/fixtures/doctor/report-healthy-v1.json" || return 1
+}
+
+test_doctor_no_write_healthy() {
+  local v="$MOCK_VAULT" out before after runtime_root
+  doctor_setup_vault
+  runtime_root=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/runtime.ts" path --vault-dir "$v" \
+    | bun -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));process.stdout.write(d.runtimeRoot)")
+  before=$(cd "$v" && find . -type f | sort | xargs shasum 2>/dev/null)
+  out=$(doctor_run)
+  after=$(cd "$v" && find . -type f | sort | xargs shasum 2>/dev/null)
+  if [ "$before" != "$after" ]; then
+    echo -e "    ${RED}FAIL${NC}: vault changed by doctor"
+    return 1
+  fi
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.version !== 1) process.exit(1);
+    if (r.state !== "healthy") { console.error(JSON.stringify(r.findings)); process.exit(1); }
+    if (!r.plugin.version) process.exit(1);
+    if (!r.roots.vault.resolved) process.exit(1);
+    if (r.roots.runtime.exists !== false) process.exit(1);
+  ' "$out" || return 1
+  if [ -e "$runtime_root" ]; then
+    echo -e "    ${RED}FAIL${NC}: doctor created this vault's runtime directories"
+    return 1
+  fi
+}
+
+test_doctor_config_states() {
+  local out
+  doctor_setup_vault
+  out=$(doctor_run)
+  doctor_assert_finding "$out" CONFIG_VALID || return 1
+
+  printf 'layers:\n  raw: [unterminated\n' > "$MOCK_VAULT/.me/config.yaml"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" CONFIG_MALFORMED || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.config.valid) process.exit(1);
+    if (r.config.present !== true) process.exit(1);
+  ' "$out" || return 1
+
+  # Configured layer directory missing while config itself is valid.
+  printf 'layers:\n  raw: raw\n  practices: practices\n  cognition: no-such-cognition\n' \
+    > "$MOCK_VAULT/.me/config.yaml"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" LAYER_DIR_MISSING || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.config.valid !== true) process.exit(1);
+    const hit = r.findings.find(f => f.code === "LAYER_DIR_MISSING");
+    if (!hit || hit.severity !== "warning") process.exit(1);
+  ' "$out" || return 1
+
+  rm -f "$MOCK_VAULT/.me/config.yaml"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" CONFIG_MISSING || return 1
+}
+
+test_doctor_schema_states() {
+  local out
+  doctor_setup_vault
+  out=$(doctor_run)
+  doctor_assert_finding "$out" SCHEMA_CURRENT || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.schema.state !== "current") process.exit(1);
+  ' "$out" || return 1
+
+  # Edited current schema: structurally valid but no future revision marker.
+  sed 's/# me Frontmatter Schema/# me Frontmatter Schema (customized)/' \
+    "$PLUGIN_ROOT/templates/SCHEMA.md" > "$MOCK_VAULT/SCHEMA.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" SCHEMA_EDITED || return 1
+  doctor_assert_no_finding "$out" SCHEMA_FUTURE || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.schema.state !== "edited") process.exit(1);
+    if (r.state !== "behind") process.exit(1);
+  ' "$out" || return 1
+
+  # Future schema: deterministic higher profile revision marker.
+  sed 's/# me Frontmatter Schema/# me Frontmatter Schema me-schema-v2/' \
+    "$PLUGIN_ROOT/templates/SCHEMA.md" > "$MOCK_VAULT/SCHEMA.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" SCHEMA_FUTURE || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.schema.state !== "future") process.exit(1);
+    if (r.state !== "future-schema") process.exit(1);
+  ' "$out" || return 1
+
+  echo "garbage not a schema" > "$MOCK_VAULT/SCHEMA.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" SCHEMA_MALFORMED || return 1
+
+  rm -f "$MOCK_VAULT/SCHEMA.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" SCHEMA_MISSING || return 1
+}
+
+test_doctor_managed_sections() {
+  local out
+  doctor_setup_vault
+  out=$(doctor_run)
+  doctor_assert_no_finding "$out" MANAGED_SECTION_MISSING || return 1
+
+  sed '/^## Conventions$/,$d' "$PLUGIN_ROOT/templates/CLAUDE-template.md" > "$MOCK_VAULT/CLAUDE.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" MANAGED_SECTION_MISSING || return 1
+
+  sed 's/^## Configuration$/## Configuration\n## Configuration/' \
+    "$PLUGIN_ROOT/templates/CLAUDE-template.md" > "$MOCK_VAULT/CLAUDE.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" MANAGED_SECTION_DUPLICATED || return 1
+
+  node -e '
+    const fs = require("fs");
+    const t = fs.readFileSync(process.argv[1], "utf8");
+    const sections = t.split(/(?=^## )/m);
+    const kb = sections.shift();
+    const commands = sections.find(s => s.startsWith("## Commands"));
+    const rest = sections.filter(s => !s.startsWith("## Commands"));
+    fs.writeFileSync(process.argv[2], kb + commands + rest.join(""));
+  ' "$PLUGIN_ROOT/templates/CLAUDE-template.md" "$MOCK_VAULT/CLAUDE.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" MANAGED_SECTIONS_REORDERED || return 1
+
+  sed 's/^## Configuration$/### Configuration/' \
+    "$PLUGIN_ROOT/templates/CLAUDE-template.md" > "$MOCK_VAULT/CLAUDE.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" MANAGED_SECTION_MALFORMED || return 1
+
+  sed 's/Source material: translated articles, research docs, reference content\./CUSTOMIZED/' \
+    "$PLUGIN_ROOT/templates/CLAUDE-template.md" > "$MOCK_VAULT/CLAUDE.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" MANAGED_SECTION_CUSTOMIZED || return 1
+}
+
+test_doctor_agent_surfaces() {
+  local out
+  doctor_setup_vault
+  out=$(doctor_run)
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.agents.mode !== "claude-only") process.exit(1);
+  ' "$out" || return 1
+
+  cp "$PLUGIN_ROOT/AGENTS.md" "$MOCK_VAULT/AGENTS.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" AGENT_SURFACE_CODEX || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.agents.mode !== "dual") process.exit(1);
+  ' "$out" || return 1
+
+  rm -f "$MOCK_VAULT/CLAUDE.md"
+  out=$(doctor_run)
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.agents.mode !== "codex-only") process.exit(1);
+  ' "$out" || return 1
+
+  rm -f "$MOCK_VAULT/AGENTS.md"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" AGENT_SURFACE_NONE || return 1
+}
+
+test_doctor_version_states() {
+  local out copy
+  doctor_setup_vault
+  out=$(doctor_run)
+  doctor_assert_finding "$out" PLUGIN_VERSION_CONSISTENT || return 1
+
+  copy=$(mktemp -d "${TMPDIR:-/tmp}/me-doctor-plugin.XXXXXX")
+  mkdir -p "$copy/.codex-plugin" "$copy/.claude-plugin" \
+    "$copy/.agents/plugins" "$copy/templates/schema-profiles"
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$copy/templates/SCHEMA.md"
+  cp "$PLUGIN_ROOT/templates/CLAUDE-template.md" "$copy/templates/CLAUDE-template.md"
+  cp "$PLUGIN_ROOT/templates/schema-profiles/me-schema-v1.json" \
+    "$copy/templates/schema-profiles/"
+  printf '{"name":"me","version":"1.6.0"}\n' > "$copy/package.json"
+  printf '{"name":"me","version":"1.6.0"}\n' > "$copy/.codex-plugin/plugin.json"
+  printf '{"name":"me","version":"1.6.0"}\n' > "$copy/.claude-plugin/plugin.json"
+  printf '{"name":"me","version":"1.6.0","source":"./"}\n' > "$copy/.claude-plugin/marketplace.json"
+  printf '{"name":"me-marketplace","plugins":[]}\n' > "$copy/.agents/plugins/marketplace.json"
+
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/doctor.ts" --vault-dir "$MOCK_VAULT" --plugin-root "$copy")
+  doctor_assert_finding "$out" PLUGIN_VERSION_CONSISTENT || { rm -rf "$copy"; return 1; }
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.plugin.source !== "installed") process.exit(1);
+    if (r.versions.codexPlugin !== "1.6.0") process.exit(1);
+  ' "$out" || { rm -rf "$copy"; return 1; }
+
+  printf '{"name":"me","version":"1.6.2"}\n' > "$copy/.codex-plugin/plugin.json"
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/doctor.ts" --vault-dir "$MOCK_VAULT" --plugin-root "$copy")
+  doctor_assert_finding "$out" PLUGIN_VERSION_MISMATCH || { rm -rf "$copy"; return 1; }
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.state !== "behind") process.exit(1);
+  ' "$out" || { rm -rf "$copy"; return 1; }
+
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/doctor.ts" --vault-dir "$MOCK_VAULT" \
+    --plugin-root "$copy" --installed-version 1.5.0)
+  doctor_assert_finding "$out" PLUGIN_INSTALLED_MISMATCH || { rm -rf "$copy"; return 1; }
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.plugin.installedMismatch !== true) process.exit(1);
+  ' "$out" || { rm -rf "$copy"; return 1; }
+
+  rm -rf "$copy"
+}
+
+test_doctor_runtime_states() {
+  local out runtime_root
+  doctor_setup_vault
+  runtime_root=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/runtime.ts" path --vault-dir "$MOCK_VAULT" \
+    | bun -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));process.stdout.write(d.runtimeRoot)")
+
+  mkdir -p "$runtime_root/locks"
+  touch "$runtime_root/locks/vault-write.lock"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" RUNTIME_LOCK_PRESENT || return 1
+
+  mkdir -p "$runtime_root/transactions/vault-write-abc123"
+  node -e '
+    const fs = require("fs");
+    const dir = process.argv[1];
+    const j = {
+      version: 1,
+      operationId: "abc123",
+      state: "planned",
+      notePath: "practices/2026-08-04-x.md",
+      requestDigest: "a".repeat(64),
+      plannedNoteSha256: "b".repeat(64),
+      metadataPolicy: "POSIX mode preserved for replaced README; uid/gid/ACL/xattr/timestamps are not preserved."
+    };
+    fs.writeFileSync(dir + "/journal.json", JSON.stringify(j));
+  ' "$runtime_root/transactions/vault-write-abc123"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" RUNTIME_RECOVERY_INCOMPLETE || return 1
+
+  mkdir -p "$runtime_root/transactions/vault-write-bad"
+  echo 'not json' > "$runtime_root/transactions/vault-write-bad/journal.json"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" RUNTIME_RECOVERY_UNRECOGNIZED || return 1
+
+  mkdir -p "$MOCK_VAULT/.me/locks"
+  touch "$MOCK_VAULT/.me/locks/x.lock"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" RUNTIME_LEGACY_STATE || return 1
+
+  mkdir -p "$runtime_root/ingest/staging"
+  touch "$runtime_root/ingest/staging/pending.json"
+  out=$(doctor_run)
+  doctor_assert_finding "$out" RUNTIME_INGEST_PENDING || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.runtime.ingestPending.length !== 1) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_doctor_unicode_spaced_paths() {
+  local v="$MOCK_VAULT/知识 vault 空格" out before after
+  mkdir -p "$v/.me" "$v/raw" "$v/practices" "$v/cognition"
+  cat > "$v/.me/config.yaml" <<'EOF'
+layers:
+  raw: raw
+  practices: practices
+  cognition: cognition
+EOF
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$v/SCHEMA.md"
+  cp "$PLUGIN_ROOT/templates/CLAUDE-template.md" "$v/CLAUDE.md"
+  before=$(cd "$v" && find . -type f | sort | xargs shasum 2>/dev/null)
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/doctor.ts" --vault-dir "$v")
+  after=$(cd "$v" && find . -type f | sort | xargs shasum 2>/dev/null)
+  if [ "$before" != "$after" ]; then
+    echo -e "    ${RED}FAIL${NC}: unicode vault changed by doctor"
+    return 1
+  fi
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.state !== "healthy") { console.error(JSON.stringify(r.findings)); process.exit(1); }
+    if (r.roots.vault.canonical.indexOf("知识") < 0) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_doctor_packaged_release() {
+  local pack_dir install_dir tarball binary out
+  assert_file_exists "$PLUGIN_ROOT/bin/doctor.ts" || return 1
+  node -e '
+    const p=require(process.argv[1]);
+    if (p.bin["doctor"] !== "bin/doctor.ts") process.exit(1)
+  ' "$PLUGIN_ROOT/package.json" || return 1
+
+  pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-doctor-pack.XXXXXX")
+  install_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-doctor-install.XXXXXX")
+  tarball=$(cd "$PLUGIN_ROOT" && npm pack --silent --pack-destination "$pack_dir" "$PLUGIN_ROOT") || {
+    rm -rf "$pack_dir" "$install_dir"; return 1
+  }
+  cd "$PLUGIN_ROOT" && npm install --silent --ignore-scripts --prefix "$install_dir" \
+    "$pack_dir/$tarball" || { rm -rf "$pack_dir" "$install_dir"; return 1; }
+  binary="$install_dir/node_modules/.bin/doctor"
+  if [ ! -x "$binary" ]; then
+    echo -e "    ${RED}FAIL${NC}: packaged doctor binary is not executable"
+    rm -rf "$pack_dir" "$install_dir"; return 1
+  fi
+
+  doctor_setup_vault
+  out=$(cd "$PLUGIN_ROOT" && "$binary" --vault-dir "$MOCK_VAULT") || {
+    rm -rf "$pack_dir" "$install_dir"; return 1
+  }
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.version !== 1) process.exit(1);
+    if (r.state !== "healthy") process.exit(1);
+  ' "$out" || { rm -rf "$pack_dir" "$install_dir"; return 1; }
+  rm -rf "$pack_dir" "$install_dir"
+}
+
+test_doctor_docs_and_skill() {
+  assert_file_contains "$PLUGIN_ROOT/skills/doctor/SKILL.md" "doctor" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/doctor/SKILL.md" "read-only" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/doctor/references/diagnostic-contract-v1.md" "version" || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" "me:doctor" || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/features.md" "me:doctor" || return 1
+}
+
+# ── me:recall (Issue #10) ───────────────────────────────────────────
+
+RECALL_FIXTURES="$PLUGIN_ROOT/test/fixtures/recall"
+
+recall_run() {
+  (cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/recall.ts" --sessions-dir "$RECALL_FIXTURES" "$@")
+}
+
+recall_assert_warning() {
+  local out="$1" code="$2"
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (!b.warnings.some(w => w.code === process.argv[2])) {
+      console.error("missing warning " + process.argv[2]);
+      process.exit(1);
+    }
+  ' "$out" "$code" || return 1
+}
+
+recall_assert_task_evidence() {
+  local out="$1" needle="$2"
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    const found = b.tasks.some(t =>
+      (t.derivedTitle || "").includes(process.argv[2]) ||
+      t.evidence.some(e => (e.text || "").includes(process.argv[2]))
+    );
+    if (!found) { console.error("no task evidence contains " + process.argv[2]); process.exit(1); }
+  ' "$out" "$needle" || return 1
+}
+
+test_recall_skill_and_cli_exist() {
+  assert_file_exists "$PLUGIN_ROOT/skills/recall/SKILL.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/skills/recall/references/evidence-contract-v1.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/recall.ts" || return 1
+  if [ ! -x "$PLUGIN_ROOT/bin/recall.ts" ]; then
+    echo -e "    ${RED}FAIL${NC}: recall.ts entrypoint is not executable"
+    return 1
+  fi
+  node -e '
+    const p = require(process.argv[1]);
+    if (p.bin["recall"] !== "bin/recall.ts") process.exit(1);
+  ' "$PLUGIN_ROOT/package.json" || return 1
+}
+
+test_recall_invalid_arguments() {
+  local out status
+  set +e
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/recall.ts" 2>&1)
+  status=$?
+  set -e
+  if [ "$status" -ne 2 ]; then
+    echo -e "    ${RED}FAIL${NC}: expected exit 2, got $status"
+    return 1
+  fi
+  echo "$out" | grep -q "INVALID_ARGUMENTS" || {
+    echo -e "    ${RED}FAIL${NC}: expected INVALID_ARGUMENTS error"
+    return 1
+  }
+}
+
+test_recall_contract_fixture() {
+  assert_file_exists "$PLUGIN_ROOT/test/fixtures/recall/evidence-bundle-v1.json" || return 1
+  node -e '
+    const b = require(process.argv[1]);
+    const requiredTop = ["version","contract","generatedAt","query","scope","adapters","tasks","corrections","warnings","stats"];
+    for (const key of requiredTop) if (!(key in b)) { console.error("missing top-level key " + key); process.exit(1); }
+    for (const key of Object.keys(b)) if (!requiredTop.includes(key)) { console.error("unexpected top-level key " + key); process.exit(1); }
+    if (b.version !== 1) process.exit(1);
+    if (b.contract !== "session-evidence") process.exit(1);
+    if (typeof b.query.text !== "string") process.exit(1);
+    if (typeof b.scope.authorized !== "boolean" || typeof b.scope.crossWorkspace !== "boolean") process.exit(1);
+    if (!Array.isArray(b.adapters.active) || !Array.isArray(b.adapters.unsupported)) process.exit(1);
+    if (!Array.isArray(b.tasks) || !Array.isArray(b.corrections) || !Array.isArray(b.warnings)) process.exit(1);
+    if (typeof b.stats.sessionsScanned !== "number" || typeof b.stats.evidenceEmitted !== "number") process.exit(1);
+    for (const t of b.tasks) {
+      if (typeof t.taskId !== "string" || typeof t.adapter !== "string" || typeof t.workspace !== "string") process.exit(1);
+      if (typeof t.derivedTitle !== "string" || t.titleLabel !== "derived") process.exit(1);
+      if (!Array.isArray(t.sources) || typeof t.startedAt !== "string") process.exit(1);
+      if (!Array.isArray(t.evidence)) process.exit(1);
+      for (const e of t.evidence) {
+        if (!["user_statement","agent_conclusion","tool_result","correction"].includes(e.kind)) process.exit(1);
+        if (typeof e.text !== "string" || typeof e.at !== "string") process.exit(1);
+        if (typeof e.redacted !== "boolean" || typeof e.truncated !== "boolean") process.exit(1);
+        if (!e.provenance || typeof e.provenance.sourcePath !== "string" || typeof e.provenance.recordIndex !== "number") process.exit(1);
+        if (typeof e.sourceCategory !== "string") process.exit(1);
+      }
+    }
+  ' "$PLUGIN_ROOT/test/fixtures/recall/evidence-bundle-v1.json" || return 1
+}
+
+test_recall_finds_by_topic_and_date() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "调试")
+  recall_assert_task_evidence "$out" "调试" || return 1
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (!b.tasks.some(t => t.taskId === "task-a-001")) process.exit(1);
+    if (b.tasks.some(t => t.taskId === "task-b-001")) process.exit(1);
+  ' "$out" || return 1
+  # after later than every record excludes the task entirely
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "调试" --after 2026-08-03T09:03:00Z)
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (b.tasks.length !== 0) process.exit(1);
+  ' "$out" || return 1
+  # after inside the task span still includes it
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "调试" --after 2026-08-03T09:00:01Z)
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (!b.tasks.some(t => t.taskId === "task-a-001")) process.exit(1);
+  ' "$out" || return 1
+  # before earlier than every record excludes the task entirely
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "调试" --before 2026-08-03T09:00:00Z)
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (b.tasks.length !== 0) process.exit(1);
+  ' "$out" || return 1
+  # before inside the task span still includes it (inclusive window)
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "调试" --before 2026-08-03T09:01:00Z)
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (!b.tasks.some(t => t.taskId === "task-a-001")) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_topic_title_filters() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --topic "环境变量")
+  recall_assert_task_evidence "$out" "环境变量" || return 1
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (!b.tasks.some(t => t.taskId === "task-a-001")) process.exit(1);
+  ' "$out" || return 1
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --title "修复 issue")
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (!b.tasks.some(t => t.taskId === "task-a-001")) process.exit(1);
+  ' "$out" || return 1
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --title "知识库")
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (b.tasks.length !== 0) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_default_scope_current_workspace() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a)
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (!b.tasks.some(t => t.taskId === "task-a-001")) process.exit(1);
+    if (b.tasks.some(t => t.taskId === "task-b-001")) { console.error("crossed workspace"); process.exit(1); }
+  ' "$out" || return 1
+}
+
+test_recall_cross_workspace_requires_authorization() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --workspace /recall-fixture/workspace-b --query "知识库")
+  recall_assert_warning "$out" CROSS_WORKSPACE_UNAUTHORIZED || return 1
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (b.scope.crossWorkspace !== true) process.exit(1);
+    if (b.scope.authorized !== false) process.exit(1);
+    if (b.tasks.length !== 0) process.exit(1);
+  ' "$out" || return 1
+  # With explicit authorization, workspace-b is searched
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --workspace /recall-fixture/workspace-b --authorize-cross-workspace --query "知识库")
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (b.scope.authorized !== true) process.exit(1);
+    if (!b.tasks.some(t => t.taskId === "task-b-001")) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_dedup_coalesced() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "调试")
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    const task = b.tasks.find(t => t.taskId === "task-a-001");
+    if (!task) process.exit(1);
+    const userStatements = task.evidence.filter(e => e.kind === "user_statement" && e.text.includes("修复 issue"));
+    if (userStatements.length !== 1) { console.error("duplicate user statement not coalesced"); process.exit(1); }
+    if ((b.stats.coalescedDuplicates || 0) < 1) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_corrections_supersede() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "环境变量")
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    const task = b.tasks.find(t => t.taskId === "task-a-001");
+    if (!task) process.exit(1);
+    const corrections = task.evidence.filter(e => e.kind === "correction");
+    if (corrections.length < 1) { console.error("no correction evidence"); process.exit(1); }
+    const first = corrections.find(c => c.text.includes("环境变量"));
+    if (!first || typeof first.supersedes !== "string") process.exit(1);
+    if (!b.corrections.some(c => c.supersedes)) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_redaction() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "服务")
+  echo "$out" | grep -q "glpat-test-abcdefghijklmnop123456789" && { echo -e "    ${RED}FAIL${NC}: api key leaked"; return 1; }
+  echo "$out" | grep -q "wuke@example.com" && { echo -e "    ${RED}FAIL${NC}: email leaked"; return 1; }
+  echo "$out" | grep -q "/secret/path" && { echo -e "    ${RED}FAIL${NC}: env value leaked"; return 1; }
+  echo "$out" | grep -q "REDACTED:api-key" || { echo -e "    ${RED}FAIL${NC}: api-key marker missing"; return 1; }
+  echo "$out" | grep -q "REDACTED:email" || { echo -e "    ${RED}FAIL${NC}: email marker missing"; return 1; }
+  echo "$out" | grep -q "REDACTED:env-value" || { echo -e "    ${RED}FAIL${NC}: env-value marker missing"; return 1; }
+  echo "$out" | grep -q "REDACTED:private-key" || { echo -e "    ${RED}FAIL${NC}: private-key marker missing"; return 1; }
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    const task = b.tasks.find(t => t.taskId === "task-s-001");
+    if (!task) process.exit(1);
+    if (!task.evidence.some(e => e.redacted === true)) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_malformed_sources_safe() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "日志")
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if ((b.stats.malformedRecords || 0) < 2) { console.error("malformedRecords expected >= 2"); process.exit(1); }
+    if (!b.tasks.some(t => t.taskId === "task-m-001")) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_unicode() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "💡")
+  echo "$out" | grep -q "💡" || { echo -e "    ${RED}FAIL${NC}: unicode query content missing"; return 1; }
+  echo "$out" | grep -q "支持中文检索" || { echo -e "    ${RED}FAIL${NC}: unicode agent message missing"; return 1; }
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (!b.tasks.some(t => t.taskId === "task-u-001")) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_empty_explicit_success() {
+  local out status
+  set +e
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --query "totally-nonexistent-query-zzz")
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    echo -e "    ${RED}FAIL${NC}: empty results should exit 0, got $status"
+    return 1
+  fi
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (b.tasks.length !== 0) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_unsupported_adapter() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a --adapter claude-local --query "调试")
+  recall_assert_warning "$out" ADAPTER_UNSUPPORTED || return 1
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (b.adapters.active.length !== 0) process.exit(1);
+    if (!b.adapters.unsupported.includes("claude-local")) process.exit(1);
+    if (b.tasks.length !== 0) process.exit(1);
+  ' "$out" || return 1
+}
+
+test_recall_evidence_kinds_exact() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a)
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    const allowed = new Set(["user_statement","agent_conclusion","tool_result","correction"]);
+    for (const t of b.tasks) for (const e of t.evidence) {
+      if (!allowed.has(e.kind)) { console.error("bad kind " + e.kind); process.exit(1); }
+    }
+  ' "$out" || return 1
+}
+
+test_recall_no_full_transcripts() {
+  local out
+  out=$(recall_run --vault-dir /recall-fixture/workspace-a)
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    const MAX = 400;
+    for (const t of b.tasks) for (const e of t.evidence) {
+      if (e.text.length > MAX) { console.error("evidence too long: " + e.text.length); process.exit(1); }
+    }
+  ' "$out" || return 1
+}
+
+test_recall_zero_write() {
+  local sessions="$MOCK_VAULT/sessions" out before after
+  mkdir -p "$sessions"
+  cat > "$sessions/session-live.jsonl" <<EOF
+{"timestamp":"2026-08-03T09:00:00.000Z","type":"session_meta","payload":{"session_id":"task-live-001","id":"task-live-001","cwd":"$MOCK_VAULT","timestamp":"2026-08-03T09:00:00.000Z","source":"cli"}}
+{"timestamp":"2026-08-03T09:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-live-1","cwd":"$MOCK_VAULT","workspace_roots":["$MOCK_VAULT"]}}
+{"timestamp":"2026-08-03T09:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"live 会话测试"}}
+EOF
+  before=$(cd "$MOCK_VAULT" && find . -type f | sort | xargs shasum 2>/dev/null)
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/recall.ts" --vault-dir "$MOCK_VAULT" --sessions-dir "$sessions" --query "live")
+  after=$(cd "$MOCK_VAULT" && find . -type f | sort | xargs shasum 2>/dev/null)
+  if [ "$before" != "$after" ]; then
+    echo -e "    ${RED}FAIL${NC}: recall wrote to vault"
+    return 1
+  fi
+  node -e '
+    const b = JSON.parse(process.argv[1]);
+    if (!b.tasks.some(t => t.taskId === "task-live-001")) process.exit(1);
+  ' "$out" || return 1
+  local sb sa
+  sb=$(shasum "$sessions/session-live.jsonl")
+  (cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/recall.ts" --vault-dir "$MOCK_VAULT" --sessions-dir "$sessions" --query "live" > /dev/null)
+  sa=$(shasum "$sessions/session-live.jsonl")
+  if [ "$sb" != "$sa" ]; then
+    echo -e "    ${RED}FAIL${NC}: recall wrote to sessions dir"
+    return 1
+  fi
+}
+
+test_recall_packaged_release() {
+  local pack_dir extract_dir pack_json tarball
+  pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-recall-pack.XXXXXX")
+  extract_dir="$pack_dir/extracted"
+  mkdir -p "$extract_dir"
+  pack_json=$(npm pack --json --pack-destination "$pack_dir" "$PLUGIN_ROOT") || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  tarball=$(node -e '
+    const entries = JSON.parse(process.argv[1]);
+    if (!Array.isArray(entries) || entries.length !== 1 || !entries[0].filename) process.exit(1);
+    process.stdout.write(entries[0].filename);
+  ' "$pack_json") || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  tar -xzf "$pack_dir/$tarball" -C "$extract_dir" || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  assert_file_exists "$extract_dir/package/skills/recall/SKILL.md" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$extract_dir/package/skills/recall/references/evidence-contract-v1.md" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$extract_dir/package/bin/recall.ts" || { rm -rf "$pack_dir"; return 1; }
+  rm -rf "$pack_dir"
+}
+
+test_recall_docs_and_skill() {
+  assert_file_contains "$PLUGIN_ROOT/skills/recall/SKILL.md" "recall" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/recall/SKILL.md" "read-only" || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/recall/references/evidence-contract-v1.md" "user_statement" || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" "me:recall" || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/features.md" "me:recall" || return 1
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# Distill (issue #11) — Practice→Cognition promotion
+# ══════════════════════════════════════════════════════════════════════
+
+test_distill_skill_and_cli_exist() {
+  assert_file_exists "$PLUGIN_ROOT/skills/distill/SKILL.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/distill.ts" || return 1
+  node -e '
+    const p = require(process.argv[1]);
+    if (p.bin["distill"] !== "bin/distill.ts") process.exit(1);
+  ' "$PLUGIN_ROOT/package.json" || return 1
+  node -e '
+    const p = require(process.argv[1]);
+    if (!p.scripts["test:distill"]) process.exit(1);
+  ' "$PLUGIN_ROOT/package.json" || return 1
+}
+
+test_distill_invalid_arguments() {
+  local out status
+  set +e
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/distill.ts" 2>&1)
+  status=$?
+  set -e
+  if [ "$status" -ne 2 ]; then
+    echo -e "    ${RED}FAIL${NC}: expected exit 2, got $status"
+    return 1
+  fi
+  echo "$out" | grep -q "INVALID_ARGUMENTS" || {
+    echo -e "    ${RED}FAIL${NC}: expected INVALID_ARGUMENTS error"
+    return 1
+  }
+}
+
+test_distill_preview_not_ready_zero_write() {
+  setup_vault || return 1
+  mkdir -p "$MOCK_VAULT/.me"
+  mkdir -p "$MOCK_VAULT"/{raw,practices,cognition}
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+  for layer in raw practices cognition; do
+    echo "# $layer" > "$MOCK_VAULT/$layer/README.md"
+  done
+
+  # Write practice missing confidence/review → gates fail → not_ready
+  cat > "$MOCK_VAULT/practices/incomplete.md" << 'NOTEREADY'
+---
+title: "Incomplete practice"
+created: 2026-08-01
+tags: [test]
+type: reflection
+source: "[[raw/test]]"
+project: "test-proj"
+---
+
+# Incomplete practice
+
+## Boundaries
+- Test
+
+NOTEREADY
+
+  local out
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/distill.ts" --vault-dir "$MOCK_VAULT" preview --practice practices/incomplete.md 2>&1)
+  echo "$out" | grep -q '"status":"not_ready"' || {
+    echo -e "    ${RED}FAIL${NC}: expected not_ready status"
+    return 1
+  }
+  # Zero-write: no cognition note created
+  local cognition_count
+  cognition_count=$(ls "$MOCK_VAULT/cognition/" 2>/dev/null | grep -cv README.md || true)
+  cognition_count=${cognition_count:-0}
+  if [ "$cognition_count" != "0" ]; then
+    echo -e "    ${RED}FAIL${NC}: preview wrote to cognition layer"
+    return 1
+  fi
+  teardown_vault
+}
+
+test_distill_preview_emits_contract() {
+  setup_vault || return 1
+  mkdir -p "$MOCK_VAULT/.me"
+  mkdir -p "$MOCK_VAULT"/{raw,practices,cognition}
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+  for layer in raw practices cognition; do echo "# $layer" > "$MOCK_VAULT/$layer/README.md"; done
+
+  cat > "$MOCK_VAULT/practices/valid.md" << 'NOTEVALID'
+---
+title: "Valid practice"
+created: 2026-08-01
+tags: [test]
+type: reflection
+source: "[[raw/evidence]]"
+project: "valid-proj"
+---
+
+# Valid practice
+
+## Boundaries
+- Applies to: testing
+
+## Confidence
+medium — Single project.
+
+## Review
+2026-11-01
+NOTEVALID
+  echo -e '---\ntitle: "Evidence"\ncreated: 2026-07-01\ntags: []\ntype: raw\n---\n\n# Evidence' > "$MOCK_VAULT/raw/evidence.md"
+
+  local out
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/distill.ts" --vault-dir "$MOCK_VAULT" preview --practice practices/valid.md 2>&1)
+  echo "$out" | grep -q '"contract":"distill-preview"' || {
+    echo -e "    ${RED}FAIL${NC}: missing contract field"
+    return 1
+  }
+  echo "$out" | grep -q '"previewDigest"' || {
+    echo -e "    ${RED}FAIL${NC}: missing previewDigest"
+    return 1
+  }
+  echo "$out" | grep -q '"gates"' || {
+    echo -e "    ${RED}FAIL${NC}: missing gates"
+    return 1
+  }
+  teardown_vault
+}
+
+test_distill_no_lifecycle_frontmatter() {
+  setup_vault || return 1
+  mkdir -p "$MOCK_VAULT/.me"
+  mkdir -p "$MOCK_VAULT"/{raw,practices,cognition}
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+  for layer in raw practices cognition; do echo "# $layer" > "$MOCK_VAULT/$layer/README.md"; done
+
+  cat > "$MOCK_VAULT/practices/nolc.md" << 'NOLC'
+---
+title: "No lifecycle"
+created: 2026-08-01
+tags: [test]
+type: reflection
+source: "[[raw/ev]]"
+project: "nolc-proj"
+---
+
+# No lifecycle
+
+## Boundaries
+- Test
+
+## Confidence
+medium — Test.
+
+## Review
+2026-11-01
+NOLC
+  echo -e '---\ntitle: "EV"\ncreated: 2026-07-01\ntags: []\ntype: raw\n---\n\n# EV' > "$MOCK_VAULT/raw/ev.md"
+
+  local out
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/distill.ts" --vault-dir "$MOCK_VAULT" preview --practice practices/nolc.md 2>&1)
+  # Cognition markdown must not contain status/lifecycle frontmatter
+  local markdown
+  markdown=$(echo "$out" | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0,'utf8')).plannedMarkdown)")
+  if echo "$markdown" | grep -q '^status:'; then
+    echo -e "    ${RED}FAIL${NC}: cognition markdown contains status frontmatter"
+    return 1
+  fi
+  if echo "$markdown" | grep -q '^lifecycle:'; then
+    echo -e "    ${RED}FAIL${NC}: cognition markdown contains lifecycle frontmatter"
+    return 1
+  fi
+  # Review must be in body not frontmatter
+  local fm
+  fm=$(echo "$markdown" | sed -n '/^---$/,/^---$/p')
+  if echo "$fm" | grep -q '^review:'; then
+    echo -e "    ${RED}FAIL${NC}: review in cognition frontmatter (must be in body)"
+    return 1
+  fi
+  teardown_vault
+}
+
+test_distill_source_preserved() {
+  setup_vault || return 1
+  mkdir -p "$MOCK_VAULT/.me"
+  mkdir -p "$MOCK_VAULT"/{raw,practices,cognition}
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+  for layer in raw practices cognition; do echo "# $layer" > "$MOCK_VAULT/$layer/README.md"; done
+
+  local practice_content
+  practice_content=$(cat << 'PRESERVE'
+---
+title: "Preserve test"
+created: 2026-08-01
+tags: [test]
+type: reflection
+source: "[[raw/ev]]"
+project: "preserve-proj"
+---
+
+# Preserve test
+
+## Boundaries
+- Test
+
+## Confidence
+medium — Test.
+
+## Review
+2026-11-01
+PRESERVE
+)
+  echo "$practice_content" > "$MOCK_VAULT/practices/preserve.md"
+  echo -e '---\ntitle: "EV"\ncreated: 2026-07-01\ntags: []\ntype: raw\n---\n\n# EV' > "$MOCK_VAULT/raw/ev.md"
+
+  local preview
+  preview=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/distill.ts" --vault-dir "$MOCK_VAULT" preview --practice practices/preserve.md 2>&1)
+  local digest
+  digest=$(echo "$preview" | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0,'utf8')).previewDigest)")
+
+  # Apply
+  if [ -n "$digest" ] && [ "$digest" != "null" ]; then
+    local result
+    result=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/distill.ts" --vault-dir "$MOCK_VAULT" apply --practice practices/preserve.md --preview-digest "$digest" 2>&1)
+    # Source practice must be byte-identical
+    local after
+    after=$(cat "$MOCK_VAULT/practices/preserve.md")
+    if [ "$after" != "$practice_content" ]; then
+      echo -e "    ${RED}FAIL${NC}: source practice was modified"
+      return 1
+    fi
+  fi
+  teardown_vault
+}
+
+test_distill_custom_layers() {
+  setup_vault || return 1
+  mkdir -p "$MOCK_VAULT/.me"
+  cat > "$MOCK_VAULT/.me/config.yaml" << 'CUSTOMCFG'
+layers:
+  raw: research
+  practices: notes
+  cognition: insights
+CUSTOMCFG
+  cp "$PLUGIN_ROOT/templates/SCHEMA.md" "$MOCK_VAULT/SCHEMA.md"
+  mkdir -p "$MOCK_VAULT"/{research,notes,insights}
+  for layer in research notes insights; do echo "# $layer" > "$MOCK_VAULT/$layer/README.md"; done
+
+  cat > "$MOCK_VAULT/notes/custom.md" << 'CUSTOMPRAC'
+---
+title: "Custom layers test"
+created: 2026-08-01
+tags: [custom]
+type: reflection
+source: "[[research/research-note]]"
+project: "custom-proj"
+---
+
+# Custom layers test
+
+## Boundaries
+- Test
+
+## Confidence
+medium — Test.
+
+## Review
+2026-11-01
+CUSTOMPRAC
+  echo -e '---\ntitle: "Research"\ncreated: 2026-07-01\ntags: []\ntype: raw\n---\n\n# Research' > "$MOCK_VAULT/research/research-note.md"
+
+  local out
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/distill.ts" --vault-dir "$MOCK_VAULT" preview --practice notes/custom.md 2>&1)
+  echo "$out" | grep -q '"plannedCognitionPath"' || {
+    echo -e "    ${RED}FAIL${NC}: missing plannedCognitionPath"
+    return 1
+  }
+  # Path must use configured layer name "insights", not hardcoded "cognition"
+  local pp
+  pp=$(echo "$out" | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0,'utf8')).plannedCognitionPath)")
+  if ! echo "$pp" | grep -q '^insights/'; then
+    echo -e "    ${RED}FAIL${NC}: planned path not using configured insights/ prefix, got: $pp"
+    return 1
+  fi
+  teardown_vault
+}
+
 # ── Main ────────────────────────────────────────────────────────────
 
 list_tests() {
@@ -5678,6 +6780,54 @@ main() {
     run_test test_events_query_by_time_range
     run_test test_events_query_limit
     run_test test_events_query_skips_malformed
+
+    # Quick task 260804-x7: me:doctor read-only diagnostic (Issue #9)
+    run_test test_doctor_skill_and_cli_exist
+    run_test test_doctor_invalid_arguments
+    run_test test_doctor_vault_not_found
+    run_test test_doctor_contract_fixture
+    run_test test_doctor_no_write_healthy
+    run_test test_doctor_config_states
+    run_test test_doctor_schema_states
+    run_test test_doctor_managed_sections
+    run_test test_doctor_agent_surfaces
+    run_test test_doctor_version_states
+    run_test test_doctor_runtime_states
+    run_test test_doctor_unicode_spaced_paths
+    run_test test_doctor_packaged_release
+    run_test test_doctor_docs_and_skill
+
+    # Quick task 260805-r7: me:recall session evidence (Issue #10)
+    run_test test_recall_skill_and_cli_exist
+    run_test test_recall_invalid_arguments
+    run_test test_recall_contract_fixture
+    run_test test_recall_finds_by_topic_and_date
+    run_test test_recall_topic_title_filters
+    run_test test_recall_default_scope_current_workspace
+    run_test test_recall_cross_workspace_requires_authorization
+    run_test test_recall_dedup_coalesced
+    run_test test_recall_corrections_supersede
+    run_test test_recall_redaction
+    run_test test_recall_malformed_sources_safe
+    run_test test_recall_unicode
+    run_test test_recall_empty_explicit_success
+    run_test test_recall_unsupported_adapter
+    run_test test_recall_evidence_kinds_exact
+    run_test test_recall_no_full_transcripts
+    run_test test_recall_zero_write
+    run_test test_recall_packaged_release
+    run_test test_recall_docs_and_skill
+  fi
+
+  # Distill tests
+  if [ "${1:-}" = "" ] || [[ "$1" == test_distill_* ]]; then
+    run_test test_distill_skill_and_cli_exist
+    run_test test_distill_invalid_arguments
+    run_test test_distill_preview_not_ready_zero_write
+    run_test test_distill_preview_emits_contract
+    run_test test_distill_no_lifecycle_frontmatter
+    run_test test_distill_source_preserved
+    run_test test_distill_custom_layers
   fi
 
   # Summary

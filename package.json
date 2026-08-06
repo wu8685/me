@@ -5,6 +5,9 @@
   "scripts": {
     "test": "bash test/vault-test.sh",
     "test:ingest": "bun test test/ingest-*.test.ts",
+    "test:doctor": "bun test test/doctor.test.ts",
+    "test:recall": "bun test test/recall.test.ts",
+    "test:distill": "bun test test/distill.test.ts",
     "test:update": "bun test test/update-*.test.ts"
   },
   "files": [
@@ -31,6 +34,9 @@
     "move": "bun run bin/move.ts",
     "ingest": "bun run bin/ingest.ts",
     "me-runtime": "bin/runtime.ts",
+    "doctor": "bin/doctor.ts",
+    "recall": "bin/recall.ts",
+    "distill": "bin/distill.ts",
     "me-setup": "bin/setup.ts",
     "me-update": "bin/update.ts",
     "vault-write": "bin/vault-write.ts"
