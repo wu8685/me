@@ -8,7 +8,14 @@ import {
   finalizeIngest,
   type FinalizeInput,
 } from '../bin/ingest/finalize.ts';
-import { resolveRuntimeLayout } from '../bin/runtime-paths.ts';
+import {
+  acquireVaultLock,
+  releaseVaultLock,
+} from '../bin/cooperative-lock.ts';
+import {
+  bootstrapRuntimeDirectories,
+  resolveRuntimeLayout,
+} from '../bin/runtime-paths.ts';
 
 const temporaryDirectories: string[] = [];
 
@@ -434,6 +441,90 @@ describe('finalizeIngest', () => {
     expect(nestedAttempted).toBeTrue();
     expect(fs.existsSync(first.notePath)).toBeTrue();
     expect(fs.existsSync(path.dirname(first.notePath))).toBeTrue();
+  });
+
+  test('a me-update owner blocks ingest without publishing content', () => {
+    const vault = makeVault();
+    const runtime = resolveRuntimeLayout(vault);
+    bootstrapRuntimeDirectories(runtime, [runtime.lockDir]);
+    const lock = acquireVaultLock(runtime, {
+      operationId: 'update-in-progress',
+      owner: 'me-update',
+    });
+
+    try {
+      expect(() => finalizeIngest(validArticleInput(vault)))
+        .toThrow(/locked|in progress/i);
+      expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+    } finally {
+      releaseVaultLock(runtime, lock);
+    }
+  });
+
+  test('cleans later operation locks best-effort and preserves vault.lock on cleanup failure', () => {
+    const vault = makeVault();
+    const runtime = resolveRuntimeLayout(vault);
+    const cleanupAttempts: string[] = [];
+
+    expect(() => finalizeIngest(validArticleInput(vault), {
+      beforeArtifactPublish() {
+        throw new Error('stop before publish');
+      },
+      cleanupOps: {
+        rmSync(candidate, options) {
+          const target = candidate.toString();
+          if (
+            path.dirname(target) === runtime.ingestLockDir
+            && target.endsWith('.lock')
+          ) {
+            cleanupAttempts.push(target);
+            if (cleanupAttempts.length === 1) {
+              throw new Error('injected operation-lock cleanup failure');
+            }
+          }
+          fs.rmSync(candidate, options);
+        },
+      },
+      renameSync: fs.renameSync,
+    })).toThrow(/recovery|required|cleanup/i);
+
+    expect(cleanupAttempts).toHaveLength(2);
+    expect(fs.readdirSync(runtime.ingestLockDir).filter(name => name.endsWith('.lock')))
+      .toHaveLength(1);
+    expect(fs.existsSync(path.join(runtime.lockDir, 'vault.lock'))).toBeTrue();
+    expect(fs.existsSync(expectedNote(vault))).toBeFalse();
+  });
+
+  test('preserves vault.lock when staging cleanup is incomplete', () => {
+    const vault = makeVault();
+    const runtime = resolveRuntimeLayout(vault);
+    let stagingCleanupFailed = false;
+
+    expect(() => finalizeIngest(validArticleInput(vault), {
+      beforeArtifactPublish() {
+        throw new Error('stop before publish');
+      },
+      cleanupOps: {
+        rmSync(candidate, options) {
+          const target = candidate.toString();
+          if (
+            target.startsWith(`${runtime.ingestStagingDir}${path.sep}artifact-`)
+            && options?.recursive
+          ) {
+            stagingCleanupFailed = true;
+            throw new Error('injected staging cleanup failure');
+          }
+          fs.rmSync(candidate, options);
+        },
+      },
+      renameSync: fs.renameSync,
+    })).toThrow(/recovery|required|cleanup/i);
+
+    expect(stagingCleanupFailed).toBeTrue();
+    expect(fs.existsSync(path.join(runtime.lockDir, 'vault.lock'))).toBeTrue();
+    expect(fs.readdirSync(runtime.ingestStagingDir)
+      .some(name => name.startsWith('artifact-'))).toBeTrue();
+    expect(fs.existsSync(expectedNote(vault))).toBeFalse();
   });
 
   test('reserves a stem vault-wide across concurrent topics', () => {

@@ -1,127 +1,205 @@
 ---
 name: setup
-description: "Use when a workspace needs initial ME vault setup or an existing ME vault needs its managed schema and navigation files upgraded."
+description: "Use when a workspace needs initial ME vault setup. Existing ME vaults are handed off to me:update without writes."
 ---
 
 # /me:setup
 
-Initializes or upgrades a workspace vault.
+Initializes a new workspace vault at the current schema version. Claude Code
+invokes this Skill as `/me:setup`; Codex invokes it as `$me:setup`.
 
-## Step 1: Detect Target Workspace
+## Step 1: Resolve the target
 
-Use cwd as target. If `$ARGUMENTS` contains a path, use that instead.
+Use cwd as the target. If `$ARGUMENTS` contains one explicit path, use that
+instead. Reject multiple target paths. Resolve every workspace path relative to
+that target.
 
-## Step 2: Route — Fresh Setup or Upgrade?
+Resolve `PLUGIN_ROOT` without writing:
+
+1. In Claude Code, if `CLAUDE_PLUGIN_ROOT` is non-empty, canonicalize it and
+   use it.
+2. Otherwise, in Codex, take the absolute path shown for this loaded
+   `skills/setup/SKILL.md` by the skill catalog and walk up from
+   `skills/setup/SKILL.md` to the plugin root. Concretely, canonicalize
+   `dirname(<absolute-SKILL.md>)/../..`; do not derive it from cwd.
+3. Verify that `<PLUGIN_ROOT>/skills/setup/SKILL.md`,
+   `<PLUGIN_ROOT>/bin/setup.ts`, `<PLUGIN_ROOT>/bin/setup-preflight.ts`, and
+   both Agent templates exist.
+
+Never expand an unset `CLAUDE_PLUGIN_ROOT` into `/bin/...` or `/templates/...`.
+If neither trusted source yields a verified absolute plugin root, stop without
+writing.
+
+## Step 2: Stop for an existing vault
+
+Check for `{target}/.me/config.yaml` before creating any directory, lock,
+runtime namespace, or temporary file.
+
+If it exists, perform **no writes at all** to the vault or runtime and report
+exactly:
+
+```text
+me vault already initialized.
+Run $me:update (Codex) or /me:update (Claude Code) to preview any required
+vault migrations. No files changed.
+```
+
+Then stop. Existing-vault changes to `.me/config.yaml`, `SCHEMA.md`,
+`CLAUDE.md`, and `AGENTS.md` belong exclusively to `me:update`; setup never
+performs a direct upgrade.
+
+## Step 3: Configure layer mapping (fresh only)
+
+If `$ARGUMENTS` contains `--defaults`, use `raw`, `practices`, and `cognition`.
+Otherwise scan for existing directories using
+`<PLUGIN_ROOT>/skills/setup/references/layer-candidates.md`. If candidates are
+found, show the proposed mapping and ask the user to confirm it. If none are
+found, use the defaults.
+
+## Step 4: Preflight every mutation target (fresh only)
+
+Before the first `mkdir`, temp file, copy, append, or other write, run the real
+setup runner in read-only preview mode:
 
 ```bash
-[ -f ".me/config.yaml" ] && echo "upgrade" || echo "fresh"
+bun run "<PLUGIN_ROOT>/bin/setup.ts" preview \
+  --vault-dir "<target>" \
+  --raw-dir "<raw_dir>" \
+  --practices-dir "<practices_dir>" \
+  --cognition-dir "<cognition_dir>"
 ```
 
-**If "upgrade"** → go to Step 2b (upgrade path below), then STOP.
-**If "fresh"** → continue to Step 3.
+This read-only preflight must return `status: ready`. It checks the complete
+prospective mutation set together:
 
-### Step 2b: Version Upgrade Path
+- `.me/`, absent `.me/config.yaml`, every configured layer path, and each
+  `.gitkeep`;
+- existing `SCHEMA.md`, `CLAUDE.md`, `AGENTS.md`, and `.gitignore`;
+- every path component, target type, symlink boundary, and write feasibility;
+- both Agent files for duplicate, nested, mismatched, unknown, or incomplete
+  ME markers, fenced ambiguity, and safe append/refresh semantics.
 
-The workspace is already initialized. Refresh plugin-managed files only — do NOT touch `.me/config.yaml` or layer directories.
+If preflight is blocked or fails, display its structured error and stop.
+The entire vault and runtime must remain byte-for-byte unchanged. Do not create
+schema v1 config, directories, or any partial managed file before all targets
+pass.
 
-**2b-i. Refresh SCHEMA.md**
+## Step 5: Apply the preflighted current vault (fresh only)
 
-Read `${CLAUDE_PLUGIN_ROOT}/templates/SCHEMA.md` → write to `{target}/SCHEMA.md`.
-
-**2b-ii. Smart-merge CLAUDE.md**
-
-Read both files:
-- Current `{target}/CLAUDE.md`
-- Latest `${CLAUDE_PLUGIN_ROOT}/templates/CLAUDE-template.md`
-
-Apply merge rules from `skills/setup/references/merge-rules.md`: replace template-owned sections with latest content, preserve user-added sections at their original positions.
-
-Write merged result to `{target}/CLAUDE.md`.
-
-**2b-iii. Report**
-
-```
-me vault already initialized — smart-merged CLAUDE.md and refreshed SCHEMA.md to latest plugin version.
-Config unchanged: .me/config.yaml
-```
-
-Done. Do not continue to Step 3.
-
----
-
-## Step 3: Configure Layer Mapping (fresh only)
-
-If `$ARGUMENTS` contains `--defaults`, use defaults: `raw`, `practices`, `cognition`. Skip to Step 4.
-
-Otherwise scan for existing directories that match known layer names. See `skills/setup/references/layer-candidates.md` for candidate lists and detection script.
-
-If candidates found → present and ask user to confirm mapping via conversation.
-If no candidates → use defaults.
-
-## Step 4: Write .me/config.yaml (fresh only)
+After the preview succeeds, run the same executable implementation in apply
+mode. Do not reproduce its writes with shell commands:
 
 ```bash
-mkdir -p .me
+bun run "<PLUGIN_ROOT>/bin/setup.ts" apply \
+  --vault-dir "<target>" \
+  --raw-dir "<raw_dir>" \
+  --practices-dir "<practices_dir>" \
+  --cognition-dir "<cognition_dir>"
 ```
 
-Write `.me/config.yaml`:
+The runner repeats the complete read-only preflight under the shared vault
+lock, stages exact bytes, and routes every publication and rollback through
+the unified mutation executor. It rejects any target that changed after
+preview. Managed files are published in deterministic order and
+`.me/config.yaml` is always last. A normal failure rolls every published vault
+path back; an ownership ambiguity returns `RECOVERY_REQUIRED` and preserves
+recovery material instead of guessing.
+
+An interrupted pre-config apply cannot claim schema v1 because config is last.
+Before the existing-config fast-path, both preview and apply inspect external
+`<ME_RUNTIME>/transactions/me-setup-*` journals. Any retained operation,
+including config-published-but-not-cleaned state, returns
+`RECOVERY_REQUIRED`; inspect its journal and preserved content before removing
+anything. Never delete an unfamiliar transaction namespace automatically.
+
+The runner implements the actions below. They are the result contract, not
+instructions to execute manually.
+
+### Layer directories
+
+Create the configured Raw, Practices, and Cognition directories and a
+`.gitkeep` in each.
+
+### Current managed files
+
+1. Copy `<PLUGIN_ROOT>/templates/SCHEMA.md` to `SCHEMA.md`.
+2. Apply `<PLUGIN_ROOT>/templates/CLAUDE-template.md` to `CLAUDE.md`.
+3. Apply `<PLUGIN_ROOT>/templates/AGENTS-template.md` to `AGENTS.md`.
+
+For both Agent files, follow
+`skills/setup/references/merge-rules.md`. If the file is absent, create it
+from the matching current template. If it already contains a valid ME managed
+block, refresh only that block. If it is user-authored and unmarked, preserve
+every existing byte and append the complete current ME block. Duplicate,
+nested, mismatched, unknown, or incomplete markers are conflicts: stop instead
+of guessing. Never overwrite user-authored Agent instructions.
+
+### `.gitignore`
+
+- If `.gitignore` is absent, create it from
+  `<PLUGIN_ROOT>/references/gitignore-snippet.txt`.
+- If it exists without an `.obsidian/` entry, append the snippet while
+  preserving all existing bytes.
+- If it already has an `.obsidian/` entry, leave it unchanged.
+
+For this contract, an effective entry is a non-blank, non-comment line whose
+content after trimming surrounding whitespace is exactly `.obsidian/`.
+Preflight rejects more than one effective entry; comment-only mentions do not
+count. Use the same rule during final validation.
+
+Do not ignore `.me/`; portable config belongs in version control.
+
+### Config — publish last
+
+Only after every other preflighted target has been written successfully does
+the runner create `.me/` and publish `.me/config.yaml` last:
 
 ```yaml
 # me plugin configuration
-# Layer directory mapping — maps logical layers to actual directory paths
+vault_schema_version: 1
+
 layers:
   raw: "<raw_dir>"
   practices: "<practices_dir>"
   cognition: "<cognition_dir>"
 ```
 
-## Step 5: Create Vault Directories (fresh only)
+Publishing config last prevents an incomplete fresh setup from claiming schema
+version 1.
 
-```bash
-mkdir -p <raw_dir>/ <practices_dir>/ <cognition_dir>/
-touch <raw_dir>/.gitkeep <practices_dir>/.gitkeep <cognition_dir>/.gitkeep
-```
+## Step 6: Validate the fresh vault
 
-## Step 6: Write SCHEMA.md (fresh only)
+The runner reads back the created files before returning `initialized` and
+verifies:
 
-Read `${CLAUDE_PLUGIN_ROOT}/templates/SCHEMA.md` → write to `{target}/SCHEMA.md`.
+- `.me/config.yaml` parses with `vault_schema_version: 1` and the confirmed
+  three-layer mapping;
+- every configured layer directory and `.gitkeep` exists;
+- `SCHEMA.md` matches the current template;
+- both Agent files contain one complete set of current ME managed markers and
+  preserve all pre-existing bytes outside those markers;
+- `.gitignore` contains exactly one effective `.obsidian/` entry.
 
-## Step 7: Write CLAUDE.md (fresh only)
+If it returns `blocked`, report its structured error and recovery state; do
+not claim initialization succeeded.
 
-Read `${CLAUDE_PLUGIN_ROOT}/templates/CLAUDE-template.md` → write to `{target}/CLAUDE.md`.
+## Step 7: Report
 
-## Step 8: Configure .gitignore (fresh only)
-
-- No `.gitignore` → create from `${CLAUDE_PLUGIN_ROOT}/references/gitignore-snippet.txt`
-- `.gitignore` exists but no `.obsidian/` entry → append snippet
-- Already has `.obsidian/` → skip
-
-Do NOT add `.me/` to `.gitignore` — config should be tracked in git.
-
-## Step 9: Report (fresh only)
-
-```
-me vault initialized.
-
-Created:
-  .me/config.yaml     (layer mapping: raw -> <raw_dir>, practices -> <practices_dir>, cognition -> <cognition_dir>)
-  <raw_dir>/           (+ .gitkeep)
-  <practices_dir>/     (+ .gitkeep)
-  <cognition_dir>/     (+ .gitkeep)
-  SCHEMA.md
-  CLAUDE.md
-  .gitignore           (added .obsidian/ entry)
-
-Next steps:
-  Run `/me:ingest <url>` to add your first research note.
-```
+Report the files and mapped layer directories actually created or safely
+merged. Suggest `/me:ingest <url>` for Claude Code and `$me:ingest <url>` for
+Codex. Do not run Git and do not commit the vault.
 
 ## Constraints
 
-- All workspace paths relative to cwd (or `$ARGUMENTS` path). Never absolute paths for target.
-- Plugin files via `${CLAUDE_PLUGIN_ROOT}`.
-- No git hooks (D-09). No `status:` or `lifecycle:` frontmatter (D-06).
-- Layer directories always from `.me/config.yaml` — never hardcode `raw/`, `practices/`, `cognition/`.
-- `.me/config.yaml` is committed to git — shared across machines.
-- Setup writes only portable vault configuration and does not create runtime directories.
-- Host-local locks, staging, inbox, and recovery data live outside the vault under `~/.me/runtime/vault-<path-hash>/`; never add an absolute runtime path to `.me/config.yaml`. If the vault is on another filesystem, require `ME_RUNTIME_ROOT` to point to an absolute same-filesystem directory; never choose a vault-adjacent fallback or cross-device copy.
+- Existing-vault and failed-preflight routes create no runtime directories.
+- Fresh apply uses the external runtime only for the shared lock and persistent
+  mutation-retirement tombstones; it never writes host-local state into the
+  portable vault.
+- Setup does not create runtime directories inside the vault.
+- Host-local locks, staging, inbox, and recovery state live under
+  `~/.me/runtime/vault-<path-hash>/`.
+- Never store an absolute runtime path in `.me/config.yaml`.
+- If a future mutation is needed, hand it to `$me:update` / `/me:update`;
+  setup is fresh-install only.
+- Layer paths always come from `.me/config.yaml` after initialization.
+- No git hooks. No `status:` or `lifecycle:` frontmatter.

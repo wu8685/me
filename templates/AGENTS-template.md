@@ -13,7 +13,7 @@ Layers cross-reference freely via wikilinks (`[[Note Name]]`). No directional co
 <!-- me:managed:start configuration -->
 ## Configuration
 
-Layer directories are configured in `.me/config.yaml`. The defaults are `raw/`, `practices/`, `cognition/`, but your workspace may use different directory names (configured during `/me:setup`).
+Layer directories are configured in `.me/config.yaml`. The defaults are `raw/`, `practices/`, `cognition/`, but your workspace may use different directory names (configured during `$me:setup`).
 
 To check your layer mapping:
 
@@ -37,14 +37,14 @@ cat .me/config.yaml
 
 | Command | Action |
 |---------|--------|
-| `/me:setup` | Initialize this workspace (already done) |
-| `/me:update` | Preview and, after explicit confirmation, apply forward-only managed vault migrations |
-| `/me:ingest <url> [--mode translate-cn\|summarize\|raw\|transcribe]` | Ingest URL into structured note in the raw layer. Supports HTML articles (auto-detects language/mode) and Bilibili videos (metadata + CC; `--mode transcribe` forces whisper ASR when no CC) |
-| `/me:checklinks [layer]` | Check vault link health — broken wikilinks, orphans, dead-ends (optionally filter by layer) |
-| `/me:autolinks [file] [layer]` | Auto-add wikilinks via LLM concept extraction matched against vault index (bulk or single-note) |
-| `/me:backlinks <note>` | Discover backlinks and unlinked mentions for a note |
-| `/me:move <file> <dest>` | Move/rename a note with wikilink integrity preserved |
-| `/me:search [query] [--tags t1,t2] [--layer L] [--after date] [--before date]` | Search vault by content, tags, layer, date, or wikilink connections |
+| `$me:setup` | Initialize this workspace (already done) |
+| `$me:update` | Preview and, after explicit confirmation, apply forward-only managed vault migrations |
+| `$me:ingest <url> [--mode translate-cn\|summarize\|raw\|transcribe]` | Ingest URL into structured note in the raw layer. Supports HTML articles (auto-detects language/mode) and Bilibili videos (metadata + CC; `--mode transcribe` forces whisper ASR when no CC) |
+| `$me:checklinks [layer]` | Check vault link health — broken wikilinks, orphans, dead-ends (optionally filter by layer) |
+| `$me:autolinks [file] [layer]` | Auto-add wikilinks via LLM concept extraction matched against vault index (bulk or single-note) |
+| `$me:backlinks <note>` | Discover backlinks and unlinked mentions for a note |
+| `$me:move <file> <dest>` | Move/rename a note with wikilink integrity preserved |
+| `$me:search [query] [--tags t1,t2] [--layer L] [--after date] [--before date]` | Search vault by content, tags, layer, date, or wikilink connections |
 <!-- me:managed:end commands -->
 
 <!-- me:managed:start note-templates -->
@@ -64,7 +64,7 @@ Frontmatter schema is defined in `SCHEMA.md` in this workspace root.
 
 After creating or filing a new note in any layer:
 
-1. Run `/me:backlinks <new-note-name>` to discover:
+1. Run `$me:backlinks <new-note-name>` to discover:
    - Existing notes that already reference related topics
    - Unlinked mentions — notes that mention the new note's title but don't wikilink to it
 
@@ -76,15 +76,15 @@ After creating or filing a new note in any layer:
 <!-- me:managed:start search -->
 ## Search
 
-Use `/me:search` as the primary search tool — it combines free-text, tags, layer, date, and wikilink filters:
+Use `$me:search` as the primary search tool — it combines free-text, tags, layer, date, and wikilink filters:
 
 ```
-/me:search transformer                          # free-text search
-/me:search --tags ai,ml                         # filter by tags (OR logic)
-/me:search --layer raw --after 2026-03          # layer + date filter
-/me:search attention --tags ai --layer raw      # combined filters
-/me:search --linked-to "my-note"                # find notes linking to a note
-/me:search --before 2026-04-01 --limit 50       # date + limit
+$me:search transformer                          # free-text search
+$me:search --tags ai,ml                         # filter by tags (OR logic)
+$me:search --layer raw --after 2026-03          # layer + date filter
+$me:search attention --tags ai --layer raw      # combined filters
+$me:search --linked-to "my-note"                # find notes linking to a note
+$me:search --before 2026-04-01 --limit 50       # date + limit
 ```
 
 For quick grep queries (replace dirs with your `.me/config.yaml` values):
@@ -108,8 +108,8 @@ grep -rl "^type: insight" --include="*.md" .
 - **Wikilinks:** `[[filename]]` without path — Obsidian resolves by name
 - **Frontmatter:** defined in `SCHEMA.md` — do not add ad hoc fields
 - **No lifecycle field:** The directory IS the knowledge level. No `status:` or `lifecycle:` field.
-- **Link health:** Run `/me:checklinks` periodically to catch broken wikilinks, orphans, and dead-ends. Filter by layer: `/me:checklinks raw`
-- **Auto-link:** Run `/me:autolinks` to batch-add wikilinks, or `/me:autolinks raw/my-note.md` for a single note
-- **Move/rename:** Always use `/me:move` for wikilink-safe file operations — never shell `mv`
+- **Link health:** Run `$me:checklinks` periodically to catch broken wikilinks, orphans, and dead-ends. Filter by layer: `$me:checklinks raw`
+- **Auto-link:** Run `$me:autolinks` to batch-add wikilinks, or `$me:autolinks raw/my-note.md` for a single note
+- **Move/rename:** Always use `$me:move` for wikilink-safe file operations — never shell `mv`
 - **Layer directories:** Configured in `.me/config.yaml` — all commands read from this config.
 <!-- me:managed:end conventions -->

@@ -18,6 +18,10 @@ me/
 │   ├── runtime-paths.ts          # Runtime resolution and containment
 │   ├── vault-write.ts            # Generic transactional vault writer CLI
 │   ├── vault-write/              # Validation, graph planning and transaction modules
+│   ├── setup-preflight.ts        # Read-only fresh setup safety preflight
+│   ├── update.ts                 # Versioned vault migration CLI
+│   ├── update/                   # Registry, planner, contracts and transaction modules
+│   ├── mutation/                 # Shared no-clobber mutation executor
 │   ├── checklinks.ts             # Link health checker
 │   ├── autolinks.ts              # Auto wikilink generator
 │   ├── backlinks.ts              # Backlink discovery
@@ -28,6 +32,7 @@ me/
 │   ├── ingest/SKILL.md           # URL ingestion skill
 │   ├── decision-brief/SKILL.md   # Evidence-backed decision skill
 │   ├── setup/SKILL.md            # Workspace setup skill
+│   ├── update/SKILL.md           # Confirmed vault migration skill
 │   ├── search/SKILL.md           # Multi-dimensional search skill
 │   ├── checklinks/SKILL.md       # Link health skill
 │   ├── autolinks/SKILL.md        # Auto wikilink skill
@@ -38,6 +43,8 @@ me/
 ├── templates/                    # Templates
 │   ├── SCHEMA.md                 # Frontmatter schema
 │   ├── CLAUDE-template.md        # Agent navigation contract
+│   ├── AGENTS-template.md        # Codex Agent navigation contract
+│   ├── migration-history/0000/   # Immutable version-zero migration inputs
 │   ├── raw-template.md           # Raw layer note template
 │   ├── practices-template.md     # Practices layer template
 │   └── cognition-template.md     # Cognition layer template
@@ -66,6 +73,21 @@ vault 邻近目录，也不会退化为 copy。对外 recovery 使用 `<ME_RUNTI
 ME 1.6 不自动清理 1.5 留下的非空 vault-local runtime state。writer 与
 ingest 都必须在新 runtime 发生 mutation 前 fail closed，让用户先检查旧
 lock、journal 或 staging。
+
+## Versioned vault update
+
+marketplace/plugin upgrade 只更新插件资源；它不会静默修改 vault。用户随后
+通过 `/me:update`（Claude Code）或 `$me:update`（Codex）执行相同协议：
+零写 preview 展示 ordered migrations、paths、warnings 和 exact diffs，
+一次明确确认后，才以该 preview 的 `planDigest` 调用 apply。
+
+`.me/config.yaml` 的 `vault_schema_version` 是 portable、forward-only 的
+managed schema 版本。newer vault、conflict、recovery state 与
+`STALE_PREVIEW` 都 fail closed。apply 在 shared vault lock 内重新规划，
+所有 publication/rollback mutation 复用 `bin/mutation/executor.ts`；
+`.me/config.yaml` 最后发布。journal/staging/originals 位于 host-local
+runtime。只有 `committed` 是成功，其他结果保留结构化 rollback 或 recovery
+信息。ME updater 不执行 Git，也不 stage、commit 或 push 用户 vault。
 
 ## Decision Brief 与 Vault Writer 边界
 
@@ -350,7 +372,10 @@ bash test/vault-test.sh --list
 ### 2. 运行测试
 
 ```bash
+bun test test/*.test.ts
+bash test/typecheck-ingest-finalize.sh
 bash test/vault-test.sh
+npm pack --dry-run
 ```
 
 ### 3. 提交

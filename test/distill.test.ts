@@ -941,7 +941,7 @@ describe('runDistillApply', () => {
     fs.writeFileSync(evPath, evBytesA);
   });
 
-  test('concurrent LOCK_HELD returns conflict with INPUT_CHANGED error', () => {
+  test('concurrent cooperative lock returns conflict with LOCK_HELD error', () => {
     const vault = makeVault();
     writePracticeNote(vault, 'practices/locked.md', practiceContent({
       title: 'Lock test', source: '[[raw/ev]]', project: 'test-proj',
@@ -952,7 +952,7 @@ describe('runDistillApply', () => {
     ].join('\n'));
     const preview = runDistillPreview({ vaultDir: vault, practicePath: 'practices/locked.md' });
     const layout = resolveVaultLayout(vault);
-    const lockPath = path.join(layout.lockDir, 'vault-write.lock');
+    const lockPath = path.join(layout.lockDir, 'vault.lock');
     fs.mkdirSync(layout.lockDir, { recursive: true });
     const lockFd = fs.openSync(lockPath, 'wx');
     fs.writeFileSync(lockFd, JSON.stringify({ version: 1, operationId: 'foreign-lock', startedAt: new Date().toISOString() }));
