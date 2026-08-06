@@ -91,6 +91,19 @@ export interface VaultWriterOptions {
   lockOps?: Partial<LockOperations>;
   /** Test-only injection. Production callers omit this. */
   directoryFsync?(directory: string): void;
+  /**
+   * Additive callback invoked after exclusive lock acquisition and the
+   * authoritative post-lock replan, before any transaction/journal mutations.
+   *
+   * The callback receives the confirmed plan (with verified fingerprint).
+   * If it throws, the lock is safely released and the write aborts with
+   * INPUT_CHANGED — no mutations reach disk.
+   *
+   * This is the integration point for callers (e.g. distill) that must
+   * re-verify external state under the vault-write lock to close the
+   * TOCTOU window between their pre-lock check and the actual write.
+   */
+  afterAuthoritativePlan?(plan: PlannedWrite): void;
 }
 
 type MutationKind = 'link' | 'rename' | 'unlink' | 'mkdir' | 'rmdir';
@@ -104,7 +117,7 @@ type JournalState =
   | 'validated'
   | 'committed';
 
-interface PlannedWrite {
+export interface PlannedWrite {
   request: VaultWriteRequestV1;
   layout: ResolvedVaultLayout;
   target: ResolvedWriteTarget;
@@ -1758,6 +1771,35 @@ export function executeVaultWrite(
   };
 
   try {
+    /*
+     * Post-lock authoritative replan before any mutations.
+     * The callback (afterAuthoritativePlan) fires here so that callers
+     * like distill can re-verify external state under the lock. If the
+     * callback fails, no operation directory or journal is left on disk.
+     */
+    initialPlan = planWrite(vaultDir, requestValue, options.pluginRoot);
+    tx.plan = initialPlan;
+    plannedPaths = [
+      initialPlan.target.vaultRelativePath,
+      ...(initialPlan.index.action === 'none' ? [] : [initialPlan.index.path]),
+    ];
+    tx.hooks.afterLock?.();
+    const afterLockPlan = replanAfterLock(vaultDir, requestValue, options.pluginRoot);
+    if (!compareFingerprints(initialPlan.fingerprint, afterLockPlan.fingerprint)) {
+      throw new VaultWriterError('INPUT_CHANGED');
+    }
+
+    // Invoke caller's post-lock verification callback before any mutations.
+    // Callback failure → lock released safely, no operationDir/journal on disk.
+    if (options.afterAuthoritativePlan) {
+      try {
+        options.afterAuthoritativePlan(initialPlan);
+      } catch (error) {
+        throw new VaultWriterError('INPUT_CHANGED');
+      }
+    }
+
+    // Now safe to create operation directory and journal.
     tx.mkdir(operationDir);
     const journalPath = path.join(operationDir, 'journal.json');
     tx.startJournal(journalPath, {
@@ -1774,21 +1816,20 @@ export function executeVaultWrite(
       metadataPolicy: METADATA_POLICY,
     });
     /*
-     * Bootstrap changes .me directory metadata by design.  The authoritative
-     * write fingerprint is therefore the required post-lock replan, captured
-     * before the public afterLock race window.
+     * Bootstrap (mkdir of operationDir) changes runtime directory metadata.
+     * Replan to capture the updated fingerprint for subsequent verification.
      */
-    initialPlan = planWrite(vaultDir, requestValue, options.pluginRoot);
-    tx.plan = initialPlan;
+    const postBootstrapPlan = planWrite(vaultDir, requestValue, options.pluginRoot);
+    tx.plan = postBootstrapPlan;
     plannedPaths = [
-      initialPlan.target.vaultRelativePath,
-      ...(initialPlan.index.action === 'none' ? [] : [initialPlan.index.path]),
+      postBootstrapPlan.target.vaultRelativePath,
+      ...(postBootstrapPlan.index.action === 'none' ? [] : [postBootstrapPlan.index.path]),
     ];
-    tx.hooks.afterLock?.();
-    const afterLockPlan = replanAfterLock(vaultDir, requestValue, options.pluginRoot);
-    if (!compareFingerprints(initialPlan.fingerprint, afterLockPlan.fingerprint)) {
+    const verifyBootstrapPlan = replanAfterLock(vaultDir, requestValue, options.pluginRoot);
+    if (!compareFingerprints(postBootstrapPlan.fingerprint, verifyBootstrapPlan.fingerprint)) {
       throw new VaultWriterError('INPUT_CHANGED');
     }
+    initialPlan = postBootstrapPlan;
 
     tx.mkdir(stagingDir);
     requestCopy = writeTransient(

@@ -48,6 +48,8 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 | 自动添加 WikiLink | `/me:autolinks` | `me:autolinks` | - | 批量更新笔记链接 |
 | 发现反向链接 | `/me:backlinks <note>` | `me:backlinks` | 笔记名称 | 反向链接列表 |
 | 移动笔记 | `/me:move <file> <dest>` | `me:move` | 源路径, 目标路径 | 更新所有引用 |
+| 诊断 ME 状态 | `/me:doctor` | `me:doctor` | - | 只读的版本化 JSON 诊断报告 + 结论摘要 |
+| 回顾历史会话 | `/me:recall <query>` | `me:recall` | 查询词、时间范围、workspace | 只读的会话证据包：任务级匹配 + 来源 |
 
 ## 底层模块
 
@@ -57,6 +59,8 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 | Wikilink Graph | `bin/wikilink-graph.ts` | 无依赖的链接图引擎 |
 | Vault Write | `bin/vault-write.ts` | 通用笔记写入的预览、校验、索引维护与恢复报告 |
 | Runtime | `bin/runtime.ts` | 查询本机 runtime、准备受控 inbox |
+| Doctor | `bin/doctor.ts` | 只读诊断：vault/plugin 根、版本、config/schema、managed sections、runtime 恢复 |
+| Recall | `bin/recall.ts` | 只读会话证据检索：Codex 本地 session 适配器 + 确定性脱敏 + 证据包 |
 
 ## 可同步 vault 与本机运行时
 
@@ -332,6 +336,140 @@ Unchanged: 0 files
 - `[[name#heading]]` - 标题锚点链接
 
 **检测 Obsidian CLI**，有则使用增强模式，无则使用原生引擎。
+
+## /me:doctor - 只读诊断 ME 状态
+
+**功能：** 把当前 ME 工作空间的"有效状态"汇总成一份结构化报告：
+- 解析出的 vault / plugin / runtime 根；
+- 本地 plugin/package/marketplace 版本（`.codex-plugin`、`.claude-plugin`、
+  `.agents/plugins` 四个 manifest 与 `package.json`）；
+- `.me/config.yaml` 的合法性与层级目录是否存在；
+- `SCHEMA.md` 兼容性：`current` / `edited` / `future` / `malformed` /
+  `missing`（`edited` = 被改动的当前 schema，走 vault migration；`future`
+  只在该 schema 声明了更高的 profile/revision 标记时判定）；
+- 受管 Agent 表面：`dual` / `claude-only` / `codex-only` / `none`；
+- `CLAUDE.md` 受管 section 完整性：missing / duplicated / reordered /
+  malformed / customized；
+- 未完成的 runtime lock / journal / recovery（含精确恢复状态与保留路径）。
+
+**约束（写死，不放开）：** 严格只读。不升级、不迁移、不修复、不清锁、不写
+vault/runtime、不 push/commit；基础诊断不联网；缺失的 runtime 目录保持缺失；
+不做进程监控。保留 ME 1.6.x 的确认与恢复语义。
+
+**用法：**
+```bash
+bun run "$PLUGIN_ROOT/bin/doctor.ts" --vault-dir "$VAULT_DIR"
+# 可选：--plugin-root /path/to/me  --installed-version 1.6.0
+```
+
+输出为 versioned JSON（contract v1，见
+`skills/doctor/references/diagnostic-contract-v1.md`），每条 finding 带稳定
+`code`、`severity` 与 `recommendedAction`。Skill 层再把报告渲染成简洁摘要。
+
+**修复方向三分类（用于向用户解释）：**
+- **Plugin upgrade**：插件落后于 vault/checkout（如 `SCHEMA_FUTURE`、
+  `PLUGIN_INSTALLED_MISMATCH`）→ 升级 ME 插件。
+- **Vault migration**：vault 需要 `/me:setup` 刷新受管文件（如
+  `SCHEMA_MISSING`、`SCHEMA_EDITED`、`CONFIG_MISSING`、managed-section
+  findings）。
+- **Diagnosis**：runtime 状态需要人工检查后再写（如 `RUNTIME_*` findings）。
+
+## /me:recall - 只读回顾历史会话
+
+**功能：** 在本地 Codex session 证据里检索先前的任务，返回**任务级**匹配，
+而不是转储 transcript：
+
+- 默认只在**当前 workspace** 内检索；跨 workspace 检索必须显式
+  `--authorize-cross-workspace`，否则 fail closed（返回
+  `CROSS_WORKSPACE_UNAUTHORIZED` 警告，不搜索）。
+- 证据种类**严格为四种**：`user_statement`（用户发言）、
+  `agent_conclusion`（agent 结论）、`tool_result`（工具调用+输出）、
+  `correction`（后来更正/取代先前说法）。会话里的主张（conversation claims）
+  与工具事实（tool facts）在 `sourceCategory` 区分。
+- **确定性脱敏**：凭证、密钥、邮箱、环境变量、私钥、IP/MAC、疑似长密钥统一
+  替换为 `[REDACTED:<type>]`，统计在 `stats.redactionTokens`；provenance 不做
+  脱敏。单条证据文本有界（≤400 字符），默认不返回完整 transcript。
+- 任务标题非稳定字段：`derivedTitle` 从第一条脱敏后的用户发言推导并标注
+  `titleLabel: "derived"`，不当作权威标题。
+- provenance 暴露 `sourcePath` + `recordIndex`，可回到原始 session（如支持时
+  `codex resume <session_id>`）；不发明自定义 URL。
+- **零写入**：不写 vault / Memory / Agent config / runtime / index / session
+  存储；不建 DB / vector / 持久索引；不联网；会话内容是**不可信数据**，永远
+  不当作指令；agent 结论不当作已验证事实。
+
+**用法：**
+```bash
+bun run "$PLUGIN_ROOT/bin/recall.ts" --vault-dir "$VAULT_DIR" --query "修复 issue"
+# 可选：--after 2026-08-01 --before 2026-08-05T10:00:00Z --workspace DIR \
+#        --authorize-cross-workspace --adapter codex-local --limit 10
+```
+
+输出为 versioned JSON（contract v1，见
+`skills/recall/references/evidence-contract-v1.md`）。空结果也显式成功（exit 0）；
+参数非法 exit 2。
+
+> 未来 `me:reflect` 才负责把经验分类（一次性/workspace/ME-general）、展示
+> 反例与边界、要求确认并使用共享 mutation 契约落盘——**现在不实现 reflect 写**。
+
+## /me:distill - Practice→Cognition 证据门控提炼
+
+**功能：** 把经过验证的 Practices 笔记提升为 Cognition 层认知洞察。
+整个流程以"预览→人工确认→应用"三阶段进行：
+先生成完整的预览（包括目标路径、计划写入的 Markdown 和每个 gate 的判定），
+由人工审阅确认无误后，再用预览摘要（preview digest）执行写入——绝不自动 promotion。
+
+**工作流程：**
+
+1. **Preview** — 对目标 Practice 运行 9 个确定性 gate，生成 `DistillPreviewV1`：
+   - 包括计划写入的 Cognition 路径、完整 Markdown、gate 结果、独立案例、支持证据、
+     矛盾证据、置信度、review 触发条件
+   - 产出 SHA-256 `previewDigest` 用于 apply 阶段的精确匹配
+2. **人工确认** — 检查所有 gate 全部 `pass`、`plannedMarkdown` 无误、独立案例确实独立、
+   矛盾证据已解决
+3. **Apply** — 传入 `previewDigest`，重新运行所有 gate、重建 Markdown、校验 digest
+   匹配后，通过共享 vault-write 事务执行器加锁写入
+
+**9 个 Gate：**
+
+| Gate | 要求 |
+|------|------|
+| `local-provenance` | Practice 笔记位于配置的 practices 层，frontmatter 合法 |
+| `multiple-independent-cases` | 至少有一个来自不同项目且不同来源的独立案例支持 |
+| `counterevidence-search` | 已搜索过反证据 |
+| `no-unresolved-contradiction` | 不存在未解决的高严重性矛盾 |
+| `generalizes-beyond-task` | 洞察可推广到任务之外 |
+| `clear-boundaries` | 实践笔记文档化了边界/局限性 |
+| `justified-confidence` | 置信度有可用证据支撑 |
+| `review-trigger-set` | 设置了 review 日期或触发条件 |
+| `schema-valid-destination` | Cognition 层已配置且能通过 schema 校验 |
+
+**置信度与 Review 来源：** 置信度来自 Practice 正文的 `## Confidence` 段落，
+review 触发条件来自 `## Review` 段落——两者均不写入 Practice frontmatter。
+Promotion 到 Cognition 时，confidence 以 `confidence: low|medium|high` 形式
+进入 Cognition frontmatter，review 触发条件作为 `## Review` 段落保留在 Cognition 正文中。
+
+**安全约束：**
+- 绝不自动 promotion；每次都需人工审阅预览确认
+- 绝不删除、降级或修改源 Practice 笔记
+- 不修改 Practice 笔记的 status/lifecycle frontmatter
+- 同一任务、复制来源或子 agent 会话不算独立案例
+- PR merge/review praise 不算证据
+- 不绕过 lock/transaction/recovery/confirmation 流程
+- 不 commit/push
+
+**用法：**
+```bash
+# Preview
+bun run "$PLUGIN_ROOT/bin/distill.ts" --vault-dir "$VAULT_DIR" preview --practice "practices/some-practice.md"
+
+# Apply（需传入 preview 产出的 digest）
+bun run "$PLUGIN_ROOT/bin/distill.ts" --vault-dir "$VAULT_DIR" apply \
+  --practice "practices/some-practice.md" \
+  --preview-digest "<digest>"
+```
+
+输出为 versioned JSON：preview 阶段输出 `DistillPreviewV1`（contract `distill-preview`），
+apply 阶段输出 `DistillResultV1`；空结果也显式成功（exit 0），参数非法 exit 2。
 
 ## 配置文件
 

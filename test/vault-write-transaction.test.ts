@@ -711,6 +711,13 @@ describe('journal acquisition and phase ownership', () => {
       },
     };
     const result = write(vault, hooks);
+    // afterLock now fires before journal creation → no journal to corrupt
+    if (hookName === 'afterLock') {
+      // Hook may throw because no operationDir exists yet, but the write
+      // should still succeed (committed or non-manual_recovery).
+      expect(result.status).not.toBe('manual_recovery');
+      return;
+    }
     expect(result.status).toBe('manual_recovery');
     const journal = result.recoveries.flatMap(item => item.preservedPaths)
       .find(item => item.endsWith('/journal.json'))!;
@@ -1320,5 +1327,99 @@ describe('README concurrency and cleanup ownership', () => {
     } as Parameters<typeof executeVaultWrite>[2]);
     expect(result.status).toBe('committed');
     expect(result.warnings).toContain('Directory fsync is not supported on this filesystem.');
+  });
+
+  // ── afterAuthoritativePlan callback ──────────────────────────────────
+
+  test('invokes afterAuthoritativePlan with the confirmed plan after lock', () => {
+    const vault = makeVault();
+    let capturedPlan: unknown = null;
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      afterAuthoritativePlan(plan) {
+        capturedPlan = {
+          layer: plan.request.layer,
+          relativePath: plan.request.relativePath,
+          notePath: plan.target.vaultRelativePath,
+        };
+      },
+    });
+    expect(result.status).toBe('committed');
+    expect(capturedPlan).toEqual({
+      layer: 'practices',
+      relativePath: 'decisions/2026-07-26-orchid-choice.md',
+      notePath: 'practices/decisions/2026-07-26-orchid-choice.md',
+    });
+  });
+
+  test('afterAuthoritativePlan throwing aborts with INPUT_CHANGED and releases lock', () => {
+    const vault = makeVault();
+    const lockPath = writerLockPath(vault);
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      afterAuthoritativePlan() {
+        throw new Error('distill digest mismatch');
+      },
+    });
+    expect(result.status).toBe('conflict');
+    expect(result.error?.code).toBe('INPUT_CHANGED');
+    // Lock must be released
+    expect(fs.existsSync(lockPath)).toBeFalse();
+    // No note written
+    expect(fs.existsSync(path.join(
+      vault, 'practices/decisions/2026-07-26-orchid-choice.md',
+    ))).toBeFalse();
+  });
+
+  test('afterAuthoritativePlan fires before operationDir is created', () => {
+    const vault = makeVault();
+    let dirExisted = false;
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      afterAuthoritativePlan() {
+        // Check that no operation directory exists yet
+        const txDir = transactionRoot(vault);
+        const children = fs.readdirSync(txDir).filter(n => n.startsWith('vault-write-'));
+        dirExisted = children.length > 0;
+      },
+    });
+    expect(result.status).toBe('committed');
+    expect(dirExisted).toBeFalse();
+  });
+
+  test('afterAuthoritativePlan failure leaves no operationDir or journal', () => {
+    const vault = makeVault();
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      afterAuthoritativePlan() {
+        throw new Error('callback abort');
+      },
+    });
+    expect(result.status).toBe('conflict');
+    // No operation directory left behind
+    const txDir = transactionRoot(vault);
+    const children = fs.readdirSync(txDir).filter(n => n.startsWith('vault-write-'));
+    expect(children.length).toBe(0);
+  });
+
+  test('afterAuthoritativePlan has access to full plan fingerprint', () => {
+    const vault = makeVault();
+    let fingerprintValid = false;
+    const result = executeVaultWrite(vault, request(), {
+      pluginRoot,
+      mode: 'write',
+      afterAuthoritativePlan(plan) {
+        fingerprintValid =
+          typeof plan.fingerprint.requestDigest === 'string'
+          && plan.fingerprint.requestDigest.length === 64
+          && typeof plan.fingerprint.plannedNoteSha256 === 'string';
+      },
+    });
+    expect(result.status).toBe('committed');
+    expect(fingerprintValid).toBeTrue();
   });
 });

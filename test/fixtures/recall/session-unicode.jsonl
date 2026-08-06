@@ -1,0 +1,4 @@
+{"timestamp":"2026-08-01T11:00:00.000Z","type":"session_meta","payload":{"session_id":"task-u-001","id":"task-u-001","cwd":"/recall-fixture/workspace-a","timestamp":"2026-08-01T11:00:00.000Z","source":"cli"}}
+{"timestamp":"2026-08-01T11:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-u-1","cwd":"/recall-fixture/workspace-a","workspace_roots":["/recall-fixture/workspace-a"]}}
+{"timestamp":"2026-08-01T11:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"💡 研究方案：接入 Unicode 测试 — 使用中文与 emoji 🚀"}}
+{"timestamp":"2026-08-01T11:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"方案已记录 ✅ 支持中文检索","phase":"commentary"}}

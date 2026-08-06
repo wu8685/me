@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "state": "healthy",
+  "plugin": {
+    "name": "me",
+    "root": "/path/to/me",
+    "version": "1.6.1",
+    "source": "checkout",
+    "installedVersion": "1.6.1",
+    "installedMismatch": false
+  },
+  "roots": {
+    "vault": {
+      "resolved": true,
+      "lexical": "/path/to/vault",
+      "canonical": "/path/to/vault"
+    },
+    "runtime": {
+      "root": "<ME_RUNTIME>/vault-000000000000000000000000",
+      "exists": false
+    }
+  },
+  "versions": {
+    "package": "1.6.1",
+    "codexPlugin": "1.6.1",
+    "claudePlugin": "1.6.1",
+    "claudeMarketplace": "1.6.1",
+    "codexMarketplace": null
+  },
+  "config": {
+    "present": true,
+    "valid": true,
+    "parseError": null,
+    "layers": {
+      "raw": "raw",
+      "practices": "practices",
+      "cognition": "cognition"
+    }
+  },
+  "schema": {
+    "present": true,
+    "state": "current",
+    "path": "/path/to/vault/SCHEMA.md",
+    "sha256": "9894ec60c4c7e583a215938ec71186e8a12d24eaedc6dc96a42e2a4aa24480b5"
+  },
+  "agents": {
+    "claude": true,
+    "codex": false,
+    "mode": "claude-only"
+  },
+  "managedSections": {
+    "source": "CLAUDE.md",
+    "reordered": false,
+    "sections": [
+      { "heading": "Knowledge Base", "level": 1, "state": "present" },
+      { "heading": "Configuration", "level": 2, "state": "present" },
+      { "heading": "Layer Map", "level": 2, "state": "present" },
+      { "heading": "Commands", "level": 2, "state": "present" },
+      { "heading": "Note Templates", "level": 2, "state": "present" },
+      { "heading": "After Creating a Note", "level": 2, "state": "present" },
+      { "heading": "Search", "level": 2, "state": "present" },
+      { "heading": "Conventions", "level": 2, "state": "present" }
+    ]
+  },
+  "runtime": {
+    "exists": false,
+    "locks": [],
+    "recoveries": [],
+    "legacy": [],
+    "ingestPending": []
+  },
+  "findings": [
+    { "code": "CONFIG_VALID", "severity": "info", "category": "config", "message": "Layer configuration is valid.", "recommendedAction": "No action needed." },
+    { "code": "SCHEMA_CURRENT", "severity": "info", "category": "schema", "message": "Schema matches the current ME version.", "recommendedAction": "No action needed." },
+    { "code": "PLUGIN_VERSION_CONSISTENT", "severity": "info", "category": "versions", "message": "All plugin manifests agree on version 1.6.1.", "recommendedAction": "No action needed." },
+    { "code": "AGENT_SURFACE_CLAUDE", "severity": "info", "category": "agents", "message": "Claude managed surface (CLAUDE.md) is present.", "recommendedAction": "No action needed." }
+  ]
+}

@@ -140,7 +140,7 @@ function parseStringScalar(raw: string): string {
   return value;
 }
 
-function parseLayerConfig(text: string): Partial<Record<LogicalLayer, string>> {
+export function parseLayerConfig(text: string): Partial<Record<LogicalLayer, string>> {
   const lines = text.split(/\r?\n/);
   const layerHeaders: number[] = [];
   for (let index = 0; index < lines.length; index += 1) {

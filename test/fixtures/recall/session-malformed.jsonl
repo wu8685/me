@@ -1,0 +1,7 @@
+{"timestamp":"2026-08-01T10:00:00.000Z","type":"session_meta","payload":{"session_id":"task-m-001","id":"task-m-001","cwd":"/recall-fixture/workspace-a","timestamp":"2026-08-01T10:00:00.000Z","source":"cli"}}
+{"timestamp":"2026-08-01T10:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-m-1","cwd":"/recall-fixture/workspace-a","workspace_roots":["/recall-fixture/workspace-a"]}}
+{"timestamp":"2026-08-01T10:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"处理损坏日志"}}
+NOT VALID JSON AT ALL
+{"timestamp":"2026-08-01T10:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"日志已清理","phase":"commentary"}}
+also garbage
+{"timestamp":"2026-08-01T10:01:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}

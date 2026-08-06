@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "contract": "session-evidence",
+  "generatedAt": "2026-08-05T00:00:00.000Z",
+  "query": { "text": "调试", "topic": null, "title": null, "after": null, "before": null, "limit": 20 },
+  "scope": {
+    "workspace": {
+      "requested": "/recall-fixture/workspace-a",
+      "canonical": "/recall-fixture/workspace-a",
+      "resolved": false,
+      "current": true
+    },
+    "requestedWorkspace": null,
+    "crossWorkspace": false,
+    "authorized": true
+  },
+  "adapters": {
+    "requested": ["codex-local"],
+    "active": ["codex-local"],
+    "unsupported": []
+  },
+  "tasks": [
+    {
+      "taskId": "task-a-001",
+      "sessionId": "task-a-001",
+      "adapter": "codex-local",
+      "workspace": "/recall-fixture/workspace-a",
+      "derivedTitle": "修复 issue： 用多agent帮我调试 ahsir #37 的问题",
+      "titleLabel": "derived",
+      "startedAt": "2026-08-03T09:00:00.000Z",
+      "endedAt": "2026-08-03T09:03:00.000Z",
+      "sources": ["/recall-fixture/sessions/session-a.jsonl"],
+      "evidenceCount": 5,
+      "evidence": [
+        {
+          "key": "task-a-001:3",
+          "kind": "user_statement",
+          "sourceCategory": "conversation",
+          "at": "2026-08-03T09:00:02.000Z",
+          "text": "修复 issue： 用多agent帮我调试 ahsir #37 的问题",
+          "redacted": false,
+          "truncated": false,
+          "provenance": {
+            "sessionId": "task-a-001",
+            "threadId": "task-a-001",
+            "sourcePath": "/recall-fixture/sessions/session-a.jsonl",
+            "recordIndex": 3,
+            "recordType": "event_msg",
+            "payloadType": "user_message"
+          },
+          "supersedes": null,
+          "detection": null
+        }
+      ],
+      "evidenceTruncated": false
+    }
+  ],
+  "corrections": [],
+  "warnings": [],
+  "stats": {
+    "sessionsScanned": 1,
+    "sessionsInScope": 1,
+    "recordsScanned": 11,
+    "malformedRecords": 0,
+    "truncatedRecords": 0,
+    "tasksMatched": 1,
+    "evidenceEmitted": 5,
+    "coalescedDuplicates": 1,
+    "redactionTokens": {}
+  }
+}

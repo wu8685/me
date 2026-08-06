@@ -4,7 +4,10 @@
   "description": "A Claude Code / Codex plugin for knowledge management and evidence-backed decision briefs",
   "scripts": {
     "test": "bash test/vault-test.sh",
-    "test:ingest": "bun test test/ingest-*.test.ts"
+    "test:ingest": "bun test test/ingest-*.test.ts",
+    "test:doctor": "bun test test/doctor.test.ts",
+    "test:recall": "bun test test/recall.test.ts",
+    "test:distill": "bun test test/distill.test.ts"
   },
   "files": [
     ".agents/plugins/marketplace.json",
@@ -30,7 +33,10 @@
     "move": "bun run bin/move.ts",
     "ingest": "bun run bin/ingest.ts",
     "me-runtime": "bin/runtime.ts",
-    "vault-write": "bin/vault-write.ts"
+    "vault-write": "bin/vault-write.ts",
+    "doctor": "bin/doctor.ts",
+    "recall": "bin/recall.ts",
+    "distill": "bin/distill.ts"
   },
   "keywords": [
     "knowledge-management",

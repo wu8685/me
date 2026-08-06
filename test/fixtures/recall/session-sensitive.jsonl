@@ -1,0 +1,5 @@
+{"timestamp":"2026-08-01T09:00:00.000Z","type":"session_meta","payload":{"session_id":"task-s-001","id":"task-s-001","cwd":"/recall-fixture/workspace-a","timestamp":"2026-08-01T09:00:00.000Z","source":"cli"}}
+{"timestamp":"2026-08-01T09:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-s-1","cwd":"/recall-fixture/workspace-a","workspace_roots":["/recall-fixture/workspace-a"]}}
+{"timestamp":"2026-08-01T09:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"帮我配置新服务，key 是 glpat-test-abcdefghijklmnop123456789，联系 wuke@example.com"}}
+{"timestamp":"2026-08-01T09:00:04.000Z","type":"response_item","payload":{"type":"custom_tool_call","id":"ctc-s-1","call_id":"call-s-1","name":"write_file","input":{"path":"/recall-fixture/workspace-a/.env"}}}
+{"timestamp":"2026-08-01T09:00:05.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-s-1","output":"The secret is:\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDbg\n-----END PRIVATE KEY-----\nCODEX_HOME=/secret/path"}}
