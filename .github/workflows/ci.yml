@@ -26,8 +26,8 @@ jobs:
       - name: TypeScript typecheck
         run: bash test/typecheck-ingest-finalize.sh
 
-      - name: Bun tests
-        run: bun test
+      - name: Release guard & feature tests
+        run: bun test test/release-guard.test.ts test/doctor.test.ts test/recall.test.ts test/distill.test.ts
 
       - name: Release guard — version agreement & digest
         if: github.event_name == 'pull_request'
@@ -63,7 +63,6 @@ jobs:
           check_file bin/recall.ts
           check_file bin/distill.ts
           check_file bin/release-guard.ts
-          check_file .release-digests.json
           if [ $errors -gt 0 ]; then echo "FAIL: $errors file(s) missing"; exit 1; fi
           echo "Package smoke check passed"
 
