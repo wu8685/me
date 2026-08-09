@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Site rollout target",
+    "structure": "summary"
+  },
+  "sources": [
+    { "id": "S1", "kind": "vault", "ref": "raw/agentic/plan.md", "date": "2026-06-01" }
+  ],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "已达成 99% 的页面生成成功率。",
+      "type": "target",
+      "sources": ["S1"],
+      "evidenceDate": "2026-06-01",
+      "confidence": "high"
+    }
+  ]
+}

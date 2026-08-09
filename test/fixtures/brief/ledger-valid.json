@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Agentic site program review",
+    "audience": "executive staff",
+    "purpose": "quarterly report",
+    "structure": "executive-report",
+    "maxWords": 300,
+    "freshnessDays": 120
+  },
+  "sources": [
+    { "id": "S1", "kind": "vault", "ref": "raw/agentic/site-metrics.md", "date": "2026-07-20" },
+    { "id": "S2", "kind": "vault", "ref": "practices/site-rollout.md", "date": "2026-08-01" },
+    { "id": "S3", "kind": "session", "ref": "session:9f1c", "authorized": true, "date": "2026-08-02" }
+  ],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "The program builds executive reporting sites from vault evidence.",
+      "type": "fact",
+      "sources": ["S1"],
+      "evidenceDate": "2026-07-20",
+      "confidence": "high"
+    },
+    {
+      "id": "C2",
+      "text": "Site generation succeeded for 41 of 45 pages in the August run.",
+      "type": "verified_result",
+      "sources": ["S2"],
+      "evidenceDate": "2026-08-01",
+      "confidence": "high",
+      "decisive": true,
+      "metric": {
+        "value": 91,
+        "unit": "%",
+        "scope": "45 pages in the 2026-08-01 run",
+        "baseline": "72% in the 2026-06 run"
+      }
+    },
+    {
+      "id": "C3",
+      "text": "The team received a division-level commendation for the program.",
+      "type": "recognition",
+      "sources": ["S2"],
+      "evidenceDate": "2026-08-01",
+      "confidence": "medium"
+    },
+    {
+      "id": "C4",
+      "text": "Extend the rollout to the remaining two departments next quarter.",
+      "type": "recommendation",
+      "sources": ["S2"],
+      "confidence": "medium",
+      "decisive": true
+    }
+  ],
+  "briefText": "Result: 41 of 45 pages generated (91%, baseline 72%) [C2]. The division commended the program [C3]. Next: extend to two departments [C4]."
+}

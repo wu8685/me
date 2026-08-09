@@ -278,6 +278,36 @@ decision:
 
 保存要求至少有一篇实际影响本次建议、已经存在于 vault 的本地来源。ME 会先预览目标路径和索引动作，再尝试写入配置中的 Practices 目录；按上面的示例会写入 `field-notes/decisions/`。只有写入结果明确 committed 才会报告已保存；没有合格来源、路径冲突、校验失败或环境不支持时会说明 `not written`，不会改用另一个文件名，也不会自动提升到 Cognition。
 
+## 生成证据校准简报（/me:brief）
+
+当任务是把已有证据整理成一份汇报、复盘、申报材料或项目总结——而不是做选择——用
+`/me:brief`（Codex：`$me:brief`）：
+
+```text
+/me:brief 把第三季度的 Agentic 建站项目整理成一份 300 字的管理层汇报
+```
+
+ME 会先和你确认 brief contract（受众、用途、结构、字数、证据新鲜度窗口），再经
+`me:search` 检索 vault，并在写作前构建一份 **claim ledger**：每条关键主张被分类为
+`fact`、`target`、`verified_result`、`inference`、`correction`、`recognition`、
+`recommendation` 或 `unknown`，带出来源、证据日期与置信度。会话证据只有在你显式授权
+后才通过 `me:recall` 引入。
+
+ledger 和成稿都经过确定性校验器检查（同一输入在 Claude Code 与 Codex 产出相同报告）：
+
+```bash
+bun run /path/to/me/bin/brief.ts validate --ledger ledger.json --now 2026-08-09T00:00:00Z
+```
+
+校验器保证：目标不会被写成已达成的结果；量化结果保留单位、范围、基线与证据日期；
+没有证据支撑的最高级措辞（如 "highest"、"最佳"）会被标记并改写成保守表述；后来的更正
+始终可见并取代旧说法；表彰归表彰、结果归结果——"没获奖""工作仍有价值""获得组织认可"
+不会被合并成一个判断。证据不足时直接说明缺什么，不编造叙事。
+
+输出默认只在对话中，conclusion-first，并附一份 compact provenance appendix（claim ID →
+来源 → 日期）。显式授权后可以保存到 Practices（`briefs/YYYY-MM-DD-<slug>.md`），走与
+decision-brief 相同的 preview → 确认 → write 流程；简报永远不会被写入 Cognition。
+
 ## 搜索笔记
 
 ```bash
@@ -331,7 +361,17 @@ decision:
 
 # 移动到不同层级
 /me:move raw/note.md practices/note.md
+
+# 嵌套目录中的笔记：纯文件名会递归解析
+/me:move 2026-07-28-example 2026-07-21-example
+
+# 也可以直接给 vault 相对路径
+/me:move knowledge/raw/records/work/org/2026-07-28-example.md cognition/example.md
 ```
+
+纯文件名在多个目录下命中时会报歧义错误并列出候选路径，改用 layer 相对路径或
+vault 相对路径消歧。注意：`/me:move` 只维护 WikiLink，普通 Markdown 链接
+（`[text](path)`）不会被重写。
 
 ## 诊断 ME 状态（/me:doctor）
 

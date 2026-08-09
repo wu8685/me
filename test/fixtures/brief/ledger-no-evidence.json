@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Unknown topic with no notes",
+    "structure": "summary"
+  },
+  "sources": [],
+  "claims": []
+}

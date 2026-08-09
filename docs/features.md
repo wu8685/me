@@ -44,6 +44,7 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 | 升级 vault schema | `/me:update` | `me:update` | cwd 或一个 vault 路径 | 零写 preview；确认后的 forward-only migration |
 | 摄入外部材料 | `/me:ingest <source>` | `me:ingest` | URL 或 Source Bundle | 结构化 Markdown 笔记与本地素材 |
 | 生成决策简报 | `/me:decision-brief <问题>` | `me:decision-brief` | 待决问题、约束与相关证据 | 建议、选项比较、验证实验与复盘条件 |
+| 生成证据校准简报 | `/me:brief <主题>` | `me:brief` | 主题、受众、用途、结构与字数预算 | conclusion-first 简报 + claim ledger 出处附录 |
 | 多维搜索笔记 | `/me:search` | `me:search` | 查询条件 | 匹配笔记列表 |
 | 链接健康检查 | `/me:checklinks` | `me:checklinks` | - | 断链/孤儿/死结报告 |
 | 自动添加 WikiLink | `/me:autolinks` | `me:autolinks` | - | 批量更新笔记链接 |
@@ -63,6 +64,7 @@ Claude Code 侧表现为 `/me:*` slash command；Codex 侧安装插件后表现�
 | Runtime | `bin/runtime.ts` | 查询本机 runtime、准备受控 inbox |
 | Doctor | `bin/doctor.ts` | 只读诊断：vault/plugin 根、版本、config/schema、managed sections、runtime 恢复 |
 | Recall | `bin/recall.ts` | 只读会话证据检索：Codex 本地 session 适配器 + 确定性脱敏 + 证据包 |
+| Brief | `bin/brief.ts` | 确定性 claim ledger 校验：unsupported-language guard、supersession、字数预算与出处保留 |
 
 ## 可同步 vault 与本机运行时
 
@@ -213,6 +215,35 @@ source: "https://example.com/article"
 
 通用 `vault-write` 提供两个阶段：`preview` 先展示目标路径、索引动作和校验结果，不写文件；`write` 在同一请求通过校验后写入笔记并维护索引。调用方只有收到明确的 committed 结果才应报告保存成功；冲突、环境不支持或需要人工恢复时，应如实报告未写入或恢复指引。
 
+## /me:brief - 证据校准简报（Brief）
+
+**功能：** 把异构证据整理成面向特定受众的简洁叙事——executive 汇报、技术叙事、复盘、奖项申报、项目总结——同时保留每条主张的出处。与 `me:decision-brief` 不同，brief 不强制产出决策。
+
+**工作流程：**
+
+1. 先建立 brief contract：主题、受众、用途、期望行动、结构、字数、语气与证据新鲜度窗口；
+2. 通过 `me:search` 检索当前 vault；会话证据需用户显式授权后才经 `me:recall` 获取，跨 workspace 另有其自身授权边界；
+3. 写作前先构建 claim ledger，区分八类主张：`fact` / `target` / `verified_result` / `inference` / `correction` / `recognition` / `recommendation` / `unknown`；
+4. 用确定性校验器检查 ledger，再起草、再校验成稿。
+
+**确定性校验（`bin/brief.ts validate`）：**
+
+```bash
+bun run "$PLUGIN_ROOT/bin/brief.ts" validate --ledger ledger.json --now 2026-08-09T00:00:00Z
+```
+
+- 同一 ledger + 同一 `--now` 在 Claude Code 与 Codex 两端产出逐字节相同的报告（contract `brief-ledger` v1）；
+- target 不得使用已完成措辞，verified_result 必须带 unit、scope、baseline 与证据日期；
+- 无证据支撑的最高级措辞（first / only / best / highest / 最高 / 唯一 等）被标记并给出保守改写，而不是删除主张；
+- correction 必须指向被取代的 claim，被取代的 claim 保持可见；矛盾双方都保留；
+- recognition 不得断言技术有效性或结果——"未获奖""工作仍有价值""获得组织认可"是三条独立事实；
+- 字数预算超限时报错，且 decisive claims 及其出处必须在正文中保留；
+- 严格只读：不写 vault / runtime / 任何文件，不联网。exit 0 表示报告已产出（包括 findings 与证据不足），exit 2 表示参数或输入非法。
+
+**输出：** conclusion-first，五种确定性结构：executive report、technical narrative、retrospective、nomination/application、带字数预算的 summary。详细证据留在 compact provenance appendix 或机器可读 claim map，不塞进主叙事。
+
+**保存：** 默认只在对话返回。显式授权后仅保存为 Practices 笔记（`briefs/YYYY-MM-DD-<slug>.md`，`type: reflection`），复用共享 vault-write preview/confirmation/mutation 流程；绝不写入 Cognition。
+
 ## /me:checklinks - 链接健康检查
 
 **功能：** 检查知识库链接健康状态。
@@ -357,6 +388,12 @@ Unchanged: 0 files
 - 同目录重命名：`/me:move old-name new-name`
 - 跨目录移动：`/me:move old-name practices/new-name.md`
 - 带目录移动：`/me:move raw/old.md practices/new.md`
+
+**源笔记的三种写法（按顺序解析，先中先用）：**
+1. vault 相对路径：`/me:move knowledge/raw/records/work/org/note.md ...`
+2. layer 相对路径：`records/work/org/note.md` 会拼到每个配置的 layer 根目录下试
+3. 纯文件名（stem）：`note` 会在所有 layer 里递归查找，嵌套目录中的笔记也能解析；
+   同名多处命中时报歧义错误并列出所有候选路径，改用前两种写法消歧
 
 **处理的 WikiLink 变体：**
 - `[[name]]` - 基础链接

@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Rendering performance",
+    "structure": "technical-narrative"
+  },
+  "sources": [
+    { "id": "S1", "kind": "vault", "ref": "practices/render-benchmark.md", "date": "2026-07-30" }
+  ],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "Median render time dropped to 820 ms.",
+      "type": "verified_result",
+      "sources": ["S1"],
+      "evidenceDate": "2026-07-30",
+      "confidence": "high",
+      "metric": {
+        "value": 820,
+        "unit": "ms",
+        "scope": "median of 200 renders on the reference set"
+      }
+    },
+    {
+      "id": "C2",
+      "text": "缓存命中率明显上升。",
+      "type": "verified_result",
+      "sources": ["S1"],
+      "evidenceDate": "2026-07-30",
+      "confidence": "medium"
+    },
+    {
+      "id": "C3",
+      "text": "P95 render time improved.",
+      "type": "verified_result",
+      "sources": ["S1"],
+      "confidence": "medium",
+      "metric": {
+        "value": 1450,
+        "scope": "p95 of 200 renders on the reference set",
+        "baseline": "2100 ms before the change"
+      }
+    }
+  ]
+}

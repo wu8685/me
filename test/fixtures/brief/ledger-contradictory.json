@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Build capacity report",
+    "structure": "technical-narrative"
+  },
+  "sources": [
+    { "id": "S1", "kind": "vault", "ref": "raw/build/metrics-may.md", "date": "2026-05-10" },
+    { "id": "S2", "kind": "vault", "ref": "raw/build/metrics-june.md", "date": "2026-06-10" }
+  ],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "The build cluster supports 20 concurrent jobs.",
+      "type": "fact",
+      "sources": ["S1"],
+      "evidenceDate": "2026-05-10",
+      "confidence": "medium",
+      "contradicts": ["C2"]
+    },
+    {
+      "id": "C2",
+      "text": "The build cluster supports 12 concurrent jobs.",
+      "type": "fact",
+      "sources": ["S2"],
+      "evidenceDate": "2026-06-10",
+      "confidence": "medium"
+    },
+    {
+      "id": "C3",
+      "text": "The queue drains in under a minute.",
+      "type": "fact",
+      "sources": ["S1"],
+      "evidenceDate": "2026-05-10",
+      "confidence": "low",
+      "contradicts": ["C9"]
+    }
+  ]
+}
