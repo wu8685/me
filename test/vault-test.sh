@@ -6584,12 +6584,12 @@ test_release_digests_store_exists() {
   local store="$PLUGIN_ROOT/.release-digests.json"
   assert_file_exists "$store" || return 1
 
-  # Must contain the current version
+  # Must contain the current version with a contentDigest
   local current_version=$(node -e 'console.log(require(process.argv[1]).version)' "$PLUGIN_ROOT/package.json")
   node -e '
     const store=require(process.argv[1]);
     const v=process.argv[2];
-    if (!store.entries || !store.entries.some(e=>e.version===v)) process.exit(1);
+    if (!store.entries || !store.entries.some(e=>e.version===v && (e.contentDigest || e.fileListDigest))) process.exit(1);
   ' "$store" "$current_version" || {
     echo -e "    ${RED}FAIL${NC}: digest store missing entry for version $current_version"
     return 1
@@ -6597,7 +6597,7 @@ test_release_digests_store_exists() {
 }
 
 test_release_guard_rejects_digest_conflict() {
-  # Record a fake digest for current version, then verify guard rejects different content
+  # Record a fake content digest for current version, then verify guard rejects different content
   local tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/me-digest-conflict.XXXXXX")
   mkdir -p "$tmp_root/.claude-plugin" "$tmp_root/.codex-plugin" "$tmp_root/.agents/plugins"
   mkdir -p "$tmp_root/bin" "$tmp_root/skills" "$tmp_root/templates"
@@ -6608,16 +6608,16 @@ test_release_guard_rejects_digest_conflict() {
   cp "$PLUGIN_ROOT/.codex-plugin/plugin.json" "$tmp_root/.codex-plugin/plugin.json"
   cp "$PLUGIN_ROOT/.agents/plugins/marketplace.json" "$tmp_root/.agents/plugins/marketplace.json"
 
-  # Write a fake digest store with a known digest
+  # Write a fake digest store with a contentDigest — different from what the guard will compute
   local fake_digest="0000000000000000000000000000000000000000000000000000000000000000"
   node -e '
-    const s={entries:[{version:"1.7.0",fileListDigest:process.argv[2],recordedAt:"2026-01-01T00:00:00.000Z",commitSha:"abc1234"}]};
+    const s={entries:[{version:"1.7.0",contentDigest:process.argv[2],recordedAt:"2026-01-01T00:00:00.000Z",commitSha:"abc1234"}]};
     require("fs").writeFileSync(process.argv[1],JSON.stringify(s,null,2));
   ' "$tmp_root/.release-digests.json" "$fake_digest"
 
   bun "$PLUGIN_ROOT/bin/release-guard.ts" check --root "$tmp_root" 2>/dev/null && {
     rm -rf "$tmp_root"
-    echo -e "    ${RED}FAIL${NC}: release guard should have rejected digest conflict"
+    echo -e "    ${RED}FAIL${NC}: release guard should have rejected content digest conflict"
     return 1
   }
   rm -rf "$tmp_root"
@@ -6950,6 +6950,8 @@ main() {
     run_test test_recall_no_full_transcripts
     run_test test_recall_zero_write
     run_test test_recall_packaged_release
+    run_test test_recall_docs_and_skill
+
     # Quick task 260809-mt: Release invariants (Issue #13)
     run_test test_version_manifests_agree
     run_test test_release_guard_accepts_agreed_manifests

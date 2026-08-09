@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed for git diff against base
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - name: TypeScript typecheck (focused)
+        run: bash test/typecheck-ingest-finalize.sh
+
+      - name: Bun tests
+        run: bun test
+
+      - name: Release guard — version agreement & digest
+        run: bun bin/release-guard.ts check --base-ref "origin/${{ github.base_ref }}"
+
+      - name: Release guard — affected paths
+        run: bun bin/release-guard.ts check-affected
+
+      - name: Package smoke check
+        run: npm pack --dry-run
+
+      - name: Shell tests (vault-test.sh)
+        run: bash test/vault-test.sh
