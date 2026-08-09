@@ -26,8 +26,8 @@ jobs:
       - name: TypeScript typecheck
         run: bash test/typecheck-ingest-finalize.sh
 
-      - name: Release guard & feature tests
-        run: bun test test/release-guard.test.ts test/doctor.test.ts test/recall.test.ts test/distill.test.ts
+      - name: Bun tests (full suite)
+        run: bun test
 
       - name: Release guard — version agreement & digest
         if: github.event_name == 'pull_request'
