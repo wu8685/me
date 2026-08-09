@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed for git diff against base
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install
+
+      - name: TypeScript typecheck
+        run: bash test/typecheck-ingest-finalize.sh
+
+      - name: Release guard & feature tests
+        run: bun test test/release-guard.test.ts test/doctor.test.ts test/recall.test.ts test/distill.test.ts
+
+      - name: Release guard — version agreement & digest
+        if: github.event_name == 'pull_request'
+        run: bun bin/release-guard.ts check --base-ref "origin/${{ github.base_ref }}"
+
+      - name: Release guard — check (push to main)
+        if: github.event_name == 'push'
+        run: bun bin/release-guard.ts check
+
+      - name: Release guard — affected paths
+        run: bun bin/release-guard.ts check-affected
+
+      - name: Package smoke (pack + verify shipped files)
+        run: |
+          set -euo pipefail
+          npm pack
+          PKG=$(ls me-*.tgz 2>/dev/null | head -1)
+          if [ -z "$PKG" ]; then
+            echo "FAIL: npm pack produced no tarball"
+            exit 1
+          fi
+          echo "Packed: $PKG ($(wc -c < "$PKG") bytes)"
+          rm -rf /tmp/smoke-install
+          mkdir -p /tmp/smoke-install
+          tar -xzf "$PKG" -C /tmp/smoke-install
+          PKG_DIR="/tmp/smoke-install/package"
+          errors=0
+          check_file() { if test -f "$PKG_DIR/$1"; then echo "  ✓ $1"; else echo "  ✗ MISSING: $1"; errors=$((errors+1)); fi; }
+          check_file skills/doctor/SKILL.md
+          check_file skills/recall/SKILL.md
+          check_file skills/distill/SKILL.md
+          check_file bin/doctor.ts
+          check_file bin/recall.ts
+          check_file bin/distill.ts
+          check_file bin/release-guard.ts
+          if [ $errors -gt 0 ]; then echo "FAIL: $errors file(s) missing"; exit 1; fi
+          echo "Package smoke check passed"
+
+      - name: Shell tests (release guard)
+        run: bash test/vault-test.sh test_version_manifests_agree test_release_guard_accepts_agreed_manifests test_release_guard_rejects_mismatched_version test_release_guard_check_affected_lists_paths test_release_digests_store_exists test_release_guard_rejects_digest_conflict test_package_contains_doctor_recall_distill

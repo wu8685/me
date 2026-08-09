@@ -609,8 +609,8 @@ test_decision_brief_discovery_and_release_version() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.6.3" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected current release version 1.6.3"
+  [ "$(echo "$versions" | head -n 1)" = "1.7.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected current release version 1.7.0"
     return 1
   }
 }
@@ -783,8 +783,8 @@ test_ingest_docs_rich_media() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.6.3" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.6.3"
+  [ "$(echo "$versions" | head -n 1)" = "1.7.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.7.0"
     return 1
   }
 
@@ -6760,6 +6760,140 @@ test_brief_docs() {
 
 # ── Main ────────────────────────────────────────────────────────────
 
+# ── Release invariants (Issue #13) ──────────────────────────────────
+
+test_version_manifests_agree() {
+  # All four version-bearing manifests must report the same version.
+  local pkg_version=$(node -e 'console.log(require(process.argv[1]).version)' "$PLUGIN_ROOT/package.json")
+  local claude_version=$(node -e 'console.log(require(process.argv[1]).version)' "$PLUGIN_ROOT/.claude-plugin/plugin.json")
+  local claude_mkt_version=$(node -e 'console.log(require(process.argv[1]).plugins[0].version)' "$PLUGIN_ROOT/.claude-plugin/marketplace.json")
+  local codex_version=$(node -e 'console.log(require(process.argv[1]).version)' "$PLUGIN_ROOT/.codex-plugin/plugin.json")
+
+  if [ "$pkg_version" != "$claude_version" ] || [ "$pkg_version" != "$claude_mkt_version" ] || [ "$pkg_version" != "$codex_version" ]; then
+    echo -e "    ${RED}FAIL${NC}: version manifests disagree: pkg=$pkg_version claude=$claude_version claude-mkt=$claude_mkt_version codex=$codex_version"
+    return 1
+  fi
+  echo "    version: $pkg_version (all manifests agree)"
+}
+
+test_release_guard_accepts_agreed_manifests() {
+  bun "$PLUGIN_ROOT/bin/release-guard.ts" check 2>/dev/null || {
+    echo -e "    ${RED}FAIL${NC}: release guard rejected agreed manifests"
+    return 1
+  }
+}
+
+test_release_guard_rejects_mismatched_version() {
+  local tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/me-manifest-disagree.XXXXXX")
+  mkdir -p "$tmp_root/.claude-plugin" "$tmp_root/.codex-plugin"
+
+  # Copy manifests and introduce a mismatch
+  cp "$PLUGIN_ROOT/package.json" "$tmp_root/package.json"
+  cp "$PLUGIN_ROOT/.claude-plugin/plugin.json" "$tmp_root/.claude-plugin/plugin.json"
+  cp "$PLUGIN_ROOT/.claude-plugin/marketplace.json" "$tmp_root/.claude-plugin/marketplace.json"
+
+  local codex_json=$(cat "$PLUGIN_ROOT/.codex-plugin/plugin.json")
+  echo "$codex_json" | node -e '
+    const j=JSON.parse(require("fs").readFileSync("/dev/stdin","utf8"));
+    j.version="99.99.99";
+    require("fs").writeFileSync(process.argv[1],JSON.stringify(j,null,2));
+  ' "$tmp_root/.codex-plugin/plugin.json"
+
+  bun "$PLUGIN_ROOT/bin/release-guard.ts" check --root "$tmp_root" 2>/dev/null && {
+    rm -rf "$tmp_root"
+    echo -e "    ${RED}FAIL${NC}: release guard should have rejected version mismatch"
+    return 1
+  }
+  rm -rf "$tmp_root"
+}
+
+test_release_guard_check_affected_lists_paths() {
+  local out
+  out=$(bun "$PLUGIN_ROOT/bin/release-guard.ts" check-affected 2>&1) || return 1
+  echo "$out" | grep -q "skills" || { echo -e "    ${RED}FAIL${NC}: check-affected missing skills"; return 1; }
+  echo "$out" | grep -q "bin/" || { echo -e "    ${RED}FAIL${NC}: check-affected missing bin/"; return 1; }
+  echo "$out" | grep -q "templates/" || { echo -e "    ${RED}FAIL${NC}: check-affected missing templates/"; return 1; }
+  echo "$out" | grep -q "package.json" || { echo -e "    ${RED}FAIL${NC}: check-affected missing package.json"; return 1; }
+}
+
+test_release_digests_store_exists() {
+  local store="$PLUGIN_ROOT/.release-digests.json"
+  assert_file_exists "$store" || return 1
+
+  # Must contain the current version with a contentDigest
+  local current_version=$(node -e 'console.log(require(process.argv[1]).version)' "$PLUGIN_ROOT/package.json")
+  node -e '
+    const store=require(process.argv[1]);
+    const v=process.argv[2];
+    if (!store.entries || !store.entries.some(e=>e.version===v && (e.contentDigest || e.fileListDigest))) process.exit(1);
+  ' "$store" "$current_version" || {
+    echo -e "    ${RED}FAIL${NC}: digest store missing entry for version $current_version"
+    return 1
+  }
+}
+
+test_release_guard_rejects_digest_conflict() {
+  # Record a fake content digest for current version, then verify guard rejects different content
+  local tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/me-digest-conflict.XXXXXX")
+  mkdir -p "$tmp_root/.claude-plugin" "$tmp_root/.codex-plugin" "$tmp_root/.agents/plugins"
+  mkdir -p "$tmp_root/bin" "$tmp_root/skills" "$tmp_root/templates"
+
+  cp "$PLUGIN_ROOT/package.json" "$tmp_root/package.json"
+  cp "$PLUGIN_ROOT/.claude-plugin/plugin.json" "$tmp_root/.claude-plugin/plugin.json"
+  cp "$PLUGIN_ROOT/.claude-plugin/marketplace.json" "$tmp_root/.claude-plugin/marketplace.json"
+  cp "$PLUGIN_ROOT/.codex-plugin/plugin.json" "$tmp_root/.codex-plugin/plugin.json"
+  cp "$PLUGIN_ROOT/.agents/plugins/marketplace.json" "$tmp_root/.agents/plugins/marketplace.json"
+
+  # Write a fake digest store with a contentDigest — different from what the guard will compute
+  local fake_digest="0000000000000000000000000000000000000000000000000000000000000000"
+  node -e '
+    const s={entries:[{version:"1.7.0",contentDigest:process.argv[2],recordedAt:"2026-01-01T00:00:00.000Z",commitSha:"abc1234"}]};
+    require("fs").writeFileSync(process.argv[1],JSON.stringify(s,null,2));
+  ' "$tmp_root/.release-digests.json" "$fake_digest"
+
+  bun "$PLUGIN_ROOT/bin/release-guard.ts" check --root "$tmp_root" 2>/dev/null && {
+    rm -rf "$tmp_root"
+    echo -e "    ${RED}FAIL${NC}: release guard should have rejected content digest conflict"
+    return 1
+  }
+  rm -rf "$tmp_root"
+}
+
+test_package_contains_doctor_recall_distill() {
+  # Verify the packed release includes the three new skills from PR #12.
+  local pack_dir extract_dir tarball
+  pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-issue13-pack.XXXXXX")
+  extract_dir="$pack_dir/extracted"
+  mkdir -p "$extract_dir"
+
+  local pack_json
+  pack_json=$(npm pack --json --pack-destination "$pack_dir" "$PLUGIN_ROOT") || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  tarball=$(node -e '
+    const entries=JSON.parse(process.argv[1]);
+    if (!Array.isArray(entries)||entries.length!==1||!entries[0].filename) process.exit(1);
+    process.stdout.write(entries[0].filename);
+  ' "$pack_json") || { rm -rf "$pack_dir"; return 1; }
+  tar -xzf "$pack_dir/$tarball" -C "$extract_dir" || { rm -rf "$pack_dir"; return 1; }
+
+  local pkg="$extract_dir/package"
+
+  assert_file_exists "$pkg/skills/doctor/SKILL.md" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$pkg/skills/recall/SKILL.md" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$pkg/skills/distill/SKILL.md" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$pkg/bin/doctor.ts" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$pkg/bin/recall.ts" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$pkg/bin/distill.ts" || { rm -rf "$pack_dir"; return 1; }
+
+  # Verify doctor references are present
+  assert_file_exists "$pkg/skills/doctor/references/diagnostic-contract-v1.md" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$pkg/skills/recall/references/evidence-contract-v1.md" || { rm -rf "$pack_dir"; return 1; }
+
+  rm -rf "$pack_dir"
+}
+
 list_tests() {
   echo "Available tests:"
   declare -F | awk '/test_/ {print "  " $3}'
@@ -7054,6 +7188,15 @@ main() {
     run_test test_recall_zero_write
     run_test test_recall_packaged_release
     run_test test_recall_docs_and_skill
+
+    # Quick task 260809-mt: Release invariants (Issue #13)
+    run_test test_version_manifests_agree
+    run_test test_release_guard_accepts_agreed_manifests
+    run_test test_release_guard_rejects_mismatched_version
+    run_test test_release_guard_check_affected_lists_paths
+    run_test test_release_digests_store_exists
+    run_test test_release_guard_rejects_digest_conflict
+    run_test test_package_contains_doctor_recall_distill
   fi
 
   # Distill tests

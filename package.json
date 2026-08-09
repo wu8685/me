@@ -1,6 +1,6 @@
 {
   "name": "me",
-  "version": "1.6.3",
+  "version": "1.7.0",
   "description": "A Claude Code / Codex plugin for knowledge management and evidence-backed decision briefs",
   "scripts": {
     "test": "bash test/vault-test.sh",
@@ -10,7 +10,10 @@
     "test:recall": "bun test test/recall.test.ts",
     "test:brief": "bun test test/brief-ledger.test.ts",
     "test:distill": "bun test test/distill.test.ts",
-    "test:update": "bun test test/update-*.test.ts"
+    "test:update": "bun test test/update-*.test.ts",
+    "test:release-guard": "bun test test/release-guard.test.ts",
+    "release:guard": "bun run bin/release-guard.ts check",
+    "release:record": "bun run bin/release-guard.ts record"
   },
   "files": [
     ".agents/plugins/marketplace.json",
@@ -53,7 +56,8 @@
   "author": "wuke <optimuswu8685@gmail.com>",
   "license": "MIT",
   "devDependencies": {
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "@types/node": "^22.0.0"
   },
   "dependencies": {
     "diff": "^9.0.0",
