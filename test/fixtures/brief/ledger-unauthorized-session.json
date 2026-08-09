@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Migration retro",
+    "structure": "retrospective"
+  },
+  "sources": [
+    { "id": "S1", "kind": "session", "ref": "session:ab12", "date": "2026-07-25" }
+  ],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "The migration session ended with a rollback plan.",
+      "type": "fact",
+      "sources": ["S1"],
+      "evidenceDate": "2026-07-25",
+      "confidence": "medium"
+    }
+  ]
+}

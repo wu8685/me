@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Agentic site program review",
+    "structure": "executive-report"
+  },
+  "sources": [
+    { "id": "S1", "kind": "vault", "ref": "practices/site-rollout.md", "date": "2026-08-01" }
+  ],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "The program achieved the highest success rate of any team in the company.",
+      "type": "verified_result",
+      "sources": ["S1"],
+      "evidenceDate": "2026-08-01",
+      "confidence": "high",
+      "safeWording": "The program reached a 91% page-generation success rate, above the 72% June baseline.",
+      "metric": {
+        "value": 91,
+        "unit": "%",
+        "scope": "45 pages in the 2026-08-01 run",
+        "baseline": "72% in the 2026-06 run"
+      }
+    },
+    {
+      "id": "C2",
+      "text": "The rollout was fully completed across the division.",
+      "type": "verified_result",
+      "sources": ["S1"],
+      "evidenceDate": "2026-08-01",
+      "confidence": "medium",
+      "safeWording": "The rollout was the best in its class.",
+      "metric": {
+        "value": 45,
+        "unit": "pages",
+        "scope": "2026-08-01 run",
+        "baseline": "30 pages in the 2026-06 run"
+      }
+    }
+  ]
+}

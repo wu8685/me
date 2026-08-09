@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Innovation award application",
+    "structure": "nomination"
+  },
+  "sources": [
+    { "id": "S1", "kind": "vault", "ref": "raw/award/result.md", "date": "2026-07-01" },
+    { "id": "S2", "kind": "vault", "ref": "raw/award/commendation.md", "date": "2026-07-20" }
+  ],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "The submission did not win the award.",
+      "type": "fact",
+      "sources": ["S1"],
+      "evidenceDate": "2026-07-01",
+      "confidence": "high"
+    },
+    {
+      "id": "C2",
+      "text": "评审反馈认为该工作仍有价值。",
+      "type": "fact",
+      "sources": ["S1"],
+      "evidenceDate": "2026-07-01",
+      "confidence": "medium"
+    },
+    {
+      "id": "C3",
+      "text": "团队获得事业部层面表扬。",
+      "type": "recognition",
+      "sources": ["S2"],
+      "evidenceDate": "2026-07-20",
+      "confidence": "high"
+    },
+    {
+      "id": "C4",
+      "text": "The nomination proves the platform is production proven.",
+      "type": "recognition",
+      "sources": ["S2"],
+      "evidenceDate": "2026-07-20",
+      "confidence": "high"
+    }
+  ]
+}
