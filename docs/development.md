@@ -354,31 +354,72 @@ bash test/vault-test.sh --list
 
 ## 发布流程
 
+### 发布不变式（Release Invariants）
+
+ME 强制执行以下不变式，确保每个发布版本标识一个且仅一个不可变的 package payload：
+
+1. **版本清单一致**：`package.json`、`.claude-plugin/plugin.json`、
+   `.claude-plugin/marketplace.json`、`.codex-plugin/plugin.json` 四个清单
+   的 `version` 字段始终一致。
+2. **Package-affecting 变更必须有版本号 bump**：修改 `skills/`、`bin/`、
+   `templates/`、插件清单、runtime dependencies、migration declarations
+   或打包配置的 PR，必须同步提升版本号。
+3. **一个 Git tag/version → 一个 package digest**：`.release-digests.json`
+   存储每个已发布版本的 package 文件清单 SHA-256 摘要。同一版本号对应不同
+   payload 时 CI 会拒绝。
+4. **发布测试必须从打包产物安装**，不能从源码树直接运行。
+5. **已安装 package smoke test** 必须解析 Skill 且成功执行每个 CLI 的
+   help / 只读 fixture 路径。
+
+### 豁免策略（Exemption Policy）
+
+以下类型的变更新增时**不需要**版本号 bump：
+- `test/` 目录下的测试文件
+- `docs/` 目录下的文档
+- 仓库根目录下的独立 Markdown 文件（README、CLAUDE、AGENTS、DEVELOPMENT、LEGAL）
+- `.gitignore`、`bunfig.toml` 等开发基础设施
+
+这些路径不影响已发布的 runtime payload。如果需要添加新的豁免路径，
+在 `bin/release-guard.ts` 的 `EXEMPT_PATTERNS` 数组中添加。
+
 ### 1. 更新版本号
 
-更新以下文件：
+更新以下四个文件的 `version` 字段：
+- `package.json`
 - `.claude-plugin/plugin.json`
 - `.claude-plugin/marketplace.json`
 - `.codex-plugin/plugin.json`
-- `package.json`
 
-`.agents/plugins/marketplace.json` 是 Codex marketplace 入口，本身不含版本号；它通过 `source.path: "./"` 指向仓库根目录，Codex 从 `.codex-plugin/plugin.json` 读取版本。
+`.agents/plugins/marketplace.json` 是 Codex marketplace 入口，本身不含版本号；
+它通过 `source.path: "./"` 指向仓库根目录，Codex 从 `.codex-plugin/plugin.json` 读取版本。
 
 版本格式：`MAJOR.MINOR.PATCH`
 - MAJOR - 重大变更
 - MINOR - 新功能
 - PATCH - Bug 修复
 
-### 2. 运行测试
+### 2. 运行测试与 release guard
 
 ```bash
+# 完整测试套件
 bun test test/*.test.ts
 bash test/typecheck-ingest-finalize.sh
 bash test/vault-test.sh
-npm pack --dry-run
+
+# Release guard（版本一致性与 digest 检查）
+bun bin/release-guard.ts check
 ```
 
-### 3. 提交
+### 3. 记录发布 digest
+
+```bash
+bun bin/release-guard.ts record
+```
+
+这会将当前版本的 package 文件清单摘要写入 `.release-digests.json`。
+该文件必须随版本号 bump 一起 commit。
+
+### 4. 提交
 
 ```bash
 git add -A
@@ -386,12 +427,21 @@ git commit -m "chore: bump version to x.y.z"
 git push origin main
 ```
 
-### 4. 创建 Git Tag（可选）
+### 5. 创建 Git Tag（可选）
 
 ```bash
-git tag -a v1.4.0 -m "Release v1.4.0"
-git push origin v1.4.0
+git tag -a v1.7.0 -m "Release v1.7.0"
+git push origin v1.7.0
 ```
+
+### 发布后手动步骤
+
+在 PR merge 后，需要人工执行以下操作（不在 CI 中自动执行）：
+1. **Plugin marketplace 发布**：更新 marketplace 注册表以区分新版本。
+2. **Git tag**：按需创建 annotated tag。
+3. **Release notes**：在 GitHub Releases 页面发布。注意：GitHub Release
+   不等于 npm publish——ME 是 Codex / Claude Code 插件，通过 marketplace
+   或本地路径安装。
 
 ## 代码风格
 
