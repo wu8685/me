@@ -1072,8 +1072,10 @@ EOF
   mv "$v/raw/note-b.md" "$v/raw/note-b-renamed.md"
 
   # 2. Update all wikilink references (the pattern from move.md headless fallback)
-  grep -rl "\[\[${old_name}" "$v/raw/" "$v/practices/" "$v/cognition/" --include="*.md" 2>/dev/null \
-    | xargs sed -i '' "s/\[\[${old_name}\]\]/\[\[${new_name}\]\]/g; s/\[\[${old_name}|/\[\[${new_name}|/g; s/\[\[${old_name}#/\[\[${new_name}#/g"
+  for f in $(grep -rl "\[\[${old_name}" "$v/raw/" "$v/practices/" "$v/cognition/" --include="*.md" 2>/dev/null); do
+    sed -i.bak "s/\[\[${old_name}\]\]/\[\[${new_name}\]\]/g; s/\[\[${old_name}|/\[\[${new_name}|/g; s/\[\[${old_name}#/\[\[${new_name}#/g" "$f"
+    rm -f "$f.bak"
+  done
 
   # Verify: old file gone, new file exists
   assert_file_not_exists "$v/raw/note-b.md" || return 1
@@ -1177,8 +1179,10 @@ EOF
 
   mv "$v/$RAW_DIR/my-note.md" "$v/$RAW_DIR/my-renamed-note.md"
 
-  grep -rl "\[\[${old_name}" "$v/$RAW_DIR/" "$v/$PRACTICES_DIR/" "$v/$COGNITION_DIR/" --include="*.md" 2>/dev/null \
-    | xargs sed -i '' "s/\[\[${old_name}\]\]/\[\[${new_name}\]\]/g; s/\[\[${old_name}|/\[\[${new_name}|/g; s/\[\[${old_name}#/\[\[${new_name}#/g"
+  for f in $(grep -rl "\[\[${old_name}" "$v/$RAW_DIR/" "$v/$PRACTICES_DIR/" "$v/$COGNITION_DIR/" --include="*.md" 2>/dev/null); do
+    sed -i.bak "s/\[\[${old_name}\]\]/\[\[${new_name}\]\]/g; s/\[\[${old_name}|/\[\[${new_name}|/g; s/\[\[${old_name}#/\[\[${new_name}#/g" "$f"
+    rm -f "$f.bak"
+  done
 
   assert_file_exists "$v/$RAW_DIR/my-renamed-note.md" || return 1
   assert_file_contains "$v/$PRACTICES_DIR/referencing.md" '\[\[my-renamed-note\]\]' || return 1

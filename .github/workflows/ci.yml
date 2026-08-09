@@ -18,9 +18,12 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+
       - run: bun install
 
-      - name: TypeScript typecheck (focused)
+      - name: TypeScript typecheck
         run: bash test/typecheck-ingest-finalize.sh
 
       - name: Bun tests
@@ -37,8 +40,32 @@ jobs:
       - name: Release guard — affected paths
         run: bun bin/release-guard.ts check-affected
 
-      - name: Package smoke check
-        run: npm pack --dry-run
+      - name: Package smoke (pack + verify shipped files)
+        run: |
+          set -euo pipefail
+          npm pack
+          PKG=$(ls me-*.tgz 2>/dev/null | head -1)
+          if [ -z "$PKG" ]; then
+            echo "FAIL: npm pack produced no tarball"
+            exit 1
+          fi
+          echo "Packed: $PKG ($(wc -c < "$PKG") bytes)"
+          rm -rf /tmp/smoke-install
+          mkdir -p /tmp/smoke-install
+          tar -xzf "$PKG" -C /tmp/smoke-install
+          PKG_DIR="/tmp/smoke-install/package"
+          errors=0
+          check_file() { if test -f "$PKG_DIR/$1"; then echo "  ✓ $1"; else echo "  ✗ MISSING: $1"; errors=$((errors+1)); fi; }
+          check_file skills/doctor/SKILL.md
+          check_file skills/recall/SKILL.md
+          check_file skills/distill/SKILL.md
+          check_file bin/doctor.ts
+          check_file bin/recall.ts
+          check_file bin/distill.ts
+          check_file bin/release-guard.ts
+          check_file .release-digests.json
+          if [ $errors -gt 0 ]; then echo "FAIL: $errors file(s) missing"; exit 1; fi
+          echo "Package smoke check passed"
 
       - name: Shell tests (vault-test.sh)
         run: bash test/vault-test.sh
