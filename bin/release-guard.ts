@@ -592,6 +592,15 @@ function cmdRecord(args: string[]): never {
       );
       process.exit(1);
     }
+    // Same digest — update commitSha if it was stale (working-tree)
+    if (existing.commitSha === "(working-tree)" && sha !== "(working-tree)") {
+      existing.commitSha = sha;
+      existing.recordedAt = new Date().toISOString();
+      writeDigestStore(root, store);
+      console.log(`✓  Version ${version} digest unchanged — updated commitSha to ${sha}.`);
+      console.log(`   digest: ${digest}`);
+      process.exit(0);
+    }
     console.log(`✓  Version ${version} digest unchanged — already recorded.`);
     console.log(`   digest: ${digest}`);
     process.exit(0);
