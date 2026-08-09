@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Team update",
+    "structure": "poem"
+  },
+  "sources": [
+    { "id": "S1", "kind": "vault", "ref": "raw/team/update.md", "date": "2026-08-01" }
+  ],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "The team shipped the exporter behind a flag.",
+      "type": "fact",
+      "sources": ["S1"],
+      "evidenceDate": "2026-08-01",
+      "confidence": "medium"
+    }
+  ]
+}

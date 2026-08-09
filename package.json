@@ -8,6 +8,7 @@
     "test:ingest": "bun test test/ingest-*.test.ts",
     "test:doctor": "bun test test/doctor.test.ts",
     "test:recall": "bun test test/recall.test.ts",
+    "test:brief": "bun test test/brief-ledger.test.ts",
     "test:distill": "bun test test/distill.test.ts",
     "test:update": "bun test test/update-*.test.ts"
   },
@@ -37,6 +38,7 @@
     "me-runtime": "bin/runtime.ts",
     "doctor": "bin/doctor.ts",
     "recall": "bin/recall.ts",
+    "brief": "bin/brief.ts",
     "distill": "bin/distill.ts",
     "me-setup": "bin/setup.ts",
     "me-update": "bin/update.ts",

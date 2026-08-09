@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Unverified tooling claim",
+    "structure": "summary"
+  },
+  "sources": [],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "Whether the legacy exporter supports incremental runs is unconfirmed.",
+      "type": "unknown",
+      "sources": [],
+      "confidence": "low"
+    }
+  ]
+}

@@ -6581,6 +6581,183 @@ CUSTOMPRAC
   teardown_vault
 }
 
+# ── me:brief evidence-calibrated brief (Issue #14) ─────────────────
+
+test_brief_skill_and_cli_exist() {
+  assert_file_exists "$PLUGIN_ROOT/skills/brief/SKILL.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/skills/brief/references/claim-ledger-v1.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/skills/brief/references/output-contract.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/brief.ts" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/brief/ledger.ts" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/brief/contracts.ts" || return 1
+  if [ ! -x "$PLUGIN_ROOT/bin/brief.ts" ]; then
+    echo -e "    ${RED}FAIL${NC}: brief entrypoint is not executable"
+    return 1
+  fi
+  node -e '
+    const p = require(process.argv[1]);
+    if (p.bin["brief"] !== "bin/brief.ts") process.exit(1);
+  ' "$PLUGIN_ROOT/package.json" || return 1
+  node -e '
+    const p = require(process.argv[1]);
+    if (!p.scripts["test:brief"]) process.exit(1);
+  ' "$PLUGIN_ROOT/package.json" || return 1
+}
+
+test_brief_invalid_arguments() {
+  local out status
+  set +e
+  out=$(cd "$PLUGIN_ROOT" && bun run "$PLUGIN_ROOT/bin/brief.ts" 2>&1)
+  status=$?
+  set -e
+  if [ "$status" -ne 2 ]; then
+    echo -e "    ${RED}FAIL${NC}: expected exit 2, got $status"
+    return 1
+  fi
+  echo "$out" | grep -q "Usage: brief validate" || {
+    echo -e "    ${RED}FAIL${NC}: expected usage output"
+    return 1
+  }
+}
+
+test_brief_skill_contract() {
+  local f="$PLUGIN_ROOT/skills/brief/SKILL.md"
+  grep -Fq 'chat only' "$f" || return 1
+  grep -Fq 'explicit authorization' "$f" || return 1
+  grep -Fq 'bin/vault-write.ts preview' "$f" || return 1
+  grep -Fq 'bin/vault-write.ts write' "$f" || return 1
+  grep -Fq 'commitModel: journaled-cooperative' "$f" || return 1
+  grep -Fq 'Never promote a brief directly to cognition' "$f" || return 1
+  grep -Fq 'bin/brief.ts' "$f" || return 1
+  grep -Fq 'bin/runtime.ts' "$f" || return 1
+  grep -Fq 'prepare-inbox' "$f" || return 1
+  grep -Fq '<ME_RUNTIME>' "$f" || return 1
+  grep -Fq 'me:search' "$f" || return 1
+  grep -Fq 'me:recall' "$f" || return 1
+  grep -Fq 'briefs/YYYY-MM-DD-<slug>.md' "$f" || return 1
+  grep -Fq 'type: reflection' "$f" || return 1
+  grep -Fq 'Do not set `acknowledgeCognition`' "$f" || return 1
+  grep -Fq 'say `not written`' "$f" || return 1
+  local claim_type
+  for claim_type in fact target verified_result inference correction recognition recommendation unknown; do
+    grep -Fq "$claim_type" "$f" || {
+      echo -e "    ${RED}FAIL${NC}: SKILL.md is missing claim type $claim_type"
+      return 1
+    }
+  done
+  grep -Fq 'references/claim-ledger-v1.md' "$f" || return 1
+  grep -Fq 'references/output-contract.md' "$f" || return 1
+}
+
+test_brief_skill_routing() {
+  local f="$PLUGIN_ROOT/skills/brief/SKILL.md"
+  # brief must not replace decision-brief and must not scrape or format slides
+  grep -Fq 'me:decision-brief' "$f" || return 1
+  assert_file_not_contains "$f" 'auto-promote' || return 1
+  local line_count
+  line_count=$(wc -l < "$f" 2>/dev/null || echo "0")
+  if [ "$line_count" -ge 500 ]; then
+    echo -e "    ${RED}FAIL${NC}: brief/SKILL.md has $line_count lines (must be under 500)"
+    return 1
+  fi
+}
+
+test_brief_deterministic_fixtures() {
+  local fixtures="$PLUGIN_ROOT/test/fixtures/brief"
+  local now="2026-08-09T00:00:00.000Z"
+  local first second
+  first=$(bun run "$PLUGIN_ROOT/bin/brief.ts" validate \
+    --ledger "$fixtures/ledger-valid.json" --now "$now") || return 1
+  second=$(bun run "$PLUGIN_ROOT/bin/brief.ts" validate \
+    --ledger "$fixtures/ledger-valid.json" --now "$now") || return 1
+  [ "$first" = "$second" ] || {
+    echo -e "    ${RED}FAIL${NC}: identical ledger produced different reports"
+    return 1
+  }
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.contract !== "brief-ledger" || r.version !== 1) process.exit(1);
+    if (r.status !== "ok" || r.findings.length !== 0) process.exit(1);
+  ' "$first" || return 1
+
+  local superlative target
+  superlative=$(bun run "$PLUGIN_ROOT/bin/brief.ts" validate \
+    --ledger "$fixtures/ledger-superlative.json" --now "$now") || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.status !== "findings") process.exit(1);
+    if (!r.findings.some(f => f.code === "UNSUPPORTED_SUPERLATIVE" && f.safeAlternative)) process.exit(1);
+  ' "$superlative" || return 1
+  target=$(bun run "$PLUGIN_ROOT/bin/brief.ts" validate \
+    --ledger "$fixtures/ledger-target-as-result.json" --now "$now") || return 1
+  node -e '
+    const r = JSON.parse(process.argv[1]);
+    if (r.status !== "invalid") process.exit(1);
+    if (!r.findings.some(f => f.code === "TARGET_WORDED_AS_RESULT" && f.severity === "error")) process.exit(1);
+  ' "$target" || return 1
+}
+
+test_brief_zero_write() {
+  local before after runtime_before runtime_after
+  mkdir -p "$MOCK_VAULT/raw"
+  echo "# note" > "$MOCK_VAULT/raw/note.md"
+  before=$(find "$MOCK_VAULT" -type f -exec cksum {} \; | sort)
+  runtime_before=$(find "$ME_RUNTIME_ROOT" -type f -exec cksum {} \; | sort)
+  (cd "$MOCK_VAULT" && bun run "$PLUGIN_ROOT/bin/brief.ts" validate \
+    --ledger "$PLUGIN_ROOT/test/fixtures/brief/ledger-valid.json" \
+    --now "2026-08-09T00:00:00.000Z" >/dev/null) || return 1
+  after=$(find "$MOCK_VAULT" -type f -exec cksum {} \; | sort)
+  runtime_after=$(find "$ME_RUNTIME_ROOT" -type f -exec cksum {} \; | sort)
+  [ "$after" = "$before" ] || {
+    echo -e "    ${RED}FAIL${NC}: validate changed vault bytes"
+    return 1
+  }
+  [ "$runtime_after" = "$runtime_before" ] || {
+    echo -e "    ${RED}FAIL${NC}: validate created runtime state"
+    return 1
+  }
+}
+
+test_brief_packaged_release() {
+  local pack_dir extract_dir pack_json tarball
+  pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-brief-pack.XXXXXX")
+  extract_dir="$pack_dir/extracted"
+  mkdir -p "$extract_dir"
+  pack_json=$(npm pack --json --pack-destination "$pack_dir" "$PLUGIN_ROOT") || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  tarball=$(node -e '
+    const entries = JSON.parse(process.argv[1]);
+    if (!Array.isArray(entries) || entries.length !== 1 || !entries[0].filename) process.exit(1);
+    process.stdout.write(entries[0].filename);
+  ' "$pack_json") || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  tar -xzf "$pack_dir/$tarball" -C "$extract_dir" || {
+    rm -rf "$pack_dir"
+    return 1
+  }
+  assert_file_exists "$extract_dir/package/skills/brief/SKILL.md" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$extract_dir/package/skills/brief/references/claim-ledger-v1.md" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$extract_dir/package/skills/brief/references/output-contract.md" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$extract_dir/package/bin/brief.ts" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$extract_dir/package/bin/brief/ledger.ts" || { rm -rf "$pack_dir"; return 1; }
+  assert_file_exists "$extract_dir/package/bin/brief/contracts.ts" || { rm -rf "$pack_dir"; return 1; }
+  rm -rf "$pack_dir"
+}
+
+test_brief_docs() {
+  assert_file_contains "$PLUGIN_ROOT/docs/features.md" 'me:brief' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'me:brief' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/user-guide.md" 'claim ledger\|Claim Ledger' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/brief/references/claim-ledger-v1.md" 'verified_result' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/brief/references/output-contract.md" 'executive' || return 1
+  assert_file_contains "$PLUGIN_ROOT/docs/features.md" 'brief.ts' || return 1
+  assert_file_not_contains "$PLUGIN_ROOT/README.md" 'me:brief' || return 1
+}
+
 # ── Main ────────────────────────────────────────────────────────────
 
 list_tests() {
@@ -6888,6 +7065,18 @@ main() {
     run_test test_distill_no_lifecycle_frontmatter
     run_test test_distill_source_preserved
     run_test test_distill_custom_layers
+  fi
+
+  # Brief tests (Issue #14)
+  if [ "${1:-}" = "" ] || [[ "$1" == test_brief_* ]]; then
+    run_test test_brief_skill_and_cli_exist
+    run_test test_brief_invalid_arguments
+    run_test test_brief_skill_contract
+    run_test test_brief_skill_routing
+    run_test test_brief_deterministic_fixtures
+    run_test test_brief_zero_write
+    run_test test_brief_packaged_release
+    run_test test_brief_docs
   fi
 
   # Summary

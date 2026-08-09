@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "contract": "claim-ledger",
+  "brief": {
+    "topic": "Quarterly platform summary",
+    "structure": "summary",
+    "maxWords": 40
+  },
+  "sources": [
+    { "id": "S1", "kind": "vault", "ref": "practices/platform-q2.md", "date": "2026-07-01" }
+  ],
+  "claims": [
+    {
+      "id": "C1",
+      "text": "Deploy frequency reached 14 per week in Q2.",
+      "type": "verified_result",
+      "sources": ["S1"],
+      "evidenceDate": "2026-07-01",
+      "confidence": "high",
+      "decisive": true,
+      "metric": {
+        "value": 14,
+        "unit": "deploys/week",
+        "scope": "Q2 2026, platform team",
+        "baseline": "9 deploys/week in Q1 2026"
+      }
+    }
+  ],
+  "briefText": "The platform team had a busy and productive second quarter across every workstream. Deploy frequency climbed steadily through April and May while the release pipeline kept improving week over week. Review latency fell, incident counts stayed flat, and morale on the team remained strong throughout the period under review here."
+}
