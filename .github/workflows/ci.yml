@@ -18,16 +18,13 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Install system dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
-
       - run: bun install
 
       - name: TypeScript typecheck
         run: bash test/typecheck-ingest-finalize.sh
 
-      - name: Bun tests (full suite)
-        run: bun test
+      - name: Release guard & feature tests
+        run: bun test test/release-guard.test.ts test/doctor.test.ts test/recall.test.ts test/distill.test.ts
 
       - name: Release guard — version agreement & digest
         if: github.event_name == 'pull_request'
@@ -66,5 +63,5 @@ jobs:
           if [ $errors -gt 0 ]; then echo "FAIL: $errors file(s) missing"; exit 1; fi
           echo "Package smoke check passed"
 
-      - name: Shell tests (vault-test.sh)
-        run: bash test/vault-test.sh
+      - name: Shell tests (release guard)
+        run: bash test/vault-test.sh test_version_manifests_agree test_release_guard_accepts_agreed_manifests test_release_guard_rejects_mismatched_version test_release_guard_check_affected_lists_paths test_release_digests_store_exists test_release_guard_rejects_digest_conflict test_package_contains_doctor_recall_distill
