@@ -172,10 +172,6 @@ describe('shared filesystem mutation executor', () => {
   )(
     'rejects changed source before %s after a %s change',
     (primitive, change) => {
-      // identity-change tests rely on inode-reuse semantics that differ
-      // between APFS (macOS) and overlayfs/tmpfs (Linux).  These are
-      // not part of the release-guard CI suite; they run on the
-      // developer's native platform only.
       const { root, executor } = fixture({ directoryFsync() {} });
       const source = path.join(root, 'source.md');
       const destination = path.join(root, 'destination.md');
@@ -368,9 +364,6 @@ describe('shared filesystem mutation executor', () => {
   });
 
   test('rejects lost file and directory ownership before destructive cleanup', () => {
-    // inode-reuse semantics differ between APFS (macOS) and overlayfs/tmpfs
-    // (Linux).  This test is not part of the release-guard CI suite; it
-    // runs on the developer's native platform only.
     const { root, executor } = fixture({ directoryFsync() {} });
     const file = path.join(root, 'owned.md');
     const directory = path.join(root, 'owned-dir');
