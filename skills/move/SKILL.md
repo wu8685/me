@@ -32,6 +32,20 @@ The TypeScript executable automatically:
 - Handles both in-place renames (same folder) and cross-folder moves
 - Rewrites all wikilink references across the vault when filename changes
 
+## Source Resolution
+
+The source note may be given in three forms, tried in this order (first hit wins):
+
+1. **Vault-relative path** — `knowledge/raw/records/work/org/note.md` (with or without `.md`)
+2. **Layer-relative path** — `records/work/org/note.md` is joined to each configured layer root
+3. **Bare stem** — `note` is looked up recursively across every configured layer, so notes in
+   nested subdirectories resolve without typing the full path
+
+If a bare stem matches more than one note, the command fails with an ambiguity error listing
+every candidate as a vault-relative path; re-run with a layer-relative or vault-relative form
+to disambiguate. In Obsidian mode the resolved note is always passed to the Obsidian CLI as a
+normalized vault-relative path, never as the raw input.
+
 ## Examples
 
 ```bash
@@ -40,6 +54,12 @@ The TypeScript executable automatically:
 
 # Cross-folder move
 /me:move old-name practices/new-name.md
+
+# Nested note by bare stem (resolved recursively inside the layers)
+/me:move 2026-07-28-example 2026-07-21-example
+
+# Nested note by vault-relative path
+/me:move knowledge/raw/records/work/org/2026-07-28-example.md cognition/example.md
 ```
 
 ## Output
@@ -57,3 +77,4 @@ The command reports:
 - All vault paths are relative to cwd
 - Wikilinks use `[[Filename]]` without path prefix per D-08
 - Layer directories resolved from `.me/config.yaml` at runtime
+- Ordinary Markdown links (`[text](path)`) are NOT rewritten — only wikilinks are maintained

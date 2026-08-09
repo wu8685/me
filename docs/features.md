@@ -358,6 +358,12 @@ Unchanged: 0 files
 - 跨目录移动：`/me:move old-name practices/new-name.md`
 - 带目录移动：`/me:move raw/old.md practices/new.md`
 
+**源笔记的三种写法（按顺序解析，先中先用）：**
+1. vault 相对路径：`/me:move knowledge/raw/records/work/org/note.md ...`
+2. layer 相对路径：`records/work/org/note.md` 会拼到每个配置的 layer 根目录下试
+3. 纯文件名（stem）：`note` 会在所有 layer 里递归查找，嵌套目录中的笔记也能解析；
+   同名多处命中时报歧义错误并列出所有候选路径，改用前两种写法消歧
+
 **处理的 WikiLink 变体：**
 - `[[name]]` - 基础链接
 - `[[name|alias]]` - 带别名链接
