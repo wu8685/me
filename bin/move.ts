@@ -44,30 +44,112 @@ function detectObsidian(): boolean {
   }
 }
 
+interface NoteResolution {
+  /** Absolute path of the resolved note, or null when unresolved. */
+  path: string | null;
+  /** Vault-relative candidates when a recursive stem lookup is ambiguous. */
+  candidates: string[];
+}
+
 /**
- * Find a note file in the vault by name (with or without .md extension).
+ * Recursively collect markdown files under dir, skipping dot-directories
+ * such as .obsidian.
  */
-function findNotePath(vaultDir: string, config: LayerConfig, noteName: string): string | null {
+function walkMarkdown(dir: string, out: string[]): void {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.')) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkMarkdown(full, out);
+    } else if (entry.name.endsWith('.md')) {
+      out.push(full);
+    }
+  }
+}
+
+/**
+ * Resolve a note inside the vault. Accepted input forms, tried in order:
+ *
+ * 1. Vault-relative path (with or without .md); absolute paths inside the
+ *    vault are accepted and converted. Paths escaping the vault are rejected.
+ * 2. Path relative to a configured layer root (with or without .md) — this
+ *    also covers the classic direct-child lookup.
+ * 3. Recursive lookup by bare stem across every configured layer. Multiple
+ *    matches yield an ambiguity result listing vault-relative candidates.
+ */
+function resolveNotePath(vaultDir: string, config: LayerConfig, noteName: string): NoteResolution {
+  const none: NoteResolution = { path: null, candidates: [] };
   const cleanName = noteName.replace(/\.md$/, '');
   const layers = Object.values(config);
 
-  for (const layer of layers) {
-    const layerPath = path.join(vaultDir, layer);
-    if (!fs.existsSync(layerPath)) continue;
+  const existingFile = (absolute: string): string | null =>
+    fs.existsSync(absolute) && fs.statSync(absolute).isFile() ? absolute : null;
 
-    // Try with .md extension
-    const withExt = path.join(layerPath, `${cleanName}.md`);
-    if (fs.existsSync(withExt)) {
-      return withExt;
-    }
-
-    // Try without extension
-    if (fs.existsSync(path.join(layerPath, cleanName))) {
-      return path.join(layerPath, cleanName);
+  // 1. Vault-relative (or absolute-inside-vault) path.
+  if (cleanName.includes('/') || path.isAbsolute(cleanName)) {
+    const relative = path.isAbsolute(cleanName)
+      ? path.relative(vaultDir, cleanName)
+      : cleanName;
+    const insideVault = relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    if (insideVault) {
+      for (const candidate of [relative, `${relative}.md`]) {
+        const hit = existingFile(path.join(vaultDir, candidate));
+        if (hit) return { path: hit, candidates: [] };
+      }
     }
   }
 
-  return null;
+  // 2. Layer-relative path.
+  for (const layer of layers) {
+    const layerPath = path.join(vaultDir, layer);
+    if (!fs.existsSync(layerPath)) continue;
+    for (const candidate of [`${cleanName}.md`, cleanName]) {
+      const hit = existingFile(path.join(layerPath, candidate));
+      if (hit) return { path: hit, candidates: [] };
+    }
+  }
+
+  // 3. Recursive stem lookup (bare stems only).
+  if (!cleanName.includes('/') && !path.isAbsolute(cleanName)) {
+    const matches: string[] = [];
+    for (const layer of layers) {
+      const layerPath = path.join(vaultDir, layer);
+      if (!fs.existsSync(layerPath)) continue;
+      const files: string[] = [];
+      walkMarkdown(layerPath, files);
+      for (const file of files) {
+        if (getStem(file) === cleanName) {
+          matches.push(file);
+        }
+      }
+    }
+    if (matches.length === 1) {
+      return { path: matches[0], candidates: [] };
+    }
+    if (matches.length > 1) {
+      return {
+        path: null,
+        candidates: matches.map((file) => toPosix(path.relative(vaultDir, file))),
+      };
+    }
+  }
+
+  return none;
+}
+
+/**
+ * Convert a filesystem path to POSIX separators for Obsidian CLI arguments
+ * and user-facing messages.
+ */
+function toPosix(filePath: string): string {
+  return filePath.split(path.sep).join('/');
+}
+
+/**
+ * Escape a note name before interpolating it into a RegExp.
+ */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -106,13 +188,11 @@ function rewriteWikilinks(vaultDir: string, config: LayerConfig, oldName: string
           let content = fs.readFileSync(full, 'utf8');
           const originalContent = content;
 
-          // Rewrite [[oldName]] -> [[newName]]
-          const pattern1 = new RegExp(`\\[\\[${oldName}(\\]|\\||#)`, 'g');
-          content = content.replace(pattern1, `[[${newName}$1`);
-
-          // Rewrite [[oldName]] at end of line (already handled by above, but being explicit)
-          const pattern2 = new RegExp(`\\[\\[${oldName}\\]\\]`, 'g');
-          content = content.replace(pattern2, `[[${newName}]]`);
+          // Rewrite [[oldName]], [[oldName|alias]], and [[oldName#heading]].
+          // The note name is escaped before entering the pattern, and the
+          // replacement is a function so `$` sequences in newName stay literal.
+          const pattern = new RegExp(`\\[\\[${escapeRegExp(oldName)}(\\]|\\||#)`, 'g');
+          content = content.replace(pattern, (_match, separator) => `[[${newName}${separator}`);
 
           if (content !== originalContent) {
             fs.writeFileSync(full, content, 'utf8');
@@ -162,25 +242,40 @@ Examples:
   }
 
   // Find source file
-  const sourcePath = findNotePath(vault, config, source);
+  const resolution = resolveNotePath(vault, config, source);
+  if (resolution.candidates.length > 0) {
+    return [
+      `Error: Note '${source}' is ambiguous — multiple notes share this stem:`,
+      ...resolution.candidates.map((candidate) => `  - ${candidate}`),
+      'Use a layer-relative or vault-relative path to disambiguate.',
+    ].join('\n');
+  }
+  const sourcePath = resolution.path;
   if (!sourcePath) {
     return `Error: Note '${source}' not found in the vault. Check the name and try again.`;
   }
 
   const oldName = getStem(sourcePath);
+  // Normalized vault-relative source, used for Obsidian CLI arguments.
+  const sourceRelative = toPosix(path.relative(vault, sourcePath));
 
   // Determine operation type
   const isCrossFolder = destination.includes('/') || destination.includes('\\');
+
+  // Expected absolute destination path, used for post-move verification.
+  let expectedDestPath: string;
 
   if (hasObsidian) {
     // Obsidian mode
     try {
       if (isCrossFolder) {
         // Cross-folder move
-        execSync(`obsidian move file="${source}" to="${destination}"`, { stdio: 'inherit' });
+        execSync(`obsidian move file="${sourceRelative}" to="${destination}"`, { stdio: 'inherit' });
+        expectedDestPath = path.join(vault, destination);
       } else {
         // In-place rename
-        execSync(`obsidian rename file="${source}" name="${destination}"`, { stdio: 'inherit' });
+        execSync(`obsidian rename file="${sourceRelative}" name="${destination}"`, { stdio: 'inherit' });
+        expectedDestPath = path.join(path.dirname(sourcePath), `${destination}.md`);
       }
       output.push(`\nMoved: ${source} -> ${destination}`);
       output.push('Wikilinks updated across vault.');
@@ -216,6 +311,8 @@ Examples:
     const newName = getStem(destPath);
     rewriteWikilinks(vault, config, oldName, newName);
 
+    expectedDestPath = destPath;
+
     output.push(`\nMoved: ${source} -> ${destination}`);
     output.push('Wikilinks rewritten via grep+sed.');
     output.push('');
@@ -223,9 +320,7 @@ Examples:
   }
 
   // Verify destination exists
-  const destName = getStem(destination);
-  const verifiedPath = findNotePath(vault, config, destName);
-  if (!verifiedPath) {
+  if (!fs.existsSync(expectedDestPath)) {
     output.push('\nWarning: Destination file could not be verified after move.');
   } else {
     output.push('\nMove operation completed successfully.');

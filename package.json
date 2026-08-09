@@ -4,6 +4,7 @@
   "description": "A Claude Code / Codex plugin for knowledge management and evidence-backed decision briefs",
   "scripts": {
     "test": "bash test/vault-test.sh",
+    "test:move": "bun test test/move.test.ts",
     "test:ingest": "bun test test/ingest-*.test.ts",
     "test:doctor": "bun test test/doctor.test.ts",
     "test:recall": "bun test test/recall.test.ts",

@@ -1185,6 +1185,65 @@ EOF
   assert_file_not_contains "$v/$PRACTICES_DIR/referencing.md" '\[\[my-note\]\]' || return 1
 }
 
+test_move_nested_note_resolution() {
+  # bin/move.ts must resolve notes nested inside configured layers (issue #2).
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/.me" "$v/knowledge/raw/records/work/org" "$v/knowledge/practices" "$v/knowledge/cognition"
+
+  cat > "$v/.me/config.yaml" << 'EOF'
+layers:
+  raw: "knowledge/raw"
+  practices: "knowledge/practices"
+  cognition: "knowledge/cognition"
+EOF
+
+  echo "# Example" > "$v/knowledge/raw/records/work/org/2026-07-28-example.md"
+  echo "See [[2026-07-28-example]] and [[2026-07-28-example|alias]] and [[2026-07-28-example#sec]]." \
+    > "$v/knowledge/practices/ref.md"
+
+  # Force native mode even on machines with the Obsidian CLI installed.
+  local stubbin="$v/.stubbin"
+  mkdir -p "$stubbin"
+  printf '#!/bin/sh\nexit 1\n' > "$stubbin/obsidian"
+  chmod +x "$stubbin/obsidian"
+
+  # 1. Bare stem resolves recursively and rewrites wikilink variants.
+  env PATH="$stubbin:$PATH" bun run "$PLUGIN_ROOT/bin/move.ts" \
+    "2026-07-28-example" "2026-07-21-example" "$v" > /tmp/move-nested-out.txt 2>&1 || return 1
+  assert_file_not_exists "$v/knowledge/raw/records/work/org/2026-07-28-example.md" || return 1
+  assert_file_exists "$v/knowledge/raw/records/work/org/2026-07-21-example.md" || return 1
+  assert_file_contains "$v/knowledge/practices/ref.md" '\[\[2026-07-21-example\]\]' || return 1
+  assert_file_contains "$v/knowledge/practices/ref.md" '\[\[2026-07-21-example|alias\]\]' || return 1
+  assert_file_contains "$v/knowledge/practices/ref.md" '\[\[2026-07-21-example#sec\]\]' || return 1
+
+  # 2. Vault-relative source path resolves directly.
+  env PATH="$stubbin:$PATH" bun run "$PLUGIN_ROOT/bin/move.ts" \
+    "knowledge/raw/records/work/org/2026-07-21-example.md" \
+    "knowledge/cognition/example.md" "$v" >> /tmp/move-nested-out.txt 2>&1 || return 1
+  assert_file_not_exists "$v/knowledge/raw/records/work/org/2026-07-21-example.md" || return 1
+  assert_file_exists "$v/knowledge/cognition/example.md" || return 1
+
+  # 3. Layer-relative source path resolves against each layer root.
+  mkdir -p "$v/knowledge/raw/a"
+  echo "# Nested" > "$v/knowledge/raw/a/nested-note.md"
+  env PATH="$stubbin:$PATH" bun run "$PLUGIN_ROOT/bin/move.ts" \
+    "a/nested-note.md" "nested-renamed" "$v" >> /tmp/move-nested-out.txt 2>&1 || return 1
+  assert_file_exists "$v/knowledge/raw/a/nested-renamed.md" || return 1
+
+  # 4. Duplicate stems report an ambiguity error listing candidates; nothing moves.
+  mkdir -p "$v/knowledge/raw/dup-a" "$v/knowledge/practices/dup-b"
+  echo x > "$v/knowledge/raw/dup-a/dup.md"
+  echo y > "$v/knowledge/practices/dup-b/dup.md"
+  local dup_out
+  dup_out=$(env PATH="$stubbin:$PATH" bun run "$PLUGIN_ROOT/bin/move.ts" \
+    "dup" "renamed" "$v" 2>&1)
+  echo "$dup_out" | grep -q "ambiguous" || return 1
+  echo "$dup_out" | grep -q "knowledge/raw/dup-a/dup.md" || return 1
+  echo "$dup_out" | grep -q "knowledge/practices/dup-b/dup.md" || return 1
+  assert_file_exists "$v/knowledge/raw/dup-a/dup.md" || return 1
+  assert_file_exists "$v/knowledge/practices/dup-b/dup.md" || return 1
+}
+
 # ── Config: Configurable Layer Directories ────────────────────────
 
 test_setup_references_config() {
@@ -6601,6 +6660,7 @@ main() {
     run_test test_headless_move_rename
     run_test test_headless_move_cross_folder
     run_test test_headless_move_rename_custom_dirs
+    run_test test_move_nested_note_resolution
 
     # Config: Configurable Layer Directories
     run_test test_setup_references_config

@@ -331,7 +331,17 @@ decision:
 
 # 移动到不同层级
 /me:move raw/note.md practices/note.md
+
+# 嵌套目录中的笔记：纯文件名会递归解析
+/me:move 2026-07-28-example 2026-07-21-example
+
+# 也可以直接给 vault 相对路径
+/me:move knowledge/raw/records/work/org/2026-07-28-example.md cognition/example.md
 ```
+
+纯文件名在多个目录下命中时会报歧义错误并列出候选路径，改用 layer 相对路径或
+vault 相对路径消歧。注意：`/me:move` 只维护 WikiLink，普通 Markdown 链接
+（`[text](path)`）不会被重写。
 
 ## 诊断 ME 状态（/me:doctor）
 
