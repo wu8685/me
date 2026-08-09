@@ -17,7 +17,6 @@
     ".agents/plugins/marketplace.json",
     ".claude-plugin/",
     ".codex-plugin/",
-    ".release-digests.json",
     "AGENTS.md",
     "CLAUDE.md",
     "DEVELOPMENT.md",
