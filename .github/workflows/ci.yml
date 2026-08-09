@@ -18,7 +18,7 @@ jobs:
         with:
           bun-version: latest
 
-      - run: bun install --frozen-lockfile
+      - run: bun install
 
       - name: TypeScript typecheck (focused)
         run: bash test/typecheck-ingest-finalize.sh
