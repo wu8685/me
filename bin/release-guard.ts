@@ -306,7 +306,9 @@ function writeDigestStore(root: string, store: ReleaseDigests): void {
  */
 function isWorkingTreeDirty(root: string): boolean {
   try {
-    const status = git(["status", "--porcelain"], { cwd: root });
+    // -uno excludes untracked files (e.g. bun.lock) which don't
+    // affect the packaged content.
+    const status = git(["status", "--porcelain", "-uno"], { cwd: root });
     return status.length > 0;
   } catch {
     return false;
