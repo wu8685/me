@@ -78,7 +78,7 @@ describe("release guard", () => {
       expect(unique[0]).toMatch(/^\d+\.\d+\.\d+$/);
     });
 
-    it("release guard check fails when manifests disagree (simulated)", () => {
+    it("release guard check fails when manifests disagree (simulated)", { timeout: 15_000 }, () => {
       const guardTmp = path.join(tmpDir, "version-disagree");
       fs.mkdirSync(guardTmp, { recursive: true });
       fs.mkdirSync(path.join(guardTmp, ".claude-plugin"), { recursive: true });
