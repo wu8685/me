@@ -27,7 +27,12 @@ jobs:
         run: bun test
 
       - name: Release guard — version agreement & digest
+        if: github.event_name == 'pull_request'
         run: bun bin/release-guard.ts check --base-ref "origin/${{ github.base_ref }}"
+
+      - name: Release guard — check (push to main)
+        if: github.event_name == 'push'
+        run: bun bin/release-guard.ts check
 
       - name: Release guard — affected paths
         run: bun bin/release-guard.ts check-affected

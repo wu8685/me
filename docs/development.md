@@ -364,8 +364,8 @@ ME 强制执行以下不变式，确保每个发布版本标识一个且仅一�
 2. **Package-affecting 变更必须有版本号 bump**：修改 `skills/`、`bin/`、
    `templates/`、插件清单、runtime dependencies、migration declarations
    或打包配置的 PR，必须同步提升版本号。
-3. **一个 Git tag/version → 一个 package digest**：`.release-digests.json`
-   存储每个已发布版本的 package 文件清单 SHA-256 摘要。同一版本号对应不同
+3. **一个 Git tag/version → 一个 package content digest**：`.release-digests.json`
+   存储每个已发布版本的 content SHA-256 摘要（`path:sha256(file-bytes)` 逐文件计算后哈希）——任意打包文件的内容变化都会导致不同的摘要。同一版本号对应不同
    payload 时 CI 会拒绝。
 4. **发布测试必须从打包产物安装**，不能从源码树直接运行。
 5. **已安装 package smoke test** 必须解析 Skill 且成功执行每个 CLI 的
@@ -373,14 +373,22 @@ ME 强制执行以下不变式，确保每个发布版本标识一个且仅一�
 
 ### 豁免策略（Exemption Policy）
 
-以下类型的变更新增时**不需要**版本号 bump：
-- `test/` 目录下的测试文件
-- `docs/` 目录下的文档
-- 仓库根目录下的独立 Markdown 文件（README、CLAUDE、AGENTS、DEVELOPMENT、LEGAL）
-- `.gitignore`、`bunfig.toml` 等开发基础设施
+**仅**以下路径的变更**不需要**版本号 bump（它们不在 `npm pack` 产物中）：
 
-这些路径不影响已发布的 runtime payload。如果需要添加新的豁免路径，
-在 `bin/release-guard.ts` 的 `EXEMPT_PATTERNS` 数组中添加。
+- `test/` 目录下的测试文件
+- `.claude/`、`.codex/`、`.planning/`、`.worktrees/`、`.superpowers/` — 开发工具与内部工作目录
+- `.gitignore`、`bunfig.toml`、`node_modules/`、`package-lock.json` — 开发基础设施
+
+**注意**：`docs/` 目录下的文档和仓库根目录下的 Markdown 文件（README、CLAUDE、AGENTS、
+DEVELOPMENT、LEGAL）**已经**进入 npm package 的 `"files"` 清单，属于 shipped runtime
+payload。修改这些文件时**必须**同步提升版本号。
+
+豁免路径的判定以 `npm pack --dry-run --json` 的实际文件清单为准（ground truth），
+不是 `bin/release-guard.ts` 内的硬编码数组。`NON_PACKAGE_PATHS` 只是一个快速排除
+列表，真正的"是否 package-affecting"由文件是否在 packlist 中决定。
+
+如果需要添加新的豁免路径，确认该路径**不在** `npm pack` 产物中后，在
+`bin/release-guard.ts` 的 `NON_PACKAGE_PATHS` 数组中添加。
 
 ### 1. 更新版本号
 
@@ -416,7 +424,7 @@ bun bin/release-guard.ts check
 bun bin/release-guard.ts record
 ```
 
-这会将当前版本的 package 文件清单摘要写入 `.release-digests.json`。
+这会将当前版本的 package content 摘要写入 `.release-digests.json`。
 该文件必须随版本号 bump 一起 commit。
 
 ### 4. 提交
