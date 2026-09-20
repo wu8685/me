@@ -1450,10 +1450,12 @@ EOF
   if ! echo "$output" | node -e "
     const g = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
     const ok = Array.isArray(g.files) && typeof g.links === 'object' &&
-                Array.isArray(g.broken) && Array.isArray(g.orphans) && Array.isArray(g.deadends);
+                Array.isArray(g.broken) && Array.isArray(g.virtual) &&
+                Array.isArray(g.ignored) && Array.isArray(g.orphans) &&
+                Array.isArray(g.deadends);
     process.exit(ok ? 0 : 1);
   " 2>/dev/null; then
-    echo -e "    ${RED}FAIL${NC}: output is not valid JSON with required keys (files, links, broken, orphans, deadends)"
+    echo -e "    ${RED}FAIL${NC}: output is not valid JSON with required graph-health keys"
     echo "    output: $(echo "$output" | head -3)"
     return 1
   fi
@@ -1467,16 +1469,133 @@ test_graph_detects_broken_links() {
 ---
 title: Note A
 ---
-See [[missing-note]].
+See ![[missing-image.png]] and [[2026-09-20-renamed-note]].
 EOF
 
   local output
   output=$(node "$PLUGIN_ROOT/bin/wikilink-graph.js" "$v" 2>&1)
   if ! echo "$output" | node -e "
     const g = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
-    process.exit(g.broken.some(b => b.target === 'missing-note') ? 0 : 1);
+    const targets = g.broken.map(b => b.target);
+    process.exit(targets.includes('missing-image.png') && targets.includes('2026-09-20-renamed-note') ? 0 : 1);
   " 2>/dev/null; then
-    echo -e "    ${RED}FAIL${NC}: graph did not detect broken link to [[missing-note]]"
+    echo -e "    ${RED}FAIL${NC}: graph did not detect missing concrete references"
+    return 1
+  fi
+}
+
+test_graph_classifies_bare_unresolved_as_virtual() {
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/raw" "$v/practices" "$v/cognition"
+
+  cat > "$v/raw/note-a.md" << 'EOF'
+See [[宋鸿兵]], [[美元环流]], and [[OpenClaw 多 Session / Agent]].
+EOF
+
+  local output
+  output=$(node "$PLUGIN_ROOT/bin/wikilink-graph.js" "$v" 2>&1)
+  if ! echo "$output" | node -e "
+    const g = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+    const virtual = new Set(g.virtual.map(v => v.target));
+    const ok = g.broken.length === 0 && virtual.has('宋鸿兵') &&
+      virtual.has('美元环流') && virtual.has('OpenClaw 多 Session / Agent');
+    process.exit(ok ? 0 : 1);
+  " 2>/dev/null; then
+    echo -e "    ${RED}FAIL${NC}: bare semantic wikilinks were not preserved as virtual nodes"
+    return 1
+  fi
+}
+
+test_graph_ignores_code_and_placeholders() {
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/raw" "$v/practices" "$v/cognition"
+
+  cat > "$v/raw/note-a.md" << 'EOF'
+`[[inline-example]]`
+
+```markdown
+[[fenced-example]]
+```
+
+[[讲义_*]]
+EOF
+
+  local output
+  output=$(node "$PLUGIN_ROOT/bin/wikilink-graph.js" "$v" 2>&1)
+  if ! echo "$output" | node -e "
+    const g = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+    const targets = g.links['raw/note-a.md'] || [];
+    const ignored = g.ignored.map(i => i.target);
+    const deadend = g.deadends.includes('raw/note-a.md');
+    process.exit(targets.length === 0 && ignored.includes('讲义_*') && deadend ? 0 : 1);
+  " 2>/dev/null; then
+    echo -e "    ${RED}FAIL${NC}: code literals or placeholders polluted graph edges"
+    return 1
+  fi
+}
+
+test_graph_resolves_targets_across_whole_vault() {
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/raw/images" "$v/practices" "$v/cognition" "$v/Memory"
+
+  cat > "$v/raw/note-a.md" << 'EOF'
+See [[portable-principle]] and ![[images/chart.png]].
+EOF
+  cat > "$v/Memory/portable-principle.md" << 'EOF'
+Portable memory outside configured layers.
+EOF
+  printf 'png fixture' > "$v/raw/images/chart.png"
+
+  local output
+  output=$(node "$PLUGIN_ROOT/bin/wikilink-graph.js" "$v" 2>&1)
+  if ! echo "$output" | node -e "
+    const g = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+    process.exit(g.broken.length === 0 && g.virtual.length === 0 ? 0 : 1);
+  " 2>/dev/null; then
+    echo -e "    ${RED}FAIL${NC}: existing targets outside layer-note basenames were not resolved"
+    return 1
+  fi
+}
+
+test_graph_path_link_counts_as_incoming() {
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/raw/topic" "$v/practices" "$v/cognition"
+
+  cat > "$v/raw/source.md" << 'EOF'
+See [[raw/topic/target]].
+EOF
+  cat > "$v/raw/topic/target.md" << 'EOF'
+Target note.
+EOF
+
+  local output
+  output=$(node "$PLUGIN_ROOT/bin/wikilink-graph.js" "$v" 2>&1)
+  if ! echo "$output" | node -e "
+    const g = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+    const orphan = g.orphans.includes('raw/topic/target.md');
+    process.exit(g.broken.length === 0 && !orphan ? 0 : 1);
+  " 2>/dev/null; then
+    echo -e "    ${RED}FAIL${NC}: resolved path-qualified link did not credit its target note"
+    return 1
+  fi
+}
+
+test_checklinks_reports_semantic_categories() {
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/raw" "$v/practices" "$v/cognition"
+
+  cat > "$v/raw/note-a.md" << 'EOF'
+See [[Concept Node]] and ![[missing.png]].
+EOF
+
+  local output
+  output=$(bun run "$PLUGIN_ROOT/bin/checklinks.ts" "$v" 2>&1)
+  if ! echo "$output" | grep -q 'Broken Concrete References (1)' ||
+     ! echo "$output" | grep -q 'Virtual Wikilink Nodes (1) — not errors' ||
+     ! echo "$output" | grep -q '\[\[Concept Node\]\].*1 occurrence.*1 source' ||
+     ! echo "$output" | grep -q 'Summary: 1 broken concrete reference, 1 virtual node'; then
+    echo -e "    ${RED}FAIL${NC}: checklinks did not report broken and virtual categories separately"
+    echo "$output"
     return 1
   fi
 }
@@ -1697,7 +1816,7 @@ test_e2e_me_setup() {
 
   local output
   output=$(cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
-  if echo "$output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key"; then
+  if echo "$output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key\\|Not logged in"; then
     echo -e "    ${YELLOW}SKIP${NC}: Claude Code authentication unavailable"
     return 0
   fi
@@ -1737,7 +1856,7 @@ test_e2e_me_setup_idempotent() {
 
   local first_output
   first_output=$(cd "$MOCK_VAULT" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
-  if echo "$first_output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key"; then
+  if echo "$first_output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key\\|Not logged in"; then
     echo -e "    ${YELLOW}SKIP${NC}: Claude Code authentication unavailable"
     return 0
   fi
@@ -2136,7 +2255,7 @@ test_e2e_me_checklink_headless() {
   local v="$MOCK_VAULT"
   local setup_output
   setup_output=$(cd "$v" && claude --plugin-dir "$PLUGIN_ROOT" -p "/me:setup" --allowedTools "Bash,Read,Write,Glob,Grep,Edit" 2>&1) || true
-  if echo "$setup_output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key"; then
+  if echo "$setup_output" | grep -qi "disabled Claude subscription access\\|Use an Anthropic API key\\|Not logged in"; then
     echo -e "    ${YELLOW}SKIP${NC}: Claude Code authentication unavailable"
     return 0
   fi
@@ -6989,6 +7108,11 @@ main() {
     run_test test_graph_script_exists
     run_test test_graph_outputs_valid_json
     run_test test_graph_detects_broken_links
+    run_test test_graph_classifies_bare_unresolved_as_virtual
+    run_test test_graph_ignores_code_and_placeholders
+    run_test test_graph_resolves_targets_across_whole_vault
+    run_test test_graph_path_link_counts_as_incoming
+    run_test test_checklinks_reports_semantic_categories
     run_test test_graph_no_false_broken
     run_test test_graph_detects_orphans
     run_test test_graph_detects_deadends
