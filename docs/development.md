@@ -438,8 +438,8 @@ git push origin main
 ### 5. 创建 Git Tag（可选）
 
 ```bash
-git tag -a v1.7.0 -m "Release v1.7.0"
-git push origin v1.7.0
+git tag -a v1.7.1 -m "Release v1.7.1"
+git push origin v1.7.1
 ```
 
 ### 发布后手动步骤
