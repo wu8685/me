@@ -5,6 +5,12 @@
       "contentDigest": "48ec7bc69e18213ea3187532ea8de2b7be3627d3cde9bdc524bc2209bd25ef78",
       "recordedAt": "2026-08-09T14:29:07.917Z",
       "commitSha": "9aad082"
+    },
+    {
+      "version": "1.7.1",
+      "contentDigest": "2c2ae305f5ad87d74d2aa0ebccc51127db183f164e85df9b37dd95c8117a1cd0",
+      "recordedAt": "2026-09-20T06:04:21.350Z",
+      "commitSha": "dc2d996"
     }
   ]
 }
