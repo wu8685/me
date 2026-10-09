@@ -72,6 +72,19 @@ codex plugin marketplace upgrade me-marketplace
 $me:update
 ```
 
+### 插件运行时依赖（无需手动安装）
+
+从 1.7.2 起，ME 的运行时依赖（`diff`、`yaml`）随插件包一起发布：
+marketplace 安装（Codex 的 plugin cache、Claude Code 的 plugin 目录）解压后
+即包含 `node_modules/`，`/me:update`、`$me:update` 等命令开箱可用。
+
+- 用户**不需要**在 plugin cache 里手动运行 `npm install`；ME 命令也不会
+  在运行时隐式联网安装依赖。
+- 如果升级后命令报 `Cannot find package 'diff'` / `'yaml'`，说明安装的是
+  1.7.0/1.7.1 的旧包——升级到 1.7.2+ 即可，或重新安装插件让 marketplace
+  拉取新 artifact。
+
+
 Claude Code 更新插件后在 vault 中运行 `/me:update`。两端语义完全相同：
 
 1. 先做零写入 preview，展示有序 migrations、目标路径、warnings 和 exact

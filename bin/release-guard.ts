@@ -14,6 +14,12 @@
  *   3. A recorded version→content-digest mapping is never overwritten
  *      with a different payload (paths + file contents hashed, not just
  *      file names).
+ *   4. package.json and package-lock.json agree on package identity and
+ *      dependency sets, so `npm ci` can hydrate a clean checkout
+ *      deterministically.
+ *   5. Every runtime dependency is bundled into the packed artifact
+ *      (package.json#bundleDependencies), so a marketplace-style install
+ *      never needs a manual package installation inside the plugin cache.
  */
 
 import * as fs from "node:fs";
@@ -58,6 +64,8 @@ const NON_PACKAGE_PATHS: string[] = [
   ".gitignore",
   "bunfig.toml",
   "node_modules/",
+  // Exempt from the version-bump guard (not packed), but guarded separately:
+  // guardLockfileConsistent enforces package.json ↔ lockfile agreement.
   "package-lock.json",
 ];
 
@@ -478,6 +486,209 @@ function guardDigestImmutable(root: string): GuardFinding[] {
   return findings;
 }
 
+// ── Lockfile / dependency guards ───────────────────────────────────
+
+interface PackageManifest {
+  name?: string;
+  version?: string;
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+  bundleDependencies?: string[];
+  bundledDependencies?: string[];
+}
+
+function readPackageManifest(root: string): PackageManifest | null {
+  const pkgPath = path.join(root, "package.json");
+  if (!fs.existsSync(pkgPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function declaredDependencyCount(pkg: PackageManifest): number {
+  return (
+    Object.keys(pkg.dependencies ?? {}).length +
+    Object.keys(pkg.devDependencies ?? {}).length
+  );
+}
+
+/**
+ * Check 4: package.json and package-lock.json must agree.
+ *
+ * The lockfile is the hydration contract for clean installs (`npm ci`).
+ * Drift between the two — the 1.7.0 defect — makes `npm ci` fail and
+ * leaves installed plugins without their runtime dependencies.
+ *
+ * The lockfile is required whenever package.json declares any
+ * dependencies; a dependency-free package is exempt.
+ */
+function guardLockfileConsistent(root: string): GuardFinding[] {
+  const findings: GuardFinding[] = [];
+
+  const pkg = readPackageManifest(root);
+  if (!pkg) {
+    findings.push({
+      severity: "error",
+      code: "PACKAGE_JSON_UNREADABLE",
+      message: "Cannot read or parse package.json",
+    });
+    return findings;
+  }
+
+  const lockPath = path.join(root, "package-lock.json");
+  if (!fs.existsSync(lockPath)) {
+    if (declaredDependencyCount(pkg) > 0) {
+      findings.push({
+        severity: "error",
+        code: "LOCKFILE_MISSING",
+        message:
+          "package-lock.json is missing but package.json declares dependencies. " +
+          "Generate it with `npm install` and commit it — clean installs hydrate via `npm ci`.",
+      });
+    }
+    return findings;
+  }
+
+  let lock: any;
+  try {
+    lock = JSON.parse(fs.readFileSync(lockPath, "utf-8"));
+  } catch {
+    findings.push({
+      severity: "error",
+      code: "LOCKFILE_UNREADABLE",
+      message: "Cannot parse package-lock.json",
+    });
+    return findings;
+  }
+
+  const lockRoot = lock?.packages?.[""];
+  if (!lockRoot || typeof lockRoot !== "object") {
+    findings.push({
+      severity: "error",
+      code: "LOCKFILE_ROOT_MISSING",
+      message: 'package-lock.json has no root entry at packages[""]',
+    });
+    return findings;
+  }
+
+  if (lock.name !== undefined && pkg.name !== undefined && lock.name !== pkg.name) {
+    findings.push({
+      severity: "error",
+      code: "LOCKFILE_NAME_MISMATCH",
+      message:
+        `package.json name "${pkg.name}" differs from lockfile name "${lock.name}". ` +
+        `Regenerate the lockfile with \`npm install\`.`,
+    });
+  }
+
+  if (lockRoot.version !== pkg.version) {
+    findings.push({
+      severity: "error",
+      code: "LOCKFILE_VERSION_MISMATCH",
+      message:
+        `package.json version "${pkg.version}" differs from lockfile root version ` +
+        `"${lockRoot.version}". Regenerate the lockfile with \`npm install\` after every ` +
+        `version bump.`,
+    });
+  }
+
+  // Dependency spec agreement in both directions.
+  const specPairs: [string, Record<string, string> | undefined][] = [
+    ["dependencies", lockRoot.dependencies],
+    ["devDependencies", lockRoot.devDependencies],
+  ];
+  for (const [field, lockSpecs] of specPairs) {
+    const pkgSpecs = (pkg as any)[field] as Record<string, string> | undefined;
+    for (const [dep, spec] of Object.entries(pkgSpecs ?? {})) {
+      const lockSpec = lockSpecs?.[dep];
+      if (lockSpec === undefined) {
+        findings.push({
+          severity: "error",
+          code: "LOCKFILE_DEP_MISMATCH",
+          message:
+            `package.json ${field}.${dep} ("${spec}") is missing from the lockfile root. ` +
+            `Regenerate the lockfile with \`npm install\`.`,
+        });
+      } else if (lockSpec !== spec) {
+        findings.push({
+          severity: "error",
+          code: "LOCKFILE_DEP_MISMATCH",
+          message:
+            `package.json ${field}.${dep} is "${spec}" but the lockfile root declares ` +
+            `"${lockSpec}". Regenerate the lockfile with \`npm install\`.`,
+        });
+      }
+    }
+    for (const dep of Object.keys(lockSpecs ?? {})) {
+      if (!pkgSpecs || !(dep in pkgSpecs)) {
+        findings.push({
+          severity: "error",
+          code: "LOCKFILE_DEP_MISMATCH",
+          message:
+            `Lockfile root ${field}.${dep} has no matching package.json entry. ` +
+            `Regenerate the lockfile with \`npm install\`.`,
+        });
+      }
+    }
+  }
+
+  // Every declared dependency must resolve to a locked package entry.
+  const lockPackages = (lock.packages ?? {}) as Record<string, unknown>;
+  for (const dep of [
+    ...Object.keys(pkg.dependencies ?? {}),
+    ...Object.keys(pkg.devDependencies ?? {}),
+  ]) {
+    if (!(`node_modules/${dep}` in lockPackages)) {
+      findings.push({
+        severity: "error",
+        code: "LOCKFILE_DEP_UNRESOLVED",
+        message:
+          `Dependency "${dep}" has no resolved entry at packages["node_modules/${dep}"] ` +
+          `in package-lock.json. Regenerate the lockfile with \`npm install\`.`,
+      });
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * Check 5: every runtime dependency must be bundled into the package.
+ *
+ * The packed tarball is the release artifact installed by marketplace-style
+ * plugin caches, which do not run a package manager. Runtime dependencies
+ * therefore ship inside the artifact via package.json#bundleDependencies.
+ * A dependency declared but not bundled leaves the installed plugin unable
+ * to resolve it at runtime.
+ */
+function guardRuntimeDepsBundled(root: string): GuardFinding[] {
+  const findings: GuardFinding[] = [];
+
+  const pkg = readPackageManifest(root);
+  if (!pkg) return findings;
+
+  const bundled = new Set(pkg.bundleDependencies ?? pkg.bundledDependencies ?? []);
+  const missing = Object.keys(pkg.dependencies ?? {}).filter(
+    (dep) => !bundled.has(dep),
+  );
+
+  if (missing.length > 0) {
+    findings.push({
+      severity: "error",
+      code: "DEP_NOT_BUNDLED",
+      message:
+        `Runtime dependencies not listed in bundleDependencies: ${missing.join(", ")}. ` +
+        `Marketplace-style installs do not run a package manager, so every entry in ` +
+        `"dependencies" must also be listed in "bundleDependencies" to ship inside the ` +
+        `packed artifact.`,
+    });
+  }
+
+  return findings;
+}
+
 // ── Subcommands ────────────────────────────────────────────────────
 
 function cmdCheck(args: string[]): never {
@@ -498,6 +709,8 @@ function cmdCheck(args: string[]): never {
     ...guardVersionsAgree(root),
     ...guardVersionBumpedOnChange(root, baseRef),
     ...guardDigestImmutable(root),
+    ...guardLockfileConsistent(root),
+    ...guardRuntimeDepsBundled(root),
   ];
 
   const errors = findings.filter((f) => f.severity === "error");
@@ -572,6 +785,21 @@ function cmdRecord(args: string[]): never {
   const version = readVersion(root, VERSION_SOURCES[0]);
   if (!version) {
     console.error("✗  Cannot read version from package.json");
+    process.exit(1);
+  }
+
+  // Refuse to record a release whose install contract is already broken —
+  // a drifted lockfile or an unbundled runtime dependency must never reach
+  // an immutable version→digest entry.
+  const consistencyErrors = [
+    ...guardLockfileConsistent(root),
+    ...guardRuntimeDepsBundled(root),
+  ].filter((f) => f.severity === "error");
+  if (consistencyErrors.length > 0) {
+    console.error("✗  Cannot record release — install contract violations:");
+    for (const e of consistencyErrors) {
+      console.error(`   [${e.code}] ${e.message}`);
+    }
     process.exit(1);
   }
 
