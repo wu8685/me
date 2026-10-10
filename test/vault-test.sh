@@ -400,7 +400,10 @@ test_vault_writer_public_binary() {
   local pack_dir install_dir tarball binary runtime_binary setup_binary update_binary result
   pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-pack.XXXXXX")
   install_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-install.XXXXXX")
-  tarball=$(npm pack --silent --pack-destination "$pack_dir" "$PLUGIN_ROOT") || return 1
+  # Pack from the plugin root as cwd: `npm pack <path>` silently drops
+  # bundleDependencies from the tarball (npm path-arg behavior), while the
+  # release contract is defined by `npm pack` from the package root.
+  tarball=$(cd "$PLUGIN_ROOT" && npm pack --silent --pack-destination "$pack_dir") || return 1
   npm install --silent --ignore-scripts --prefix "$install_dir" \
     "$pack_dir/$tarball" || return 1
   binary="$install_dir/node_modules/.bin/vault-write"
@@ -446,20 +449,20 @@ test_vault_writer_public_binary() {
     fi
   done
 
-  # Bundled runtime dependencies must arrive inside the installed package —
+  # Bundled runtime dependencies must ship inside the tarball itself —
   # marketplace-style installs never run a package manager (Issue #18).
-  # npm hoists declared deps to $install_dir/node_modules; only bundled deps
-  # also land inside the package itself.
+  # Assert against the tarball listing: `npm install` may hoist or prune the
+  # bundled copies, so the post-install layout is not the ground truth.
   local bundled_dep
   for bundled_dep in diff yaml; do
-    if [ ! -f "$installed_package/node_modules/$bundled_dep/package.json" ]; then
+    if ! tar -tzf "$pack_dir/$tarball" | grep -q "^package/node_modules/$bundled_dep/package.json$"; then
       echo -e "    ${RED}FAIL${NC}: packed release does not bundle runtime dependency $bundled_dep"
       return 1
     fi
   done
   # Dev toolchain must not leak into the artifact.
   for bundled_dep in typescript "@types"; do
-    if [ -e "$installed_package/node_modules/$bundled_dep" ]; then
+    if tar -tzf "$pack_dir/$tarball" | grep -q "^package/node_modules/$bundled_dep/"; then
       echo -e "    ${RED}FAIL${NC}: packed release bundles dev dependency $bundled_dep"
       return 1
     fi
