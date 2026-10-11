@@ -124,6 +124,21 @@ earlier one."
   inspect the provenance (e.g. `codex resume <session_id>` where supported)
   rather than asserting the conclusion.
 
+## Provenance handoff for durable notes
+
+When a durable Practices note declares a future use (see the future-retrieval
+contract at `references/future-retrieval-contract.md`), its `## 来源` section
+may cite session provenance discovered here. The handoff rules:
+
+- Store a **pointer**, never transcript text: the `me:recall` query, the
+  `taskId`/`sessionId`, and the date are enough to navigate back. Recall output
+  is already redacted and bounded; do not copy evidence text into the note.
+- Default scope is the current workspace. Citing sessions from another
+  workspace still requires the user's explicit authorization
+  (`--authorize-cross-workspace`) at recall time — the note must record only
+  what the authorized bundle surfaced.
+- Recall stays read-only in this handoff: it never writes the note itself.
+
 ## Future me:reflect handoff (not implemented here)
 
 `me:recall` produces read-only session evidence. A future `me:reflect` step will
