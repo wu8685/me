@@ -352,3 +352,150 @@ describe('doctor CLI', () => {
     expect(report.findings.some(f => f.code === 'VAULT_UNSAFE')).toBeFalse();
   });
 });
+
+describe('layer-routing diagnostics', () => {
+  const MISFILED_DECISION = [
+    '---',
+    'title: "Chose Option B"',
+    'created: 2026-02-02',
+    'tags: [decision]',
+    'type: article',
+    'source: "https://example.com/blog/attention"',
+    '---',
+    '',
+    'We decided to adopt option B. The trade-off is acceptable.',
+    'We recommend a follow-up experiment next week.',
+    '',
+  ].join('\n');
+
+  function routingFinding(report: { findings: Array<{ code: string }> }, code: string) {
+    return report.findings.find(f => f.code === code);
+  }
+
+  test('misfiled decision record in raw surfaces an advisory with evidence', () => {
+    const vault = makeVault();
+    setupHealthyVault(vault);
+    fs.writeFileSync(path.join(vault, 'raw', '2026-02-02-chose-option-b.md'), MISFILED_DECISION);
+
+    const report = JSON.parse(invoke(['--vault-dir', vault]).stdout);
+    const advisory = routingFinding(report, 'ROUTING_RAW_LIKE_PRACTICE');
+    expect(advisory).toBeDefined();
+    expect(advisory?.severity).toBe('warning');
+    expect(advisory?.category).toBe('layer-routing');
+    expect(advisory?.path).toBe('raw/2026-02-02-chose-option-b.md');
+    expect(advisory?.details?.heuristic).toBeTrue();
+    expect((advisory?.details?.evidence as string[]).length).toBeGreaterThan(0);
+    expect(report.routing.scannedNotes).toBe(1);
+    expect(report.routing.advisories).toBe(1);
+    expect(report.state).toBe('behind');
+  });
+
+  test('raw note with an internal provenance URI is a deterministic error', () => {
+    const vault = makeVault();
+    setupHealthyVault(vault);
+    fs.writeFileSync(
+      path.join(vault, 'raw', '2026-02-02-internal.md'),
+      MISFILED_DECISION.replace('https://example.com/blog/attention', 'me://vault/raw/legacy'),
+    );
+
+    const report = JSON.parse(invoke(['--vault-dir', vault]).stdout);
+    const finding = routingFinding(report, 'ROUTING_RAW_SOURCE_NOT_URL');
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe('error');
+    expect(finding?.path).toBe('raw/2026-02-02-internal.md');
+    expect(report.routing.errors).toBeGreaterThan(0);
+    expect(report.state).toBe('malformed');
+  });
+
+  test('cognition note missing confidence is a deterministic error', () => {
+    const vault = makeVault();
+    setupHealthyVault(vault);
+    fs.writeFileSync(path.join(vault, 'cognition', '2026-02-04-insight.md'), [
+      '---',
+      'title: "Insight"',
+      'created: 2026-02-04',
+      'tags: [x]',
+      'type: insight',
+      'source: "[[practices/2026-02-02-chose-option-b]]"',
+      '---',
+      '',
+      'A purported insight.',
+      '',
+    ].join('\n'));
+
+    const report = JSON.parse(invoke(['--vault-dir', vault]).stdout);
+    const finding = routingFinding(report, 'ROUTING_MISSING_REQUIRED_FIELD');
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe('error');
+    expect(finding?.details?.field).toBe('confidence');
+  });
+
+  test('advisory suppression via .me/doctor-suppressions.json hides false positives', () => {
+    const vault = makeVault();
+    setupHealthyVault(vault);
+    fs.writeFileSync(path.join(vault, 'raw', '2026-02-02-chose-option-b.md'), MISFILED_DECISION);
+    fs.writeFileSync(path.join(vault, '.me', 'doctor-suppressions.json'), JSON.stringify({
+      version: 1,
+      suppress: [{ code: 'ROUTING_RAW_LIKE_PRACTICE', path: 'raw/2026-02-02-chose-option-b.md' }],
+    }));
+
+    const report = JSON.parse(invoke(['--vault-dir', vault]).stdout);
+    expect(routingFinding(report, 'ROUTING_RAW_LIKE_PRACTICE')).toBeUndefined();
+    expect(report.routing.suppressedAdvisories).toBe(1);
+    expect(report.routing.advisories).toBe(0);
+  });
+
+  test('malformed suppression file is a warning, not a crash', () => {
+    const vault = makeVault();
+    setupHealthyVault(vault);
+    fs.writeFileSync(path.join(vault, '.me', 'doctor-suppressions.json'), '{nope');
+
+    const result = invoke(['--vault-dir', vault]);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(routingFinding(report, 'ROUTING_SUPPRESSIONS_INVALID')).toBeDefined();
+  });
+
+  test('custom configured layer paths are scanned', () => {
+    const vault = makeVault();
+    fs.mkdirSync(path.join(vault, '.me'));
+    fs.mkdirSync(path.join(vault, 'inbox'));
+    fs.mkdirSync(path.join(vault, 'journal'));
+    fs.mkdirSync(path.join(vault, 'wiki'));
+    fs.writeFileSync(
+      path.join(vault, '.me', 'config.yaml'),
+      ['layers:', '  raw: inbox', '  practices: journal', '  cognition: wiki'].join('\n') + '\n',
+    );
+    fs.copyFileSync(path.join(pluginRoot, 'templates/SCHEMA.md'), path.join(vault, 'SCHEMA.md'));
+    fs.copyFileSync(path.join(pluginRoot, 'templates/CLAUDE-template.md'), path.join(vault, 'CLAUDE.md'));
+    fs.writeFileSync(path.join(vault, 'inbox', '2026-02-02-chose-option-b.md'), MISFILED_DECISION);
+
+    const report = JSON.parse(invoke(['--vault-dir', vault]).stdout);
+    const advisory = routingFinding(report, 'ROUTING_RAW_LIKE_PRACTICE');
+    expect(advisory?.path).toBe('inbox/2026-02-02-chose-option-b.md');
+  });
+
+  test('routing diagnostics stay zero-write', () => {
+    const vault = makeVault();
+    setupHealthyVault(vault);
+    fs.writeFileSync(path.join(vault, 'raw', '2026-02-02-chose-option-b.md'), MISFILED_DECISION);
+    const runtimeBase = path.join(path.dirname(vault), 'runtime');
+
+    const snapshot = (dir: string): string[] => {
+      const entries: string[] = [];
+      const walk = (current: string) => {
+        for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+          const full = path.join(current, entry.name);
+          if (entry.isDirectory()) walk(full);
+          else entries.push(`${path.relative(vault, full)}:${fs.readFileSync(full, 'utf8').length}`);
+        }
+      };
+      walk(dir);
+      return entries.sort();
+    };
+    const before = snapshot(vault);
+    invoke(['--vault-dir', vault], { ME_RUNTIME_ROOT: runtimeBase });
+    expect(snapshot(vault)).toEqual(before);
+    expect(fs.existsSync(runtimeBase)).toBeFalse();
+  });
+});

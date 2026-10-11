@@ -52,14 +52,46 @@
     "source": "CLAUDE.md",
     "reordered": false,
     "sections": [
-      { "heading": "Knowledge Base", "level": 1, "state": "present" },
-      { "heading": "Configuration", "level": 2, "state": "present" },
-      { "heading": "Layer Map", "level": 2, "state": "present" },
-      { "heading": "Commands", "level": 2, "state": "present" },
-      { "heading": "Note Templates", "level": 2, "state": "present" },
-      { "heading": "After Creating a Note", "level": 2, "state": "present" },
-      { "heading": "Search", "level": 2, "state": "present" },
-      { "heading": "Conventions", "level": 2, "state": "present" }
+      {
+        "heading": "Knowledge Base",
+        "level": 1,
+        "state": "present"
+      },
+      {
+        "heading": "Configuration",
+        "level": 2,
+        "state": "present"
+      },
+      {
+        "heading": "Layer Map",
+        "level": 2,
+        "state": "present"
+      },
+      {
+        "heading": "Commands",
+        "level": 2,
+        "state": "present"
+      },
+      {
+        "heading": "Note Templates",
+        "level": 2,
+        "state": "present"
+      },
+      {
+        "heading": "After Creating a Note",
+        "level": 2,
+        "state": "present"
+      },
+      {
+        "heading": "Search",
+        "level": 2,
+        "state": "present"
+      },
+      {
+        "heading": "Conventions",
+        "level": 2,
+        "state": "present"
+      }
     ]
   },
   "runtime": {
@@ -69,10 +101,40 @@
     "legacy": [],
     "ingestPending": []
   },
+  "routing": {
+    "scannedNotes": 0,
+    "errors": 0,
+    "advisories": 0,
+    "suppressedAdvisories": 0
+  },
   "findings": [
-    { "code": "CONFIG_VALID", "severity": "info", "category": "config", "message": "Layer configuration is valid.", "recommendedAction": "No action needed." },
-    { "code": "SCHEMA_CURRENT", "severity": "info", "category": "schema", "message": "Schema matches the current ME version.", "recommendedAction": "No action needed." },
-    { "code": "PLUGIN_VERSION_CONSISTENT", "severity": "info", "category": "versions", "message": "All plugin manifests agree on version 1.6.1.", "recommendedAction": "No action needed." },
-    { "code": "AGENT_SURFACE_CLAUDE", "severity": "info", "category": "agents", "message": "Claude managed surface (CLAUDE.md) is present.", "recommendedAction": "No action needed." }
+    {
+      "code": "CONFIG_VALID",
+      "severity": "info",
+      "category": "config",
+      "message": "Layer configuration is valid.",
+      "recommendedAction": "No action needed."
+    },
+    {
+      "code": "SCHEMA_CURRENT",
+      "severity": "info",
+      "category": "schema",
+      "message": "Schema matches the current ME version.",
+      "recommendedAction": "No action needed."
+    },
+    {
+      "code": "PLUGIN_VERSION_CONSISTENT",
+      "severity": "info",
+      "category": "versions",
+      "message": "All plugin manifests agree on version 1.6.1.",
+      "recommendedAction": "No action needed."
+    },
+    {
+      "code": "AGENT_SURFACE_CLAUDE",
+      "severity": "info",
+      "category": "agents",
+      "message": "Claude managed surface (CLAUDE.md) is present.",
+      "recommendedAction": "No action needed."
+    }
   ]
 }

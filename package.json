@@ -1,6 +1,6 @@
 {
   "name": "me",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "description": "A Claude Code / Codex plugin for knowledge management and evidence-backed decision briefs",
   "scripts": {
     "test": "bash test/vault-test.sh",
@@ -13,7 +13,8 @@
     "test:update": "bun test test/update-*.test.ts",
     "test:release-guard": "bun test test/release-guard.test.ts",
     "release:guard": "bun run bin/release-guard.ts check",
-    "release:record": "bun run bin/release-guard.ts record"
+    "release:record": "bun run bin/release-guard.ts record",
+    "test:routing": "bun test test/routing.test.ts test/route-check.test.ts test/remediate.test.ts"
   },
   "files": [
     ".agents/plugins/marketplace.json",
@@ -45,7 +46,9 @@
     "distill": "bin/distill.ts",
     "me-setup": "bin/setup.ts",
     "me-update": "bin/update.ts",
-    "vault-write": "bin/vault-write.ts"
+    "vault-write": "bin/vault-write.ts",
+    "route-check": "bin/route-check.ts",
+    "remediate": "bin/remediate.ts"
   },
   "keywords": [
     "knowledge-management",

@@ -30,6 +30,22 @@ cat .me/config.yaml
 | Raw | per `.me/config.yaml` (default: `raw/`) | Source material, translated articles, reference docs | Ingesting external content |
 | Practices | per `.me/config.yaml` (default: `practices/`) | Practice records, experiments, process notes | Recording what you tried |
 | Cognition | per `.me/config.yaml` (default: `cognition/`) | Distilled insights, stable knowledge | Insight is proven by practice |
+
+### Routing precedence
+
+Before writing any note, decide the destination layer by:
+
+```text
+semantic knowledge type > layer schema constraints > existing directory convention
+```
+
+1. External source material or faithful source capture → Raw (including meeting transcripts and articles that quote opinions).
+2. Practice history, subjective observations, feedback, decisions, trade-offs, and working conclusions → Practices.
+3. Stable reusable insight → Cognition, only through the evidence-gated `/me:distill` promotion flow.
+4. Existing nearby notes are navigation evidence, never routing evidence — a misfiled legacy note does not justify copying its location.
+5. If content mixes source material and judgment, preserve the source in Raw and write the interpretation or decision in Practices with a `[[wikilink]]` provenance back to the Raw note.
+
+Run `/me:route-check` before creating a note: `blocked` results must stop the write; `advisory` results require explicit user confirmation. `/me:doctor` reports deterministic routing violations as errors and possible misfilings as heuristic advisories; remediate a confirmed misfiled note only via `/me:remediate` (zero-write preview, digest-bound confirmation, link-safe move) — never move existing notes automatically.
 <!-- me:managed:end layer-map -->
 
 <!-- me:managed:start commands -->
@@ -44,6 +60,8 @@ cat .me/config.yaml
 | `/me:autolinks [file] [layer]` | Auto-add wikilinks via LLM concept extraction matched against vault index (bulk or single-note) |
 | `/me:backlinks <note>` | Discover backlinks and unlinked mentions for a note |
 | `/me:move <file> <dest>` | Move/rename a note with wikilink integrity preserved |
+| `/me:route-check` | Pre-write layer routing contract — validate destination layer before creating a note |
+| `/me:remediate` | Move a confirmed misfiled note to the correct layer (zero-write preview, digest-bound confirmation) |
 | `/me:search [query] [--tags t1,t2] [--layer L] [--after date] [--before date]` | Search vault by content, tags, layer, date, or wikilink connections |
 <!-- me:managed:end commands -->
 

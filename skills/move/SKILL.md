@@ -78,3 +78,12 @@ The command reports:
 - Wikilinks use `[[Filename]]` without path prefix per D-08
 - Layer directories resolved from `.me/config.yaml` at runtime
 - Ordinary Markdown links (`[text](path)`) are NOT rewritten — only wikilinks are maintained
+
+## Layer corrections
+
+`/me:move` relocates notes within the structure as-is. When a note is filed in
+the **wrong layer** (see `/me:doctor` layer-routing findings), use
+`/me:remediate` instead: it adds a zero-write digest-bound preview, target-layer
+schema revalidation, index updates, and rollback recovery to the same
+link-safe relocation behavior.
+

@@ -7,9 +7,9 @@ description: "Use when a user asks why ME is misbehaving, what state a vault is 
 
 Explain the effective ME state of a workspace in one structured, read-only
 report: resolved vault/plugin roots, locally available versions, config and
-schema validity, managed Agent surfaces and section integrity, and unfinished
-runtime lock/journal/recovery state — with stable finding codes, severities,
-and recommended actions.
+schema validity, managed Agent surfaces and section integrity, unfinished
+runtime lock/journal/recovery state, and semantic layer-routing diagnostics —
+with stable finding codes, severities, and recommended actions.
 
 ## Constraints (non-negotiable)
 
@@ -70,9 +70,21 @@ Parse the versioned JSON and render, in this order:
 7. **Findings** (`report.findings`): group by severity (`error` → `warning` →
    `info`), and for each finding quote `code`, `severity`, `message`, and
    `recommendedAction`.
+8. **Layer routing** (`report.routing`, `layer-routing` findings):
+   deterministic schema violations (error) vs heuristic misfiling advisories
+   (warning, `details.heuristic: true`, with `details.evidence`). Advisories
+   are signals, not proof — present them as possibilities to confirm with the
+   user, never as verdicts.
 
 Never claim a fix happened. Every recommended action is a *suggestion for the
 user*, not a step this Skill performs.
+
+## Remediation pointer
+
+A confirmed misfiled note is remediated only via `/me:remediate` (zero-write
+digest-bound preview, explicit confirmation, link-safe move with rollback) —
+never by shell `mv`, never automatically, never in bulk. Advisory findings
+alone do not justify a move.
 
 ## Classify the outcome for the user
 

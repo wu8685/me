@@ -373,6 +373,59 @@ decision-brief 相同的 preview → 确认 → write 流程；简报永远不�
 vault 相对路径消歧。注意：`/me:move` 只维护 WikiLink，普通 Markdown 链接
 （`[text](path)`）不会被重写。
 
+## 层级路由与纠偏（/me:route-check · /me:remediate）
+
+写任何笔记之前，目标层级按下面的优先级决定：
+
+```text
+语义知识类型 > 层级 schema 约束 > 既有目录惯例
+```
+
+- 外部来源材料、忠实的来源摘录（含转述他人观点的文章、会议转写）→ **raw**；
+- 实践记录、主观观察、反馈、决策、取舍、阶段性结论 → **practices**；
+- 稳定可复用的洞察 → **cognition**，且只能走 `/me:distill` 的证据门槛流程；
+- 附近已有笔记只是导航证据，不是路由证据——历史放错位置的笔记不构成
+  照旧归类的理由；
+- 内容同时包含来源材料和判断时：来源保留在 raw，解释/决策单独写进
+  practices，并用 `[[wikilink]]` 溯源回 raw 笔记。
+
+写笔记前先跑预写契约（只读）：
+
+```bash
+# Claude Code / Codex 中直接用技能
+/me:route-check
+
+# 或手动调用 CLI
+bun run /path/to/me/bin/route-check.ts --vault-dir . --layer practices --file /tmp/candidate.md
+```
+
+`blocked` 必须停止写入（确定性 schema 违规）；`advisory` 需要向用户显式确认
+（语义启发式，可能误报）。
+
+确认某条笔记放错了层级后，用纠偏契约迁移（**绝不批量、绝不自动**）：
+
+```bash
+# 1. 零写入预览：源/目标路径、frontmatter 变更、wikilink 重写、README 索引变更
+bun run /path/to/me/bin/remediate.ts preview --vault-dir . \
+  --note raw/2026-02-02-example.md --to-layer practices --markdown-file /tmp/corrected.md
+
+# 2. 向用户展示预览并请求显式确认
+
+# 3. 绑定预览 digest 执行；vault 有变动则以 STALE_PREVIEW 拒绝
+bun run /path/to/me/bin/remediate.ts apply --vault-dir . \
+  --note raw/2026-02-02-example.md --to-layer practices --markdown-file /tmp/corrected.md \
+  --expected-plan-digest <预览输出的 planDigest>
+```
+
+apply 沿用 `/me:move` 的链接安全搬迁（重写路径限定的 `[[layer/note]]` 引用），
+并更新两层 README 索引；目标层 schema 校验、链接与索引可达性在写入后复检，
+失败即回滚并在 runtime journal 中留下可审计结果。
+
+`/me:doctor` 会把确定性路由违规报为 error finding（如 raw 笔记的 `source`
+不是外部 URL），把疑似放错层级的笔记报为带证据的启发式 advisory；误报可在
+`.me/doctor-suppressions.json` 中按 code+path 抑制。advisory 本身绝不构成
+迁移理由，也不触发任何自动改写。
+
 ## 诊断 ME 状态（/me:doctor）
 
 当工作空间"看起来不对"——摄入失败、写盘被拒、怀疑版本不一致、或想确认某个

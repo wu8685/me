@@ -609,8 +609,8 @@ test_decision_brief_discovery_and_release_version() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.7.1" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected current release version 1.7.1"
+  [ "$(echo "$versions" | head -n 1)" = "1.8.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected current release version 1.8.0"
     return 1
   }
 }
@@ -783,8 +783,8 @@ test_ingest_docs_rich_media() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.7.1" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.7.1"
+  [ "$(echo "$versions" | head -n 1)" = "1.8.0" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.8.0"
     return 1
   }
 
@@ -5681,7 +5681,7 @@ test_doctor_contract_fixture() {
   assert_file_exists "$PLUGIN_ROOT/test/fixtures/doctor/report-healthy-v1.json" || return 1
   node -e '
     const r = require(process.argv[1]);
-    const requiredTop = ["version","state","plugin","roots","versions","config","schema","agents","managedSections","runtime","findings"];
+    const requiredTop = ["version","state","plugin","roots","versions","config","schema","agents","managedSections","runtime","routing","findings"];
     for (const key of requiredTop) {
       if (!(key in r)) { console.error("missing top-level key " + key); process.exit(1); }
     }
@@ -5723,6 +5723,10 @@ test_doctor_contract_fixture() {
     // runtime shape
     if (typeof r.runtime.exists !== "boolean") process.exit(1);
     if (!Array.isArray(r.runtime.locks) || !Array.isArray(r.runtime.recoveries) || !Array.isArray(r.runtime.legacy) || !Array.isArray(r.runtime.ingestPending)) process.exit(1);
+    // routing shape
+    for (const key of ["scannedNotes","errors","advisories","suppressedAdvisories"]) {
+      if (typeof r.routing[key] !== "number") process.exit(1);
+    }
     // findings shape
     if (!Array.isArray(r.findings) || r.findings.length === 0) process.exit(1);
     for (const f of r.findings) {
@@ -7018,6 +7022,56 @@ list_tests() {
   declare -F | awk '/test_/ {print "  " $3}'
 }
 
+# ── Layer routing contract (Issue #20) ──────────────────────────────
+test_routing_contract() {
+  assert_file_exists "$PLUGIN_ROOT/bin/vault-write/routing.ts" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/route-check.ts" || return 1
+  assert_file_exists "$PLUGIN_ROOT/bin/remediate.ts" || return 1
+  if [ ! -x "$PLUGIN_ROOT/bin/route-check.ts" ] || [ ! -x "$PLUGIN_ROOT/bin/remediate.ts" ]; then
+    echo -e "    ${RED}FAIL${NC}: route-check/remediate entrypoints are not executable"
+    return 1
+  fi
+  assert_file_exists "$PLUGIN_ROOT/skills/route-check/SKILL.md" || return 1
+  assert_file_exists "$PLUGIN_ROOT/skills/remediate/SKILL.md" || return 1
+  node -e '
+    const p=require(process.argv[1]);
+    if (p.bin["route-check"] !== "bin/route-check.ts") process.exit(1);
+    if (p.bin["remediate"] !== "bin/remediate.ts") process.exit(1);
+  ' "$PLUGIN_ROOT/package.json" || return 1
+
+  # Both managed surfaces carry identical routing precedence semantics.
+  for template in CLAUDE-template.md AGENTS-template.md; do
+    grep -Fq 'semantic knowledge type > layer schema constraints > existing directory convention' \
+      "$PLUGIN_ROOT/templates/$template" || {
+      echo -e "    ${RED}FAIL${NC}: $template lacks the routing precedence"
+      return 1
+    }
+    grep -Fq 'navigation evidence, never routing evidence' \
+      "$PLUGIN_ROOT/templates/$template" || {
+      echo -e "    ${RED}FAIL${NC}: $template lacks the legacy-neighbor rule"
+      return 1
+    }
+  done
+  assert_file_contains "$PLUGIN_ROOT/templates/CLAUDE-template.md" '/me:route-check' || return 1
+  assert_file_contains "$PLUGIN_ROOT/templates/AGENTS-template.md" '\$me:route-check' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/doctor/SKILL.md" 'layer-routing' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/doctor/references/diagnostic-contract-v1.md" 'ROUTING_RAW_SOURCE_NOT_URL' || return 1
+  assert_file_contains "$PLUGIN_ROOT/skills/remediate/SKILL.md" 'STALE_PREVIEW' || return 1
+
+  # Anonymous fixture enforcement: routing tests and fixtures must not contain
+  # personal or organization-sensitive URLs — example.com only.
+  local offenders
+  offenders=$(grep -rhoE 'https?://[^"'"'"' )|<>`]+' \
+    "$PLUGIN_ROOT/test/routing.test.ts" \
+    "$PLUGIN_ROOT/test/route-check.test.ts" \
+    "$PLUGIN_ROOT/test/remediate.test.ts" \
+    | grep -v 'https://example\.com' || true)
+  if [ -n "$offenders" ]; then
+    echo -e "    ${RED}FAIL${NC}: non-anonymous URLs in routing fixtures: $offenders"
+    return 1
+  fi
+}
+
 main() {
   if [ "${1:-}" = "--list" ]; then
     list_tests
@@ -7344,6 +7398,12 @@ main() {
     run_test test_brief_zero_write
     run_test test_brief_packaged_release
     run_test test_brief_docs
+  fi
+
+
+  # Routing tests (Issue #20)
+  if [ "${1:-}" = "" ]; then
+    run_test test_routing_contract
   fi
 
   # Summary
