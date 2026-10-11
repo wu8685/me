@@ -5084,6 +5084,233 @@ EOF
   fi
 }
 
+# ── Issue #19: Future-Retrieval Contract ───────────────────────────
+
+test_future_retrieval_contract_document() {
+  # The focused reference contract exists and pins the whole agreement.
+  local doc="$PLUGIN_ROOT/references/future-retrieval-contract.md"
+  assert_file_exists "$doc" || return 1
+
+  # Optional ordinary-Markdown sections (localized headings).
+  for heading in '后续用途' '决策背景' '未决问题' '检索入口' '来源'; do
+    if ! grep -qF "$heading" "$doc"; then
+      echo -e "    ${RED}FAIL${NC}: contract doc missing section '$heading'"
+      return 1
+    fi
+  done
+
+  # Trigger vocabulary examples from real use.
+  for trigger in '年底总结时需要找到这件事' '下次继续完善' '复盘'; do
+    if ! grep -qF "$trigger" "$doc"; then
+      echo -e "    ${RED}FAIL${NC}: contract doc missing trigger example '$trigger'"
+      return 1
+    fi
+  done
+
+  # Core rules: preview before write, no new frontmatter fields, post-write
+  # verification, provenance boundaries.
+  if ! grep -qiF 'preview' "$doc"; then
+    echo -e "    ${RED}FAIL${NC}: contract doc missing retrieval-plan preview requirement"
+    return 1
+  fi
+  if ! grep -qiF 'frontmatter' "$doc"; then
+    echo -e "    ${RED}FAIL${NC}: contract doc missing the no-new-frontmatter rule"
+    return 1
+  fi
+  if ! grep -qF 'me:search' "$doc"; then
+    echo -e "    ${RED}FAIL${NC}: contract doc missing post-write me:search verification"
+    return 1
+  fi
+  if ! grep -qiF 'transcript' "$doc"; then
+    echo -e "    ${RED}FAIL${NC}: contract doc missing the no-transcript provenance rule"
+    return 1
+  fi
+  if ! grep -qiF 'redact' "$doc"; then
+    echo -e "    ${RED}FAIL${NC}: contract doc missing the sensitive-material redaction rule"
+    return 1
+  fi
+  if ! grep -qiF 'authoriz' "$doc"; then
+    echo -e "    ${RED}FAIL${NC}: contract doc missing the cross-workspace authorization rule"
+    return 1
+  fi
+}
+
+test_future_retrieval_managed_guidance_parity() {
+  # Both managed Agent surfaces carry semantically equivalent guidance.
+  local agents_t="$PLUGIN_ROOT/templates/AGENTS-template.md"
+  local claude_t="$PLUGIN_ROOT/templates/CLAUDE-template.md"
+  local tmp_agents tmp_claude
+  tmp_agents=$(mktemp "${TMPDIR:-/tmp}/me-fr-agents.XXXXXX")
+  tmp_claude=$(mktemp "${TMPDIR:-/tmp}/me-fr-claude.XXXXXX")
+
+  sed -n '/me:managed:start after-creating-a-note/,/me:managed:end after-creating-a-note/p' \
+    "$agents_t" | sed 's/\$me:/\/me:/g' > "$tmp_agents"
+  sed -n '/me:managed:start after-creating-a-note/,/me:managed:end after-creating-a-note/p' \
+    "$claude_t" > "$tmp_claude"
+
+  if ! diff -q "$tmp_agents" "$tmp_claude" > /dev/null; then
+    echo -e "    ${RED}FAIL${NC}: after-creating-a-note guidance differs between AGENTS and CLAUDE templates"
+    diff "$tmp_agents" "$tmp_claude" | head -20
+    rm -f "$tmp_agents" "$tmp_claude"
+    return 1
+  fi
+
+  if ! grep -qF 'future-retrieval-contract.md' "$tmp_claude"; then
+    echo -e "    ${RED}FAIL${NC}: managed guidance does not reference the future-retrieval contract"
+    rm -f "$tmp_agents" "$tmp_claude"
+    return 1
+  fi
+  for required in '检索入口' 'preview' '/me:search'; do
+    if ! grep -qF "$required" "$tmp_claude"; then
+      echo -e "    ${RED}FAIL${NC}: managed guidance missing '$required'"
+      rm -f "$tmp_agents" "$tmp_claude"
+      return 1
+    fi
+  done
+  rm -f "$tmp_agents" "$tmp_claude"
+}
+
+test_future_retrieval_year_end_search() {
+  # Real-use evidence #2: the note must be findable with year-end-review
+  # vocabulary that never appeared verbatim in the original user statement
+  # ("年底总结时需要找到这件事").
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/practices"
+  local fixture="$PLUGIN_ROOT/test/fixtures/retrieval/year-end-review-note.md"
+  assert_file_exists "$fixture" || return 1
+  cp "$fixture" "$v/practices/2026-09-20-capacity-challenge.md"
+
+  if grep -qF '年底总结时需要找到这件事' "$fixture"; then
+    echo -e "    ${RED}FAIL${NC}: fixture must not quote the original statement verbatim"
+    return 1
+  fi
+
+  local output
+  output=$(bun run "$PLUGIN_ROOT/bin/search.ts" --tags year-end-review --vault-dir "$v" 2>&1)
+  if ! echo "$output" | grep -qi "capacity-challenge"; then
+    echo -e "    ${RED}FAIL${NC}: --tags year-end-review did not find the fixture"
+    echo "    output: $output"
+    return 1
+  fi
+
+  output=$(bun run "$PLUGIN_ROOT/bin/search.ts" '年终复盘' --vault-dir "$v" 2>&1)
+  if ! echo "$output" | grep -qi "capacity-challenge"; then
+    echo -e "    ${RED}FAIL${NC}: free-text '年终复盘' did not find the fixture"
+    echo "    output: $output"
+    return 1
+  fi
+}
+
+test_future_retrieval_resume_planning_fixture() {
+  # Real-use evidence #1: a resumable planning note preserves final state,
+  # rationale, unresolved questions, and the next decision point.
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/practices"
+  local fixture="$PLUGIN_ROOT/test/fixtures/retrieval/resume-planning-note.md"
+  assert_file_exists "$fixture" || return 1
+  cp "$fixture" "$v/practices/2026-10-09-s2-okr-planning.md"
+
+  for required in '## 决策背景' '## 未决问题' '下一个决策点' '定稿' '假设'; do
+    if ! grep -qF "$required" "$fixture"; then
+      echo -e "    ${RED}FAIL${NC}: resume fixture missing '$required'"
+      return 1
+    fi
+  done
+
+  local output
+  output=$(bun run "$PLUGIN_ROOT/bin/search.ts" '继续完善' --vault-dir "$v" 2>&1)
+  if ! echo "$output" | grep -qi "s2-okr-planning"; then
+    echo -e "    ${RED}FAIL${NC}: resume-later vocabulary '继续完善' did not find the fixture"
+    echo "    output: $output"
+    return 1
+  fi
+  output=$(bun run "$PLUGIN_ROOT/bin/search.ts" --tags okr,planning --vault-dir "$v" 2>&1)
+  if ! echo "$output" | grep -qi "s2-okr-planning"; then
+    echo -e "    ${RED}FAIL${NC}: --tags okr,planning did not find the fixture"
+    echo "    output: $output"
+    return 1
+  fi
+}
+
+test_future_retrieval_sections_optional_by_default() {
+  # Without a declared future use, ordinary note creation is unburdened:
+  # the base practices template carries none of the optional sections.
+  local tmpl="$PLUGIN_ROOT/templates/practices-template.md"
+  for heading in '后续用途' '决策背景' '未决问题' '检索入口'; do
+    if grep -qF "$heading" "$tmpl"; then
+      echo -e "    ${RED}FAIL${NC}: practices template must not require '$heading' by default"
+      return 1
+    fi
+  done
+  # And no new frontmatter fields appear anywhere in the schema.
+  if grep -qiF 'future' "$PLUGIN_ROOT/templates/SCHEMA.md"; then
+    echo -e "    ${RED}FAIL${NC}: SCHEMA.md must not gain future-retrieval frontmatter fields"
+    return 1
+  fi
+}
+
+test_future_retrieval_custom_layer_paths() {
+  # The contract works with configured custom layer paths.
+  local v="$MOCK_VAULT"
+  mkdir -p "$v/.me" "$v/research" "$v/practice" "$v/insights"
+  cat > "$v/.me/config.yaml" << 'EOF'
+layers:
+  raw: research
+  practices: practice
+  cognition: insights
+EOF
+  cp "$PLUGIN_ROOT/test/fixtures/retrieval/year-end-review-note.md" \
+    "$v/practice/2026-09-20-capacity-challenge.md"
+
+  local output
+  output=$(bun run "$PLUGIN_ROOT/bin/search.ts" --tags year-end-review --layer practices --vault-dir "$v" 2>&1)
+  if ! echo "$output" | grep -qi "capacity-challenge"; then
+    echo -e "    ${RED}FAIL${NC}: custom practices dir did not surface the fixture"
+    echo "    output: $output"
+    return 1
+  fi
+}
+
+test_future_retrieval_provenance_pointer_only() {
+  # Fixtures keep provenance as a navigable pointer, never a transcript dump,
+  # and carry no sensitive session material.
+  local fixture
+  for fixture in year-end-review-note.md resume-planning-note.md; do
+    local f="$PLUGIN_ROOT/test/fixtures/retrieval/$fixture"
+    assert_file_exists "$f" || return 1
+    if ! grep -qF '## 来源' "$f"; then
+      echo -e "    ${RED}FAIL${NC}: $fixture missing the provenance section"
+      return 1
+    fi
+    if ! grep -qF 'me:recall' "$f"; then
+      echo -e "    ${RED}FAIL${NC}: $fixture provenance is not a recall pointer"
+      return 1
+    fi
+    if grep -qiE '^(user|assistant|system):' "$f"; then
+      echo -e "    ${RED}FAIL${NC}: $fixture contains transcript-shaped lines"
+      return 1
+    fi
+    if grep -qiE 'bearer |sk-[a-z0-9]|gh[pousr]_' "$f"; then
+      echo -e "    ${RED}FAIL${NC}: $fixture contains credential-shaped material"
+      return 1
+    fi
+  done
+}
+
+test_future_retrieval_recall_handoff_documented() {
+  # me:recall documents the provenance handoff: pointers, not transcripts;
+  # cross-workspace access stays behind explicit authorization.
+  local skill="$PLUGIN_ROOT/skills/recall/SKILL.md"
+  if ! grep -qF 'future-retrieval-contract.md' "$skill"; then
+    echo -e "    ${RED}FAIL${NC}: recall skill missing the provenance handoff reference"
+    return 1
+  fi
+  if ! grep -qiF 'pointer' "$skill"; then
+    echo -e "    ${RED}FAIL${NC}: recall skill handoff must require pointer-only provenance"
+    return 1
+  fi
+}
+
 # ── Quick task 260409-m13: autolinks UUID id ───────────────────────
 
 test_autolinks_ensures_frontmatter_id() {
@@ -7301,6 +7528,16 @@ main() {
     run_test test_search_newest_first
     run_test test_search_default_limit
     run_test test_search_custom_config_dirs
+
+    # Issue #19: Future-Retrieval Contract
+    run_test test_future_retrieval_contract_document
+    run_test test_future_retrieval_managed_guidance_parity
+    run_test test_future_retrieval_year_end_search
+    run_test test_future_retrieval_resume_planning_fixture
+    run_test test_future_retrieval_sections_optional_by_default
+    run_test test_future_retrieval_custom_layer_paths
+    run_test test_future_retrieval_provenance_pointer_only
+    run_test test_future_retrieval_recall_handoff_documented
 
     # Quick task 260409-m13: autolinks UUID id
     run_test test_autolinks_ensures_frontmatter_id

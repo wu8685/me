@@ -89,6 +89,14 @@ After creating or filing a new note in any layer:
 2. Present results as suggestions. Do NOT auto-insert wikilinks — let the user decide which connections to make.
 
 3. Use `[[filename]]` syntax (no path prefix). Wikilinks can cross any layer boundary freely.
+
+4. If the user declared a future use for the note (e.g. "年底总结时需要找到这件事", "下次继续完善", "next planning cycle", "use this in a later report"), apply the future-retrieval contract bundled with the plugin at `references/future-retrieval-contract.md`:
+
+   - Preview a retrieval plan before writing: the intended future use, proposed schema-valid retrieval vocabulary (prefer existing tags and aliases), the index or topic-note connection, the rationale and open questions to preserve, the minimal provenance pointer, and the exact writes. The preview is chat-only — the write still requires the normal confirmation.
+   - Record only the minimum context the scenario needs, using optional ordinary Markdown sections such as `## 后续用途`, `## 决策背景`, `## 未决问题`, `## 检索入口`, `## 来源`. Never add frontmatter fields and never paste session transcripts; provenance is a pointer (e.g. a `/me:recall` query plus taskId), redacted and current-workspace by default.
+   - After the write, run representative `/me:search` queries with the planned future vocabulary and report whether the declared retrieval scenario succeeds.
+
+   Without a declared future use, skip this step — ordinary notes carry no extra sections.
 <!-- me:managed:end after-creating-a-note -->
 
 <!-- me:managed:start search -->

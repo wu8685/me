@@ -38,6 +38,8 @@ me/
 │   ├── autolinks/SKILL.md        # Auto wikilink skill
 │   ├── backlinks/SKILL.md        # Backlink discovery skill
 │   └── move/SKILL.md             # Note move/rename skill
+├── references/                   # Plugin-level reference contracts
+│   └── future-retrieval-contract.md  # Future-retrieval contract (issue #19)
 ├── test/                         # Test suite
 │   └── vault-test.sh
 ├── templates/                    # Templates
@@ -106,6 +108,31 @@ runtime。只有 `committed` 是成功，其他结果保留结构化 rollback �
 启动 write 时会先检查未完成 operation。可以证明 ownership 且未发生外部变化的内容才允许自动清理或恢复；无法证明归属、内容已变化或 operation 目录损坏时，保留现有数据并返回 `status: manual_recovery`。
 
 调用方必须读取聚合的 `recoveryState`，并逐项展示 `recoveries[]` 中的 `operationId`、`state`、`preservedPaths`、`remainingMutations` 与全部 `actions`。不得把 `manual_recovery` 简化为“已保存”或“已回滚”。只有 `status: committed` 才能对外报告保存成功。
+
+## Future-Retrieval Contract
+
+`references/future-retrieval-contract.md` 是"为声明过的未来用途而写"的规范：
+触发词、retrieval-plan preview 必须包含的内容、可选正文段落
+（`## 后续用途` / `## 决策背景` / `## 未决问题` / `## 检索入口` / `## 来源`）、
+索引接入、来源指针与脱敏边界、写后 `me:search` 验证。
+
+落地位置（不加新 Skill、不加 frontmatter 字段）：
+
+- managed Agent 模板（`templates/AGENTS-template.md` 与
+  `templates/CLAUDE-template.md`）的 `after-creating-a-note` 段落；
+  两个模板只差 `$me:` / `/me:` 前缀，语义等价由
+  `test_future_retrieval_managed_guidance_parity` 保证。
+- `skills/recall/SKILL.md` 的 provenance handoff 段落（指针而非 transcript）。
+- `test/fixtures/retrieval/` 的两个 fixture：year-end review 检索、
+  resume-later 规划笔记。
+- 行为测试：`test/vault-test.sh` 的 `test_future_retrieval_*`，以及
+  `bun test test/vault-write-future-sections.test.ts`（可选段落走现有
+  preview/lock/transaction 契约、索引复用、custom layer paths、并发
+  INPUT_CHANGED）。
+
+修改 managed 段落内容不需要新的 vault migration：已标记 block 会在
+`/me:update` 时按 block id 原位替换；但不要新增 block id —— 那会让
+adopt-known-legacy 路径的段数校验 fail closed。
 
 ## 添加新 Skill
 
