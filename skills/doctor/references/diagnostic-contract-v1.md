@@ -82,11 +82,17 @@ Usage: doctor --vault-dir DIR [--plugin-root DIR] [--installed-version VERSION]
     "legacy": [".me/locks/x.lock"],
     "ingestPending": ["<ME_RUNTIME>/ingest/staging/..."]
   },
+  "routing": {
+    "scannedNotes": 12,
+    "errors": 1,
+    "advisories": 2,
+    "suppressedAdvisories": 1
+  },
   "findings": [
     {
       "code": "CONFIG_VALID",
       "severity": "info",           // info | warning | error
-      "category": "config",          // roots | versions | config | schema | agents | managed-sections | runtime
+      "category": "config",          // roots | versions | config | schema | agents | managed-sections | runtime | layer-routing
       "message": "Layer configuration is valid.",
       "recommendedAction": "No action needed.",
       "path": "/abs/vault/.me/config.yaml",   // optional
@@ -137,6 +143,17 @@ Usage: doctor --vault-dir DIR [--plugin-root DIR] [--installed-version VERSION]
 | `RUNTIME_RECOVERY_UNRECOGNIZED` | error | runtime | An unrecognized runtime entry exists |
 | `RUNTIME_LEGACY_STATE` | warning | runtime | `.me/locks` or `.me/tmp` contains state |
 | `RUNTIME_INGEST_PENDING` | warning | runtime | Ingest locks/staging are non-empty |
+| `ROUTING_FRONTMATTER_INVALID` | error | layer-routing | Note has no recognizable frontmatter block |
+| `ROUTING_RAW_SOURCE_NOT_URL` | error | layer-routing | Raw note `source` is not an external http(s) URL (internal URI, wikilink, malformed) |
+| `ROUTING_FIELD_NOT_ALLOWED` | error | layer-routing | Frontmatter field not permitted in the note's layer |
+| `ROUTING_MISSING_REQUIRED_FIELD` | error | layer-routing | Required per-layer field missing (e.g. cognition `confidence`) |
+| `ROUTING_TYPE_INVALID_FOR_LAYER` | error | layer-routing | `type` value outside the layer's controlled vocabulary |
+| `ROUTING_PROVENANCE_NOT_REFERENCE` | error | layer-routing | Practices/cognition `source` is not a `[[wikilink]]` note/evidence reference |
+| `ROUTING_FORBIDDEN_FIELD` | error | layer-routing | Forbidden field (`status`, `lifecycle`, `date_created`) present |
+| `ROUTING_RAW_LIKE_PRACTICE` | warning (heuristic) | layer-routing | Raw note body dominated by first-person decisions/judgment |
+| `ROUTING_PRACTICES_LIKE_RAW` | warning (heuristic) | layer-routing | Practices note looks like an unmodified external article |
+| `ROUTING_COGNITION_SINGLE_EVENT` | warning (heuristic) | layer-routing | Cognition note dominated by a single unverified event |
+| `ROUTING_SUPPRESSIONS_INVALID` | warning | layer-routing | `.me/doctor-suppressions.json` is malformed |
 
 ## Recommended-action families
 
@@ -169,6 +186,38 @@ There is no explicit schema version marker in the locked SCHEMA.md today; the
 doctor does not invent certainty. An arbitrary edit to the current schema is
 `edited`, never `future`.
 
+## Layer-routing diagnostics
+
+When the vault resolves, doctor scans every note under the configured layer
+directories (from `.me/config.yaml`, defaults `raw/`, `practices/`,
+`cognition/`) and reports two finding classes in the `layer-routing` category:
+
+- **Deterministic errors** (`ROUTING_*` error codes): schema-level violations
+  such as a raw note with a non-URL `source`, a field not permitted in the
+  layer, a missing required field, or a `type` outside the layer's controlled
+  vocabulary. They carry stable codes, the note `path`, and a
+  `recommendedAction`. Remediate a confirmed misfiled note with
+  `/me:remediate` — never by moving files manually.
+- **Advisory semantic findings** (`ROUTING_RAW_LIKE_PRACTICE`,
+  `ROUTING_PRACTICES_LIKE_RAW`, `ROUTING_COGNITION_SINGLE_EVENT`): heuristic
+  misfiling signals. They are warnings labeled `details.heuristic: true` with
+  `details.evidence` listing the triggering marker labels (never note
+  sentences). They are not proof of semantic type and never move or rewrite
+  content.
+
+False-positive suppression: add entries to `.me/doctor-suppressions.json`:
+
+```json
+{ "version": 1, "suppress": [{ "code": "ROUTING_RAW_LIKE_PRACTICE", "path": "raw/2026-01-01-example.md" }] }
+```
+
+`path` is optional (omit it to suppress the code vault-wide). Only advisory
+codes are honored; deterministic errors can never be suppressed. Suppressed
+advisories are counted in `report.routing.suppressedAdvisories`.
+
+`report.routing` aggregates the scan: `scannedNotes`, `errors`, `advisories`,
+`suppressedAdvisories`. The scan is read-only and never creates runtime state.
+
 ## Known limitations
 
 - **Committed transaction depth**: doctor inspects incomplete and unrecognized
@@ -176,6 +225,9 @@ doctor does not invent certainty. An arbitrary edit to the current schema is
   (e.g. verifying every committed mutation's target bytes) beyond the recovery
   metadata already produced by vault-write. A committed-but-contradictory
   transaction is not re-verified by doctor.
+- **Heuristic advisories**: routing advisories are keyword/marker signals, not
+  semantic proof; quoted opinions inside a faithful raw capture are expected
+  and suppressed via `.me/doctor-suppressions.json` when they trigger.
 - **Installed-version source**: doctor cannot automatically discover the
   marketplace-installed plugin version when run from a checkout; `plugin.version`
   and `installedVersion` default to the checkout version. A true checkout-vs-

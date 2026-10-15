@@ -7,7 +7,7 @@ import {
   type RuntimeLayout,
 } from './runtime-paths.ts';
 
-export type CooperativeLockOwner = 'vault-write' | 'ingest' | 'me-update';
+export type CooperativeLockOwner = 'vault-write' | 'ingest' | 'me-update' | 'remediate';
 
 export interface CooperativeLockRequest {
   operationId: string;

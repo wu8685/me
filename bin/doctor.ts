@@ -20,6 +20,11 @@ import * as path from 'path';
 import type { VaultWriteRecovery } from './vault-write/contracts';
 import { parseLayerConfig } from './vault-write/path-safety';
 import {
+  analyzeNoteRouting,
+  loadAdvisorySuppressions,
+  suppressAdvisories,
+} from './vault-write/routing';
+import {
   RuntimePathError,
   resolveRuntimeLayout,
 } from './runtime-paths';
@@ -97,6 +102,18 @@ export interface DoctorReportV1 {
     recoveries: VaultWriteRecovery[];
     legacy: string[];
     ingestPending: string[];
+  };
+  /**
+   * Semantic layer-routing diagnostics: deterministic schema violations are
+   * `error` findings; heuristic misfiling signals are `warning` findings
+   * labeled `heuristic` with their triggering evidence. Read-only — doctor
+   * never moves or rewrites notes.
+   */
+  routing: {
+    scannedNotes: number;
+    errors: number;
+    advisories: number;
+    suppressedAdvisories: number;
   };
   findings: DoctorFinding[];
 }
@@ -362,6 +379,30 @@ function scanDirectory(directory: string): string[] {
   } catch {
     return [];
   }
+}
+
+/** Recursively collect note files under a layer directory (read-only). */
+function walkLayerNotes(directory: string, out: string[]): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(directory, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    if (entry.isSymbolicLink()) continue;
+    const full = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      walkLayerNotes(full, out);
+    } else if (entry.isFile() && entry.name.endsWith('.md') && entry.name !== 'README.md') {
+      out.push(full);
+    }
+  }
+}
+
+function toPosixRelative(from: string, to: string): string {
+  return path.relative(from, to).split(path.sep).join('/');
 }
 
 function runtimeDisplay(layout: ReturnType<typeof resolveRuntimeLayout>, candidate: string): string {
@@ -921,6 +962,92 @@ export function buildDoctorReport(
     }
   }
 
+  // ── Semantic layer routing ────────────────────────────────────────
+  const routing: DoctorReportV1['routing'] = {
+    scannedNotes: 0,
+    errors: 0,
+    advisories: 0,
+    suppressedAdvisories: 0,
+  };
+  if (vaultResolved) {
+    const layerDirs: Record<'raw' | 'practices' | 'cognition', string> = {
+      raw: 'raw',
+      practices: 'practices',
+      cognition: 'cognition',
+    };
+    if (config.valid) {
+      for (const layer of LAYERS) {
+        const configured = config.layers[layer];
+        if (configured !== undefined && isSafeLayerPath(configured)) {
+          layerDirs[layer] = configured;
+        }
+      }
+    }
+
+    const suppressionsLoad = loadAdvisorySuppressions(lexicalVault);
+    if (suppressionsLoad.error) {
+      findings.push({
+        code: 'ROUTING_SUPPRESSIONS_INVALID',
+        severity: 'warning',
+        category: 'layer-routing',
+        message: `.me/doctor-suppressions.json is malformed: ${suppressionsLoad.error}.`,
+        recommendedAction: 'Fix the suppression file: { "version": 1, "suppress": [{ "code": "...", "path": "..." }] }.',
+        path: path.join(meDir, 'doctor-suppressions.json'),
+      });
+    }
+
+    for (const layer of LAYERS) {
+      const layerDir = path.join(lexicalVault, ...layerDirs[layer].split('/'));
+      const notes: string[] = [];
+      walkLayerNotes(layerDir, notes);
+      for (const noteFile of notes.sort()) {
+        const relative = toPosixRelative(lexicalVault, noteFile);
+        let content: string;
+        try {
+          content = fs.readFileSync(noteFile, 'utf8');
+        } catch {
+          continue;
+        }
+        routing.scannedNotes += 1;
+        const analysis = analyzeNoteRouting(layer, content);
+        for (const deterministic of analysis.errors) {
+          routing.errors += 1;
+          findings.push({
+            code: deterministic.code,
+            severity: 'error',
+            category: 'layer-routing',
+            message: deterministic.message,
+            recommendedAction: deterministic.recommendedAction,
+            path: relative,
+            ...(deterministic.details ? { details: deterministic.details } : {}),
+          });
+        }
+        const { kept, suppressed } = suppressAdvisories(
+          analysis.advisories,
+          suppressionsLoad.suppressions,
+          relative,
+        );
+        routing.suppressedAdvisories += suppressed.length;
+        for (const heuristic of kept) {
+          routing.advisories += 1;
+          findings.push({
+            code: heuristic.code,
+            severity: 'warning',
+            category: 'layer-routing',
+            message: `${heuristic.message} (heuristic — confirm before acting)`,
+            recommendedAction: heuristic.recommendedAction,
+            path: relative,
+            details: {
+              heuristic: true,
+              evidence: heuristic.evidence,
+              suppression: 'To suppress a false positive, add { "code": "<code>", "path": "<note path>" } to .me/doctor-suppressions.json.',
+            },
+          });
+        }
+      }
+    }
+  }
+
   const packageJson = readJson(path.join(args.pluginRoot, 'package.json'));
   const report: DoctorReportV1 = {
     version: 1,
@@ -952,6 +1079,7 @@ export function buildDoctorReport(
     },
     managedSections,
     runtime,
+    routing,
     findings,
   };
   return report;

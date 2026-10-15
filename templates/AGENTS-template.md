@@ -30,6 +30,22 @@ cat .me/config.yaml
 | Raw | per `.me/config.yaml` (default: `raw/`) | Source material, translated articles, reference docs | Ingesting external content |
 | Practices | per `.me/config.yaml` (default: `practices/`) | Practice records, experiments, process notes | Recording what you tried |
 | Cognition | per `.me/config.yaml` (default: `cognition/`) | Distilled insights, stable knowledge | Insight is proven by practice |
+
+### Routing precedence
+
+Before writing any note, decide the destination layer by:
+
+```text
+semantic knowledge type > layer schema constraints > existing directory convention
+```
+
+1. External source material or faithful source capture → Raw (including meeting transcripts and articles that quote opinions).
+2. Practice history, subjective observations, feedback, decisions, trade-offs, and working conclusions → Practices.
+3. Stable reusable insight → Cognition, only through the evidence-gated `$me:distill` promotion flow.
+4. Existing nearby notes are navigation evidence, never routing evidence — a misfiled legacy note does not justify copying its location.
+5. If content mixes source material and judgment, preserve the source in Raw and write the interpretation or decision in Practices with a `[[wikilink]]` provenance back to the Raw note.
+
+Run `$me:route-check` before creating a note: `blocked` results must stop the write; `advisory` results require explicit user confirmation. `$me:doctor` reports deterministic routing violations as errors and possible misfilings as heuristic advisories; remediate a confirmed misfiled note only via `$me:remediate` (zero-write preview, digest-bound confirmation, link-safe move) — never move existing notes automatically.
 <!-- me:managed:end layer-map -->
 
 <!-- me:managed:start commands -->
@@ -44,6 +60,8 @@ cat .me/config.yaml
 | `$me:autolinks [file] [layer]` | Auto-add wikilinks via LLM concept extraction matched against vault index (bulk or single-note) |
 | `$me:backlinks <note>` | Discover backlinks and unlinked mentions for a note |
 | `$me:move <file> <dest>` | Move/rename a note with wikilink integrity preserved |
+| `$me:route-check` | Pre-write layer routing contract — validate destination layer before creating a note |
+| `$me:remediate` | Move a confirmed misfiled note to the correct layer (zero-write preview, digest-bound confirmation) |
 | `$me:search [query] [--tags t1,t2] [--layer L] [--after date] [--before date]` | Search vault by content, tags, layer, date, or wikilink connections |
 <!-- me:managed:end commands -->
 
@@ -71,6 +89,14 @@ After creating or filing a new note in any layer:
 2. Present results as suggestions. Do NOT auto-insert wikilinks — let the user decide which connections to make.
 
 3. Use `[[filename]]` syntax (no path prefix). Wikilinks can cross any layer boundary freely.
+
+4. If the user declared a future use for the note (e.g. "年底总结时需要找到这件事", "下次继续完善", "next planning cycle", "use this in a later report"), apply the future-retrieval contract bundled with the plugin at `references/future-retrieval-contract.md`:
+
+   - Preview a retrieval plan before writing: the intended future use, proposed schema-valid retrieval vocabulary (prefer existing tags and aliases), the index or topic-note connection, the rationale and open questions to preserve, the minimal provenance pointer, and the exact writes. The preview is chat-only — the write still requires the normal confirmation.
+   - Record only the minimum context the scenario needs, using optional ordinary Markdown sections such as `## 后续用途`, `## 决策背景`, `## 未决问题`, `## 检索入口`, `## 来源`. Never add frontmatter fields and never paste session transcripts; provenance is a pointer (e.g. a `$me:recall` query plus taskId), redacted and current-workspace by default.
+   - After the write, run representative `$me:search` queries with the planned future vocabulary and report whether the declared retrieval scenario succeeds.
+
+   Without a declared future use, skip this step — ordinary notes carry no extra sections.
 <!-- me:managed:end after-creating-a-note -->
 
 <!-- me:managed:start search -->
