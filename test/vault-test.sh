@@ -400,7 +400,10 @@ test_vault_writer_public_binary() {
   local pack_dir install_dir tarball binary runtime_binary setup_binary update_binary result
   pack_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-pack.XXXXXX")
   install_dir=$(mktemp -d "${TMPDIR:-/tmp}/me-vault-install.XXXXXX")
-  tarball=$(npm pack --silent --pack-destination "$pack_dir" "$PLUGIN_ROOT") || return 1
+  # Pack from the plugin root as cwd: `npm pack <path>` silently drops
+  # bundleDependencies from the tarball (npm path-arg behavior), while the
+  # release contract is defined by `npm pack` from the package root.
+  tarball=$(cd "$PLUGIN_ROOT" && npm pack --silent --pack-destination "$pack_dir") || return 1
   npm install --silent --ignore-scripts --prefix "$install_dir" \
     "$pack_dir/$tarball" || return 1
   binary="$install_dir/node_modules/.bin/vault-write"
@@ -442,6 +445,25 @@ test_vault_writer_public_binary() {
   for required_release_path in test graphify-out runtime .planning .worktrees; do
     if [ -e "$installed_package/$required_release_path" ]; then
       echo -e "    ${RED}FAIL${NC}: packed release contains $required_release_path"
+      return 1
+    fi
+  done
+
+  # Bundled runtime dependencies must ship inside the tarball itself —
+  # marketplace-style installs never run a package manager (Issue #18).
+  # Assert against the tarball listing: `npm install` may hoist or prune the
+  # bundled copies, so the post-install layout is not the ground truth.
+  local bundled_dep
+  for bundled_dep in diff yaml; do
+    if ! tar -tzf "$pack_dir/$tarball" | grep -q "^package/node_modules/$bundled_dep/package.json$"; then
+      echo -e "    ${RED}FAIL${NC}: packed release does not bundle runtime dependency $bundled_dep"
+      return 1
+    fi
+  done
+  # Dev toolchain must not leak into the artifact.
+  for bundled_dep in typescript "@types"; do
+    if tar -tzf "$pack_dir/$tarball" | grep -q "^package/node_modules/$bundled_dep/"; then
+      echo -e "    ${RED}FAIL${NC}: packed release bundles dev dependency $bundled_dep"
       return 1
     fi
   done
@@ -609,8 +631,8 @@ test_decision_brief_discovery_and_release_version() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.8.1" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected current release version 1.8.1"
+  [ "$(echo "$versions" | head -n 1)" = "1.8.2" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected current release version 1.8.2"
     return 1
   }
 }
@@ -783,8 +805,8 @@ test_ingest_docs_rich_media() {
     echo -e "    ${RED}FAIL${NC}: plugin manifest versions differ"
     return 1
   }
-  [ "$(echo "$versions" | head -n 1)" = "1.8.1" ] || {
-    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.8.1"
+  [ "$(echo "$versions" | head -n 1)" = "1.8.2" ] || {
+    echo -e "    ${RED}FAIL${NC}: expected rich-ingest release version 1.8.2"
     return 1
   }
 
@@ -7209,6 +7231,55 @@ test_release_guard_rejects_digest_conflict() {
   rm -rf "$tmp_root"
 }
 
+test_package_lockfile_consistent() {
+  # Issue #18: package.json and package-lock.json must agree on identity and
+  # dependency sets, so `npm ci` can hydrate a clean checkout.
+  node -e '
+    const fs = require("fs");
+    const root = process.argv[1];
+    const pkg = JSON.parse(fs.readFileSync(root + "/package.json", "utf8"));
+    const lock = JSON.parse(fs.readFileSync(root + "/package-lock.json", "utf8"));
+    const lockRoot = lock.packages && lock.packages[""];
+    if (!lockRoot) { console.error("no lockfile root"); process.exit(1); }
+    if (lockRoot.version !== pkg.version) {
+      console.error(`version drift: pkg=${pkg.version} lock=${lockRoot.version}`);
+      process.exit(1);
+    }
+    if (lock.name !== pkg.name) {
+      console.error(`name drift: pkg=${pkg.name} lock=${lock.name}`);
+      process.exit(1);
+    }
+    for (const field of ["dependencies", "devDependencies"]) {
+      const a = pkg[field] ?? {};
+      const b = lockRoot[field] ?? {};
+      for (const [dep, spec] of Object.entries(a)) {
+        if (b[dep] !== spec) {
+          console.error(`${field}.${dep}: pkg=${spec} lock=${b[dep]}`);
+          process.exit(1);
+        }
+        if (!lock.packages["node_modules/" + dep]) {
+          console.error(`${field}.${dep}: no resolved lockfile entry`);
+          process.exit(1);
+        }
+      }
+      for (const dep of Object.keys(b)) {
+        if (!(dep in a)) { console.error(`${field}.${dep}: lockfile-only`); process.exit(1); }
+      }
+    }
+    // Every runtime dependency must be bundled into the packed artifact.
+    const bundled = new Set(pkg.bundleDependencies ?? pkg.bundledDependencies ?? []);
+    for (const dep of Object.keys(pkg.dependencies ?? {})) {
+      if (!bundled.has(dep)) {
+        console.error(`runtime dependency not bundled: ${dep}`);
+        process.exit(1);
+      }
+    }
+  ' "$PLUGIN_ROOT" || {
+    echo -e "    ${RED}FAIL${NC}: package.json and package-lock.json are inconsistent"
+    return 1
+  }
+}
+
 test_package_contains_doctor_recall_distill() {
   # Verify the packed release includes the three new skills from PR #12.
   local pack_dir extract_dir tarball
@@ -7612,6 +7683,8 @@ main() {
     run_test test_release_digests_store_exists
     run_test test_release_guard_rejects_digest_conflict
     run_test test_package_contains_doctor_recall_distill
+    # Issue #18: packaged-install dependency and lockfile verification
+    run_test test_package_lockfile_consistent
   fi
 
   # Distill tests

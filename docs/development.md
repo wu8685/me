@@ -397,6 +397,41 @@ ME 强制执行以下不变式，确保每个发布版本标识一个且仅一�
 4. **发布测试必须从打包产物安装**，不能从源码树直接运行。
 5. **已安装 package smoke test** 必须解析 Skill 且成功执行每个 CLI 的
    help / 只读 fixture 路径。
+6. **`package.json` 与 `package-lock.json` 一致**：两者的 package 名称、
+   版本号和 dependency 集合必须一致，保证干净 checkout 上 `npm ci` 可以
+   确定性还原依赖。release guard 对 drift 直接报错
+   （`LOCKFILE_VERSION_MISMATCH` / `LOCKFILE_DEP_MISMATCH` /
+   `LOCKFILE_DEP_UNRESOLVED` / `LOCKFILE_MISSING`）。
+7. **runtime dependency 全部打进 package**：`dependencies` 中的每一项必须
+   同时列入 `bundleDependencies`（guard 报错码 `DEP_NOT_BUNDLED`）。marketplace
+   风格的安装不会在 plugin cache 里运行包管理器，因此运行时依赖随 tarball
+   一起发布。
+
+### 依赖 hydration 策略（Dependency Hydration）
+
+ME 选择 **bundle** 策略：runtime dependencies（当前为 `diff` 与 `yaml`）通过
+`package.json#bundleDependencies` 打进 npm tarball，解压后位于
+`<plugin>/node_modules/` 下，bun 的模块解析从 `bin/` 向上查找即可命中。
+安装的插件**自包含**，不需要在 plugin cache 里手动 `npm install`。
+
+规则：
+
+- 新增 runtime dependency 时，必须同时加入 `dependencies` 和
+  `bundleDependencies`，并运行 `npm install` 重新生成 lockfile。
+- devDependencies（typescript、@types/node）不打包，只在开发/CI 中通过
+  `npm ci` 安装。
+- `npm pack` 不会携带 `package-lock.json`；marketplace 安装的 hydration
+  契约是 bundle，不是安装后再跑 `npm ci`。`npm ci` 只用于源码 checkout
+  （开发与 CI）。
+- 打包前必须有 `node_modules`（CI 中由 `npm ci` 提供），否则 bundle 为空。
+- `me:update` / `me:doctor` 等命令**不会**在运行时隐式联网安装依赖；
+  依赖缺失属于发布缺陷，应由 release guard 在发布前拦截。
+
+对应测试：`test/packed-install.test.ts` 在带空格和 Unicode 的临时目录里
+解压 tarball、以隔离的 bun module cache（`--no-install` + 空
+`BUN_INSTALL_CACHE_DIR`）运行 `update` / `doctor` / `recall` / `brief` /
+`distill` 的 CLI fixture，并用"移除 bundled node_modules 后必须失败"的
+负例证明依赖解析没有泄漏到父目录或源码树。
 
 ### 豁免策略（Exemption Policy）
 
@@ -436,12 +471,18 @@ payload。修改这些文件时**必须**同步提升版本号。
 ### 2. 运行测试与 release guard
 
 ```bash
+# 干净 checkout 的确定性依赖还原（lockfile drift 时直接失败）
+npm ci
+
 # 完整测试套件
 bun test test/*.test.ts
 bash test/typecheck-ingest-finalize.sh
 bash test/vault-test.sh
 
-# Release guard（版本一致性与 digest 检查）
+# 打包安装 smoke（marketplace 风格安装 + CLI fixture）
+bun test test/packed-install.test.ts
+
+# Release guard（版本一致性、digest、lockfile 一致性、bundle 完整性）
 bun bin/release-guard.ts check
 ```
 

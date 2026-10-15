@@ -14,6 +14,10 @@ const PLUGIN_ROOT = path.resolve(import.meta.dir, "..");
  * 2. Package-affecting changes without a version bump fail CI.
  * 3. A recorded version→content-digest mapping is never overwritten
  *    with a different payload.
+ *
+ * Plus the install-contract invariants required by Issue #18:
+ * 4. package.json and package-lock.json agree (clean `npm ci` hydration).
+ * 5. Every runtime dependency is bundled into the packed artifact.
  */
 describe("release guard", () => {
   let tmpDir: string;
@@ -289,6 +293,247 @@ describe("release guard", () => {
       });
       expect(result.exitCode).toBe(1);
       expect(result.stderr + result.stdout).toMatch(/VERSION_NOT_BUMPED/);
+    });
+  });
+
+  describe("lockfile consistency (install contract)", () => {
+    /**
+     * Build a minimal synthetic plugin repo whose manifests all agree,
+     * with a controllable package.json and package-lock.json.
+     */
+    function makeLockfileRepo(
+      name: string,
+      opts: {
+        pkg?: Record<string, unknown>;
+        lock?: Record<string, unknown> | null;
+        bumpVersion?: string;
+      } = {},
+    ): string {
+      const repoDir = path.join(tmpDir, name);
+      fs.mkdirSync(path.join(repoDir, ".claude-plugin"), { recursive: true });
+      fs.mkdirSync(path.join(repoDir, ".codex-plugin"), { recursive: true });
+      fs.mkdirSync(path.join(repoDir, ".agents/plugins"), { recursive: true });
+      fs.mkdirSync(path.join(repoDir, "skills/test-skill"), { recursive: true });
+
+      const version = opts.bumpVersion ?? "1.0.0";
+      const pkg = {
+        name: "me",
+        version,
+        files: ["skills/"],
+        ...opts.pkg,
+      };
+      fs.writeFileSync(
+        path.join(repoDir, "package.json"),
+        JSON.stringify(pkg, null, 2),
+      );
+      fs.writeFileSync(path.join(repoDir, ".claude-plugin/plugin.json"), JSON.stringify({ name: "me", version }, null, 2));
+      fs.writeFileSync(path.join(repoDir, ".claude-plugin/marketplace.json"), JSON.stringify({ plugins: [{ version }] }, null, 2));
+      fs.writeFileSync(path.join(repoDir, ".codex-plugin/plugin.json"), JSON.stringify({ name: "me", version }, null, 2));
+      fs.writeFileSync(path.join(repoDir, ".agents/plugins/marketplace.json"), JSON.stringify({ plugins: [{ source: { path: "./" } }] }, null, 2));
+      fs.writeFileSync(path.join(repoDir, "skills/test-skill/SKILL.md"), "# Test\n");
+
+      if (opts.lock !== null) {
+        const lock = opts.lock ?? {
+          name: pkg.name,
+          version: pkg.version,
+          lockfileVersion: 3,
+          requires: true,
+          packages: {
+            "": {
+              name: pkg.name,
+              version: pkg.version,
+              dependencies: (pkg as any).dependencies,
+              devDependencies: (pkg as any).devDependencies,
+            },
+            ...Object.fromEntries(
+              [
+                ...Object.keys((pkg as any).dependencies ?? {}),
+                ...Object.keys((pkg as any).devDependencies ?? {}),
+              ].map((dep) => [
+                `node_modules/${dep}`,
+                { version: "0.0.0", resolved: "https://registry.invalid/x.tgz", integrity: "sha256-x" },
+              ]),
+            ),
+          },
+        };
+        fs.writeFileSync(
+          path.join(repoDir, "package-lock.json"),
+          JSON.stringify(lock, null, 2),
+        );
+      }
+
+      execFileSync("git", ["init"], { cwd: repoDir, stdio: "pipe" });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir, stdio: "pipe" });
+      execFileSync("git", ["config", "user.name", "test"], { cwd: repoDir, stdio: "pipe" });
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+      execFileSync("git", ["commit", "-m", "baseline"], { cwd: repoDir, stdio: "pipe" });
+      return repoDir;
+    }
+
+    it("passes when package.json and lockfile agree and deps are bundled", { timeout: 15_000 }, () => {
+      const repoDir = makeLockfileRepo("lock-consistent", {
+        pkg: {
+          dependencies: { diff: "^9.0.0" },
+          bundleDependencies: ["diff"],
+        },
+      });
+      const result = runGuard(["check", "--root", repoDir, "--base-ref", "HEAD"], {
+        cwd: repoDir,
+      });
+      expect(result.exitCode).toBe(0);
+    });
+
+    it("fails when the lockfile root version differs from package.json", { timeout: 15_000 }, () => {
+      const repoDir = makeLockfileRepo("lock-version-drift", {
+        pkg: {
+          dependencies: { diff: "^9.0.0" },
+          bundleDependencies: ["diff"],
+        },
+      });
+      // Simulate the 1.7.0 defect: bump package.json without regenerating the lockfile.
+      const pkgPath = path.join(repoDir, "package.json");
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+      pkg.version = "1.0.1";
+      fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+      for (const rel of [".claude-plugin/plugin.json", ".codex-plugin/plugin.json"]) {
+        const p = path.join(repoDir, rel);
+        const m = JSON.parse(fs.readFileSync(p, "utf-8"));
+        m.version = "1.0.1";
+        fs.writeFileSync(p, JSON.stringify(m, null, 2));
+      }
+      const mktPath = path.join(repoDir, ".claude-plugin/marketplace.json");
+      const mkt = JSON.parse(fs.readFileSync(mktPath, "utf-8"));
+      mkt.plugins[0].version = "1.0.1";
+      fs.writeFileSync(mktPath, JSON.stringify(mkt, null, 2));
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+
+      const result = runGuard(["check", "--root", repoDir, "--base-ref", "HEAD"], {
+        cwd: repoDir,
+        expectedExit: 1,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr + result.stdout).toMatch(/LOCKFILE_VERSION_MISMATCH/);
+    });
+
+    it("fails when a dependency is declared only in package.json", { timeout: 15_000 }, () => {
+      const repoDir = makeLockfileRepo("lock-dep-added", {
+        pkg: {
+          dependencies: { diff: "^9.0.0", yaml: "^2.9.0" },
+          bundleDependencies: ["diff", "yaml"],
+        },
+      });
+      // Remove yaml from the lockfile root only.
+      const lockPath = path.join(repoDir, "package-lock.json");
+      const lock = JSON.parse(fs.readFileSync(lockPath, "utf-8"));
+      delete lock.packages[""].dependencies.yaml;
+      fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2));
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+
+      const result = runGuard(["check", "--root", repoDir, "--base-ref", "HEAD"], {
+        cwd: repoDir,
+        expectedExit: 1,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr + result.stdout).toMatch(/LOCKFILE_DEP_MISMATCH/);
+    });
+
+    it("fails when a dependency exists only in the lockfile", { timeout: 15_000 }, () => {
+      const repoDir = makeLockfileRepo("lock-dep-removed", {
+        pkg: {
+          dependencies: { diff: "^9.0.0" },
+          bundleDependencies: ["diff"],
+        },
+      });
+      const lockPath = path.join(repoDir, "package-lock.json");
+      const lock = JSON.parse(fs.readFileSync(lockPath, "utf-8"));
+      lock.packages[""].dependencies.leftpad = "^1.0.0";
+      lock.packages["node_modules/leftpad"] = { version: "1.0.0" };
+      fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2));
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+
+      const result = runGuard(["check", "--root", repoDir, "--base-ref", "HEAD"], {
+        cwd: repoDir,
+        expectedExit: 1,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr + result.stdout).toMatch(/LOCKFILE_DEP_MISMATCH/);
+    });
+
+    it("fails when a declared dependency has no resolved lockfile entry", { timeout: 15_000 }, () => {
+      const repoDir = makeLockfileRepo("lock-dep-unresolved", {
+        pkg: {
+          dependencies: { diff: "^9.0.0" },
+          bundleDependencies: ["diff"],
+        },
+      });
+      const lockPath = path.join(repoDir, "package-lock.json");
+      const lock = JSON.parse(fs.readFileSync(lockPath, "utf-8"));
+      delete lock.packages["node_modules/diff"];
+      fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2));
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+
+      const result = runGuard(["check", "--root", repoDir, "--base-ref", "HEAD"], {
+        cwd: repoDir,
+        expectedExit: 1,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr + result.stdout).toMatch(/LOCKFILE_DEP_UNRESOLVED/);
+    });
+
+    it("fails when the lockfile is missing but dependencies are declared", { timeout: 15_000 }, () => {
+      const repoDir = makeLockfileRepo("lock-missing", {
+        pkg: {
+          dependencies: { diff: "^9.0.0" },
+          bundleDependencies: ["diff"],
+        },
+        lock: null,
+      });
+      const result = runGuard(["check", "--root", repoDir, "--base-ref", "HEAD"], {
+        cwd: repoDir,
+        expectedExit: 1,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr + result.stdout).toMatch(/LOCKFILE_MISSING/);
+    });
+
+    it("fails when a runtime dependency is not bundled", { timeout: 15_000 }, () => {
+      const repoDir = makeLockfileRepo("dep-not-bundled", {
+        pkg: {
+          dependencies: { diff: "^9.0.0", yaml: "^2.9.0" },
+          bundleDependencies: ["diff"],
+        },
+      });
+      const result = runGuard(["check", "--root", repoDir, "--base-ref", "HEAD"], {
+        cwd: repoDir,
+        expectedExit: 1,
+      });
+      expect(result.exitCode).toBe(1);
+      const combined = result.stderr + result.stdout;
+      expect(combined).toMatch(/DEP_NOT_BUNDLED/);
+      expect(combined).toMatch(/yaml/);
+    });
+
+    it("the real repository lockfile is consistent and runtime deps are bundled", { timeout: 15_000 }, () => {
+      const result = runGuard(["check", "--root", PLUGIN_ROOT, "--base-ref", "origin/main"]);
+      expect(result.exitCode).toBe(0);
+      const combined = result.stderr + result.stdout;
+      expect(combined).not.toMatch(/LOCKFILE_|DEP_NOT_BUNDLED/);
+    });
+
+    it("record refuses a version whose lockfile is drifted", { timeout: 15_000 }, () => {
+      const repoDir = makeLockfileRepo("record-drifted", {
+        pkg: {
+          dependencies: { diff: "^9.0.0" },
+          bundleDependencies: ["diff"],
+        },
+        lock: null,
+      });
+      const result = runGuard(["record", "--root", repoDir], {
+        cwd: repoDir,
+        expectedExit: 1,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr + result.stdout).toMatch(/LOCKFILE_MISSING/);
     });
   });
 
