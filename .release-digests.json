@@ -29,6 +29,12 @@
       "contentDigest": "fd4e3e8c234a47047b118f27a999dd49ef2ced75eb25a4178bbde9496bb06dcd",
       "recordedAt": "2026-10-11T09:49:50.806Z",
       "commitSha": "ac2fe5e"
+    },
+    {
+      "version": "1.8.2",
+      "contentDigest": "6e39c03efe76d5be60c0568a389f24bc2ba975d1239c3b26bf5ae9f154657c98",
+      "recordedAt": "2026-10-15T00:12:04.311Z",
+      "commitSha": "3ccddba"
     }
   ]
 }
